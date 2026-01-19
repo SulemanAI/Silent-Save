@@ -6,13 +6,31 @@ import 'services/encryption_service.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   
-  // Initialize encryption service
-  await EncryptionService.instance.initializeEncryption();
+  // Initialize services with error handling to prevent app crash on startup
+  try {
+    await EncryptionService.instance.initializeEncryption()
+        .timeout(const Duration(seconds: 5), onTimeout: () {
+      debugPrint('Encryption initialization timed out');
+    });
+  } catch (e) {
+    // Log but don't crash - encryption will be re-attempted when needed
+    debugPrint('Encryption initialization failed: $e');
+  }
   
-  // Schedule cleanup job
-  await NotificationService.instance.scheduleCleanupJob();
-  
+  // Run app first, then schedule cleanup in background
   runApp(const SilentSaveApp());
+  
+  // Schedule cleanup after app is running (non-blocking)
+  Future.delayed(const Duration(seconds: 2), () async {
+    try {
+      await NotificationService.instance.scheduleCleanupJob()
+          .timeout(const Duration(seconds: 5), onTimeout: () {
+        debugPrint('Cleanup job scheduling timed out');
+      });
+    } catch (e) {
+      debugPrint('Cleanup job scheduling failed: $e');
+    }
+  });
 }
 
 class SilentSaveApp extends StatelessWidget {
@@ -21,7 +39,7 @@ class SilentSaveApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'SilentSave',
+      title: 'Silent Save',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,

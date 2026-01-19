@@ -1,12 +1,23 @@
+import 'dart:async';
+import 'package:flutter/foundation.dart' hide Key;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:encrypt/encrypt.dart';
 
 class EncryptionService {
   static final EncryptionService instance = EncryptionService._init();
-  final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
+  final FlutterSecureStorage _secureStorage = const FlutterSecureStorage(
+    aOptions: AndroidOptions(
+      encryptedSharedPreferences: true,
+      resetOnError: true,  // Reset storage if corrupted
+    ),
+  );
   
   Encrypter? _encrypter;
   IV? _iv;
+  
+  // Race condition prevention: track initialization state
+  bool _isInitializing = false;
+  Completer<void>? _initCompleter;
 
   EncryptionService._init();
 
@@ -15,79 +26,168 @@ class EncryptionService {
   static const String _enabledStorageKey = 'encryption_enabled';
 
   Future<void> initializeEncryption() async {
-    // Check if encryption is enabled
-    final enabled = await isEncryptionEnabled();
-    if (!enabled) return;
+    // Race condition prevention: if already initializing, wait for it to complete
+    if (_isInitializing && _initCompleter != null) {
+      return _initCompleter!.future;
+    }
+    
+    // Start initialization first to prevent race conditions
+    _isInitializing = true;
+    _initCompleter = Completer<void>();
+    
+    try {
+      // Check if encryption is enabled (with error handling)
+      bool enabled;
+      try {
+        enabled = await isEncryptionEnabled();
+      } catch (e) {
+        // If we can't read encryption status, reset and disable
+        debugPrint('[EncryptionService] Error checking encryption status, resetting: $e');
+        await _resetStorage();
+        enabled = false;
+      }
+      
+      if (!enabled) {
+        _initCompleter!.complete();
+        return;
+      }
+      
+      // Already initialized
+      if (_encrypter != null && _iv != null) {
+        _initCompleter!.complete();
+        return;
+      }
+      
+      // Get or create encryption key
+      String? keyString;
+      String? ivString;
+      
+      try {
+        keyString = await _secureStorage.read(key: _keyStorageKey);
+        ivString = await _secureStorage.read(key: _ivStorageKey);
+      } catch (e) {
+        // If reading fails (corrupted storage), reset everything
+        debugPrint('[EncryptionService] Storage corrupted while reading keys, resetting: $e');
+        await _resetStorage();
+        keyString = null;
+        ivString = null;
+      }
 
-    // Get or create encryption key
-    String? keyString = await _secureStorage.read(key: _keyStorageKey);
-    String? ivString = await _secureStorage.read(key: _ivStorageKey);
+      if (keyString == null || ivString == null) {
+        // Generate new key and IV
+        final key = Key.fromSecureRandom(32);
+        final iv = IV.fromSecureRandom(16);
 
-    if (keyString == null || ivString == null) {
-      // Generate new key and IV
-      final key = Key.fromSecureRandom(32);
-      final iv = IV.fromSecureRandom(16);
+        try {
+          await _secureStorage.write(key: _keyStorageKey, value: key.base64);
+          await _secureStorage.write(key: _ivStorageKey, value: iv.base64);
+        } catch (e) {
+          debugPrint('[EncryptionService] Error writing new keys, resetting: $e');
+          await _resetStorage();
+          // Try writing again after reset
+          await _secureStorage.write(key: _keyStorageKey, value: key.base64);
+          await _secureStorage.write(key: _ivStorageKey, value: iv.base64);
+        }
 
-      await _secureStorage.write(key: _keyStorageKey, value: key.base64);
-      await _secureStorage.write(key: _ivStorageKey, value: iv.base64);
+        _encrypter = Encrypter(AES(key));
+        _iv = iv;
+      } else {
+        // Use existing key and IV
+        final key = Key.fromBase64(keyString);
+        final iv = IV.fromBase64(ivString);
 
-      _encrypter = Encrypter(AES(key));
-      _iv = iv;
-    } else {
-      // Use existing key and IV
-      final key = Key.fromBase64(keyString);
-      final iv = IV.fromBase64(ivString);
+        _encrypter = Encrypter(AES(key));
+        _iv = iv;
+      }
+      
+      _initCompleter!.complete();
+    } catch (e) {
+      debugPrint('[EncryptionService] Initialization error: $e');
+      // Reset state on error so encryption is disabled
+      _encrypter = null;
+      _iv = null;
+      // Reset storage to clear corrupted data
+      await _resetStorage();
+      // Complete the completer to allow callers to proceed (without encryption)
+      _initCompleter!.complete();
+      // Don't rethrow - allow graceful degradation to unencrypted mode
+    } finally {
+      _isInitializing = false;
+    }
+  }
 
-      _encrypter = Encrypter(AES(key));
-      _iv = iv;
+  Future<void> _resetStorage() async {
+    try {
+      await _secureStorage.deleteAll();
+      debugPrint('[EncryptionService] Storage reset complete');
+    } catch (e) {
+      debugPrint('[EncryptionService] Failed to reset storage: $e');
     }
   }
 
   Future<bool> isEncryptionEnabled() async {
-    final enabled = await _secureStorage.read(key: _enabledStorageKey);
-    return enabled == 'true';
+    try {
+      final enabled = await _secureStorage.read(key: _enabledStorageKey);
+      return enabled == 'true';
+    } catch (e) {
+      // If we can't read, encryption is effectively disabled
+      debugPrint('[EncryptionService] Error reading encryption status: $e');
+      await _resetStorage();
+      return false;
+    }
   }
 
   Future<void> enableEncryption(bool enable) async {
-    await _secureStorage.write(
-      key: _enabledStorageKey,
-      value: enable.toString(),
-    );
-    
-    if (enable) {
-      await initializeEncryption();
-    } else {
-      _encrypter = null;
-      _iv = null;
+    try {
+      await _secureStorage.write(
+        key: _enabledStorageKey,
+        value: enable.toString(),
+      );
+      
+      if (enable) {
+        await initializeEncryption();
+      } else {
+        _encrypter = null;
+        _iv = null;
+      }
+    } catch (e) {
+      debugPrint('[EncryptionService] Error enabling encryption: $e');
+      await _resetStorage();
     }
   }
 
   Future<String> encrypt(String plainText) async {
-    if (_encrypter == null || _iv == null) {
-      await initializeEncryption();
-    }
-    
-    if (_encrypter == null || _iv == null) {
-      return plainText; // Return as-is if encryption not initialized
-    }
+    try {
+      if (_encrypter == null || _iv == null) {
+        await initializeEncryption();
+      }
+      
+      if (_encrypter == null || _iv == null) {
+        return plainText; // Return as-is if encryption not initialized
+      }
 
-    final encrypted = _encrypter!.encrypt(plainText, iv: _iv);
-    return encrypted.base64;
+      final encrypted = _encrypter!.encrypt(plainText, iv: _iv);
+      return encrypted.base64;
+    } catch (e) {
+      debugPrint('[EncryptionService] Encryption error: $e');
+      return plainText; // Return unencrypted on error
+    }
   }
 
   Future<String> decrypt(String encryptedText) async {
-    if (_encrypter == null || _iv == null) {
-      await initializeEncryption();
-    }
-    
-    if (_encrypter == null || _iv == null) {
-      return encryptedText; // Return as-is if encryption not initialized
-    }
-
     try {
+      if (_encrypter == null || _iv == null) {
+        await initializeEncryption();
+      }
+      
+      if (_encrypter == null || _iv == null) {
+        return encryptedText; // Return as-is if encryption not initialized
+      }
+
       final encrypted = Encrypted.fromBase64(encryptedText);
       return _encrypter!.decrypt(encrypted, iv: _iv);
     } catch (e) {
+      debugPrint('[EncryptionService] Decryption error: $e');
       return encryptedText; // Return as-is if decryption fails
     }
   }
@@ -100,4 +200,3 @@ class EncryptionService {
     _iv = null;
   }
 }
-

@@ -2,7 +2,7 @@ import os
 import sys
 from PIL import Image
 
-def process_image(input_path, output_size=(256, 256)):
+def process_image(input_path, output_size=(1024, 1024)):
     """
     Converts an image to PNG and resizes it to the specified dimensions.
     """
@@ -44,7 +44,7 @@ if __name__ == "__main__":
     # You can run this script directly or change the variable below.
     
     # Replace 'input_image.jpg' with the path to your actual file
-    target_file = r"C:\Users\cv\Desktop\SilentSave\assets\icon.png"
+    target_file = r"C:\Users\cv\Desktop\SilentSave\assets\icon.jpeg"
     
     # Check if the user passed a file via command line arguments
     # Example: python image_converter.py myphoto.bmp
