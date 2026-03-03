@@ -1,33 +1,54 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
+import 'package:font_awesome_flutter/font_awesome_flutter.dart';
+import 'package:path_provider/path_provider.dart';
 import '../models/message_model.dart';
 import '../services/database_helper.dart';
 
 class ConversationScreen extends StatefulWidget {
   final String sender;
   final String app;
+  final String? initialAvatarPath;
 
   const ConversationScreen({
     super.key,
     required this.sender,
     required this.app,
+    this.initialAvatarPath,
   });
 
   @override
   State<ConversationScreen> createState() => _ConversationScreenState();
 }
 
-class _ConversationScreenState extends State<ConversationScreen> {
+class _ConversationScreenState extends State<ConversationScreen> with WidgetsBindingObserver {
   List<MessageModel> _messages = [];
   bool _isLoading = true;
   bool _isGroupChat = false;
   String? _avatarPath;
+  String? _avatarsDir; // For looking up sender-specific avatars in groups
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _avatarPath = widget.initialAvatarPath;
     _loadMessages();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _loadMessages();
+    }
   }
 
   Future<void> _loadMessages() async {
@@ -52,6 +73,19 @@ class _ConversationScreenState extends State<ConversationScreen> {
       }
     }
     
+    // Initialize avatars directory for sender avatar lookup in group chats
+    if (_avatarsDir == null) {
+      try {
+        final supportDir = await getApplicationSupportDirectory();
+        _avatarsDir = '${supportDir.path}/avatars';
+      } catch (e) {
+        // Fallback: derive from existing avatar path
+        if (latestAvatarPath != null && latestAvatarPath.isNotEmpty) {
+          _avatarsDir = File(latestAvatarPath).parent.path;
+        }
+      }
+    }
+    
     setState(() {
       _messages = messages;
       _isGroupChat = isGroup;
@@ -60,13 +94,13 @@ class _ConversationScreenState extends State<ConversationScreen> {
     });
   }
 
-  String _getAppIcon(String packageName) {
+  Widget _getAppIcon(String packageName, {double size = 12, Color? color}) {
     if (packageName.contains('whatsapp')) {
-      return '💬';
+      return FaIcon(FontAwesomeIcons.whatsapp, size: size, color: color ?? Colors.green);
     } else if (packageName.contains('instagram')) {
-      return '📸';
+      return FaIcon(FontAwesomeIcons.instagram, size: size, color: color ?? Colors.pinkAccent);
     }
-    return '📱';
+    return Icon(Icons.notifications, size: size, color: color ?? Colors.grey);
   }
 
   // Sanitize text to remove invalid UTF-16 characters that could crash the app
@@ -225,10 +259,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
                   ),
                   Row(
                     children: [
-                      Text(
-                        _getAppIcon(widget.app),
-                        style: const TextStyle(fontSize: 12),
-                      ),
+                      _getAppIcon(widget.app, size: 12),
                       const SizedBox(width: 4),
                       Text(
                         _isGroupChat ? 'Group Chat' : 'Private Chat',
@@ -320,9 +351,18 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
   Widget _buildMessageList() {
     // Filter out deleted messages
-    final activeMessages = _messages
+    var activeMessages = _messages
         .where((msg) => msg.isDeleted != true)
         .toList();
+    
+    // Deduplicate messages with identical content and timestamp
+    final seen = <String>{};
+    activeMessages = activeMessages.where((msg) {
+      final key = '${msg.message}||${msg.timestamp.millisecondsSinceEpoch}';
+      if (seen.contains(key)) return false;
+      seen.add(key);
+      return true;
+    }).toList();
     
     if (activeMessages.isEmpty) {
       return _buildEmptyState();
@@ -425,13 +465,13 @@ class _ConversationScreenState extends State<ConversationScreen> {
     if (item.isHeader) {
       return _buildDateHeader(item.date!);
     } else {
-      // Get the next message (visually above) for grouping logic
-      // In our items list, the next item (reversedIndex + 1) is visually above
+      // Get the previous message (visually above) for grouping logic
+      // In our items list (oldest=0, newest=end), reversedIndex - 1 is the item above in display
       String? previousSenderName;
-      if (reversedIndex + 1 < items.length) {
-        final nextItem = items[reversedIndex + 1];
-        if (!nextItem.isHeader && nextItem.message != null) {
-          previousSenderName = nextItem.message!.senderName ?? nextItem.message!.sender;
+      if (reversedIndex - 1 >= 0) {
+        final prevItem = items[reversedIndex - 1];
+        if (!prevItem.isHeader && prevItem.message != null) {
+          previousSenderName = prevItem.message!.senderName ?? prevItem.message!.sender;
         }
       }
       return _buildMessageBubble(item.message!, previousSenderName);
@@ -470,6 +510,148 @@ class _ConversationScreenState extends State<ConversationScreen> {
     );
   }
 
+  // Build sender avatar widget — tries to load the sender's actual DP file,
+  // falls back to letter initial if not available
+  Widget _buildSenderAvatar(String senderName, Color senderColor) {
+    // Try to find sender-specific avatar file saved by native code
+    if (_avatarsDir != null) {
+      final appPrefix = widget.app.contains('whatsapp') ? 'wa' :
+                         widget.app.contains('instagram') ? 'ig' : 'other';
+      final safeName = senderName.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+      final truncatedName = safeName.length > 50 ? safeName.substring(0, 50) : safeName;
+      final avatarFile = File('$_avatarsDir/${appPrefix}_sender_$truncatedName.png');
+      
+      if (avatarFile.existsSync()) {
+        return Container(
+          width: 28,
+          height: 28,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            image: DecorationImage(
+              image: FileImage(avatarFile),
+              fit: BoxFit.cover,
+            ),
+            border: Border.all(
+              color: senderColor.withOpacity(0.5),
+              width: 1,
+            ),
+          ),
+        );
+      }
+    }
+    
+    // Fallback: letter initial
+    return Container(
+      width: 28,
+      height: 28,
+      decoration: BoxDecoration(
+        color: senderColor.withOpacity(0.2),
+        shape: BoxShape.circle,
+        border: Border.all(
+          color: senderColor.withOpacity(0.5),
+          width: 1,
+        ),
+      ),
+      child: Center(
+        child: Text(
+          senderName.isNotEmpty ? senderName[0].toUpperCase() : '?',
+          style: TextStyle(
+            fontSize: 13,
+            fontWeight: FontWeight.bold,
+            color: senderColor,
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Show options menu when long-pressing a message (copy, etc.)
+  void _showMessageOptions(BuildContext context, MessageModel message) {
+    final senderName = message.senderName ?? message.sender;
+    
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.grey.shade900,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Handle bar
+              Container(
+                width: 40,
+                height: 4,
+                margin: const EdgeInsets.symmetric(vertical: 12),
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade600,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              // Message preview
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                child: Text(
+                  _sanitizeText(message.message).length > 100
+                      ? '${_sanitizeText(message.message).substring(0, 100)}...'
+                      : _sanitizeText(message.message),
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: Colors.grey.shade400,
+                    fontStyle: FontStyle.italic,
+                  ),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              const Divider(height: 1, color: Colors.grey),
+              // Copy message text
+              ListTile(
+                leading: const Icon(Icons.copy, color: Colors.white70),
+                title: const Text('Copy message', style: TextStyle(color: Colors.white)),
+                onTap: () {
+                  Clipboard.setData(ClipboardData(text: message.message));
+                  Navigator.pop(ctx);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: const Text('Message copied to clipboard'),
+                      backgroundColor: Colors.white.withValues(alpha: 0.7),
+                      behavior: SnackBarBehavior.floating,
+                      duration: const Duration(seconds: 2),
+                    ),
+                  );
+                },
+              ),
+              // Copy with sender name and timestamp
+              if (_isGroupChat)
+                ListTile(
+                  leading: const Icon(Icons.content_copy, color: Colors.white70),
+                  title: const Text('Copy with sender info', style: TextStyle(color: Colors.white)),
+                  onTap: () {
+                    final formattedTime = _formatMessageTime(message.timestamp);
+                    final textToCopy = '[$formattedTime] $senderName: ${message.message}';
+                    Clipboard.setData(ClipboardData(text: textToCopy));
+                    Navigator.pop(ctx);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: const Text('Message with sender info copied'),
+                        backgroundColor: Colors.grey.shade800,
+                        behavior: SnackBarBehavior.floating,
+                        duration: const Duration(seconds: 2),
+                      ),
+                    );
+                  },
+                ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
   Widget _buildMessageBubble(MessageModel message, String? previousSenderName) {
     final senderName = message.senderName ?? message.sender;
     
@@ -494,28 +676,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
               padding: const EdgeInsets.only(left: 4, bottom: 6),
               child: Row(
                 children: [
-                  Container(
-                    width: 24,
-                    height: 24,
-                    decoration: BoxDecoration(
-                      color: senderColor.withOpacity(0.2),
-                      shape: BoxShape.circle,
-                      border: Border.all(
-                        color: senderColor.withOpacity(0.5),
-                        width: 1,
-                      ),
-                    ),
-                    child: Center(
-                      child: Text(
-                        senderName.isNotEmpty ? senderName[0].toUpperCase() : '?',
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                          color: senderColor,
-                        ),
-                      ),
-                    ),
-                  ),
+                  _buildSenderAvatar(senderName, senderColor),
                   const SizedBox(width: 8),
                   Text(
                     senderName,
@@ -528,60 +689,63 @@ class _ConversationScreenState extends State<ConversationScreen> {
                 ],
               ),
             ),
-          // Message bubble
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                colors: _isGroupChat
-                    ? [senderColor.withOpacity(0.15), senderColor.withOpacity(0.08)]
-                    : [Colors.deepPurple.shade800.withOpacity(0.5), Colors.purple.shade900.withOpacity(0.3)],
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
+          // Message bubble — long press to copy
+          GestureDetector(
+            onLongPress: () => _showMessageOptions(context, message),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: _isGroupChat
+                      ? [senderColor.withOpacity(0.15), senderColor.withOpacity(0.08)]
+                      : [Colors.deepPurple.shade800.withOpacity(0.5), Colors.purple.shade900.withOpacity(0.3)],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                  color: _isGroupChat 
+                      ? senderColor.withOpacity(0.3) 
+                      : Colors.deepPurple.shade600.withOpacity(0.3),
+                  width: 1,
+                ),
               ),
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(
-                color: _isGroupChat 
-                    ? senderColor.withOpacity(0.3) 
-                    : Colors.deepPurple.shade600.withOpacity(0.3),
-                width: 1,
-              ),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // Message text
-                Text(
-                  _sanitizeText(message.message),
-                  style: const TextStyle(
-                    fontSize: 15,
-                    color: Colors.white,
-                    height: 1.4,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Message text
+                  Text(
+                    _sanitizeText(message.message),
+                    style: const TextStyle(
+                      fontSize: 15,
+                      color: Colors.white,
+                      height: 1.4,
+                    ),
                   ),
-                ),
-                const SizedBox(height: 6),
-                // Timestamp and read status
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      _formatMessageTime(message.timestamp),
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: Colors.grey.shade500,
+                  const SizedBox(height: 6),
+                  // Timestamp and read status
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        _formatMessageTime(message.timestamp),
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Colors.grey.shade500,
+                        ),
                       ),
-                    ),
-                    const SizedBox(width: 6),
-                    Icon(
-                      message.isRead == true ? Icons.done_all : Icons.done,
-                      size: 14,
-                      color: message.isRead == true 
-                          ? Colors.blue.shade300 
-                          : Colors.grey.shade600,
-                    ),
-                  ],
-                ),
-              ],
+                      const SizedBox(width: 6),
+                      Icon(
+                        message.isRead == true ? Icons.done_all : Icons.done,
+                        size: 14,
+                        color: message.isRead == true 
+                            ? Colors.blue.shade300 
+                            : Colors.grey.shade600,
+                      ),
+                    ],
+                  ),
+                ],
+              ),
             ),
           ),
         ],

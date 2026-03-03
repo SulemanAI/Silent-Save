@@ -24,7 +24,7 @@ class MessageModel {
   });
 
   Map<String, dynamic> toMap() {
-    return {
+    final map = <String, dynamic>{
       'id': id,
       'sender': sender,
       'message': message,
@@ -34,8 +34,13 @@ class MessageModel {
       'isRead': isRead == true ? 1 : 0,
       'senderName': senderName ?? sender,
       'isGroupChat': isGroupChat == true ? 1 : 0,
-      'avatarPath': avatarPath,
     };
+    // Only include avatarPath if it has a value, to avoid errors
+    // when the column doesn't exist yet in older databases
+    if (avatarPath != null) {
+      map['avatarPath'] = avatarPath;
+    }
+    return map;
   }
 
   factory MessageModel.fromMap(Map<String, dynamic> map) {

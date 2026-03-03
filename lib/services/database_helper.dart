@@ -21,12 +21,46 @@ class DatabaseHelper {
     final dbPath = await getDatabasesPath();
     final path = join(dbPath, filePath);
 
-    return await openDatabase(
+    final db = await openDatabase(
       path,
-      version: 4,  // Updated for avatarPath column
+      version: 5,  // v5: added avatarPath column
       onCreate: _createDB,
       onUpgrade: _onUpgrade,
     );
+
+    // Safety net: ensure avatarPath column exists regardless of migration state.
+    // This handles edge cases where the DB version was bumped but the ALTER failed.
+    await _ensureColumns(db);
+
+    return db;
+  }
+
+  /// Verify critical columns exist and add them if missing.
+  /// This is a safety net for databases where migrations may have been skipped.
+  Future<void> _ensureColumns(Database db) async {
+    try {
+      final columns = await db.rawQuery('PRAGMA table_info(messages)');
+      final columnNames = columns.map((c) => c['name'] as String).toSet();
+
+      if (!columnNames.contains('isRead')) {
+        await db.execute('ALTER TABLE messages ADD COLUMN isRead INTEGER DEFAULT 0');
+        debugPrint('[DatabaseHelper] Added missing column: isRead');
+      }
+      if (!columnNames.contains('senderName')) {
+        await db.execute('ALTER TABLE messages ADD COLUMN senderName TEXT');
+        debugPrint('[DatabaseHelper] Added missing column: senderName');
+      }
+      if (!columnNames.contains('isGroupChat')) {
+        await db.execute('ALTER TABLE messages ADD COLUMN isGroupChat INTEGER DEFAULT 0');
+        debugPrint('[DatabaseHelper] Added missing column: isGroupChat');
+      }
+      if (!columnNames.contains('avatarPath')) {
+        await db.execute('ALTER TABLE messages ADD COLUMN avatarPath TEXT');
+        debugPrint('[DatabaseHelper] Added missing column: avatarPath');
+      }
+    } catch (e) {
+      debugPrint('[DatabaseHelper] _ensureColumns error: $e');
+    }
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
@@ -40,8 +74,19 @@ class DatabaseHelper {
       await db.execute('ALTER TABLE messages ADD COLUMN isGroupChat INTEGER DEFAULT 0');
     }
     if (oldVersion < 4) {
-      // Add avatarPath column for version 4
-      await db.execute('ALTER TABLE messages ADD COLUMN avatarPath TEXT');
+      // Add composite index for fast dedup lookups
+      await db.execute('''
+        CREATE INDEX IF NOT EXISTS idx_dedup 
+        ON messages(sender, app, message, timestamp)
+      ''');
+    }
+    if (oldVersion < 5) {
+      // Add avatarPath column for sender profile pictures
+      try {
+        await db.execute('ALTER TABLE messages ADD COLUMN avatarPath TEXT');
+      } catch (_) {
+        // Column may already exist from _ensureColumns safety net
+      }
     }
   }
 
@@ -61,47 +106,45 @@ class DatabaseHelper {
       )
     ''');
 
-    // Create index for faster queries
+    // Indexes for queries
+    await db.execute('CREATE INDEX idx_timestamp ON messages(timestamp)');
+    await db.execute('CREATE INDEX idx_sender ON messages(sender)');
+    // Composite index for fast dedup checks
     await db.execute('''
-      CREATE INDEX idx_timestamp ON messages(timestamp)
-    ''');
-    
-    await db.execute('''
-      CREATE INDEX idx_sender ON messages(sender)
+      CREATE INDEX idx_dedup ON messages(sender, app, message, timestamp)
     ''');
   }
 
   Future<int> insertMessage(MessageModel message) async {
     final db = await database;
     
-    debugPrint('[DatabaseHelper] Attempting to insert message: sender="${message.sender}", text="${message.message.substring(0, message.message.length > 30 ? 30 : message.message.length)}..."');
-    
-    // Encrypt message first if encryption is enabled
+    // Encrypt message if encryption is enabled
     final isEncrypted = await _encryptionService.isEncryptionEnabled();
     final encryptedMessage = isEncrypted
         ? await _encryptionService.encrypt(message.message)
         : message.message;
     
-    // Check for duplicate message before inserting
-    // A message is considered duplicate if it has the same sender, app, and content
-    // within a 10-second window (to handle notification repeats)
-    // We check against the encrypted message since that's what's stored in the database
+    // Time-window dedup: check for same sender+app+message within ±2 seconds.
+    // WhatsApp/Instagram sometimes re-post the same message with slightly
+    // different timestamps, so exact-match isn't enough.
+    final tsMs = message.timestamp.millisecondsSinceEpoch;
+    const dedupWindowMs = 2000; // ±2 seconds
+    
     final duplicateCheck = await db.query(
       'messages',
-      where: 'sender = ? AND app = ? AND message = ? AND ABS(timestamp - ?) < ?',
+      where: 'sender = ? AND app = ? AND message = ? AND timestamp BETWEEN ? AND ?',
       whereArgs: [
         message.sender,
         message.app,
         encryptedMessage,
-        message.timestamp.millisecondsSinceEpoch, 
-        10000, // 10 second window on either side
+        tsMs - dedupWindowMs,
+        tsMs + dedupWindowMs,
       ],
       limit: 1,
     );
     
     if (duplicateCheck.isNotEmpty) {
-      // Message already exists, skip insertion
-      debugPrint('[DatabaseHelper] Duplicate message found, skipping');
+      debugPrint('[DatabaseHelper] Duplicate (±2s window), skipping');
       return -1;
     }
     
@@ -114,16 +157,74 @@ class DatabaseHelper {
       isRead: message.isRead,
       senderName: message.senderName,
       isGroupChat: message.isGroupChat,
+      avatarPath: message.avatarPath,
     );
     
     final result = await db.insert('messages', messageToInsert.toMap());
-    debugPrint('[DatabaseHelper] Message inserted with ID: $result, isGroupChat: ${message.isGroupChat}, senderName: ${message.senderName}');
-    
-    // Verify insertion
-    final count = Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM messages'));
-    debugPrint('[DatabaseHelper] Total messages in database: $count');
+    debugPrint('[DatabaseHelper] ✓ Saved #$result from "${message.sender}"');
     
     return result;
+  }
+
+  /// Batch insert multiple messages in a single DB transaction.
+  /// Returns the number of messages actually inserted (excluding deduped).
+  Future<int> insertMessages(List<MessageModel> messages) async {
+    if (messages.isEmpty) return 0;
+    
+    final db = await database;
+    final isEncrypted = await _encryptionService.isEncryptionEnabled();
+    int inserted = 0;
+    
+    await db.transaction((txn) async {
+      for (final message in messages) {
+        try {
+          final encryptedMessage = isEncrypted
+              ? await _encryptionService.encrypt(message.message)
+              : message.message;
+          
+          final tsMs = message.timestamp.millisecondsSinceEpoch;
+          const dedupWindowMs = 2000;
+          
+          final duplicateCheck = await txn.query(
+            'messages',
+            where: 'sender = ? AND app = ? AND message = ? AND timestamp BETWEEN ? AND ?',
+            whereArgs: [
+              message.sender,
+              message.app,
+              encryptedMessage,
+              tsMs - dedupWindowMs,
+              tsMs + dedupWindowMs,
+            ],
+            limit: 1,
+          );
+          
+          if (duplicateCheck.isNotEmpty) continue;
+          
+          final messageToInsert = MessageModel(
+            sender: message.sender,
+            message: encryptedMessage,
+            app: message.app,
+            timestamp: message.timestamp,
+            isDeleted: message.isDeleted,
+            isRead: message.isRead,
+            senderName: message.senderName,
+            isGroupChat: message.isGroupChat,
+            avatarPath: message.avatarPath,
+          );
+          
+          await txn.insert('messages', messageToInsert.toMap());
+          inserted++;
+        } catch (e) {
+          debugPrint('[DatabaseHelper] Batch insert error for "${message.sender}": $e');
+        }
+      }
+    });
+    
+    if (inserted > 0) {
+      debugPrint('[DatabaseHelper] ✓ Batch saved $inserted/${messages.length} messages');
+    }
+    
+    return inserted;
   }
 
   Future<List<MessageModel>> getAllMessages() async {
@@ -209,7 +310,8 @@ class DatabaseHelper {
         m.isGroupChat,
         m.avatarPath,
         (SELECT COUNT(*) FROM messages m2 WHERE m2.sender = m.sender AND m2.app = m.app AND m2.isDeleted = 0) as messageCount,
-        (SELECT COUNT(*) FROM messages m3 WHERE m3.sender = m.sender AND m3.app = m.app AND m3.isRead = 0 AND m3.isDeleted = 0) as unreadCount
+        (SELECT COUNT(*) FROM messages m3 WHERE m3.sender = m.sender AND m3.app = m.app AND m3.isRead = 0 AND m3.isDeleted = 0) as unreadCount,
+        (SELECT avatarPath FROM messages m5 WHERE m5.sender = m.sender AND m5.app = m.app AND m5.avatarPath IS NOT NULL AND m5.avatarPath != '' ORDER BY m5.timestamp DESC LIMIT 1) as latestAvatarPath
       FROM messages m
       WHERE m.isDeleted = 0
       AND m.timestamp = (

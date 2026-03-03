@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import '../services/database_helper.dart';
 import '../services/notification_service.dart';
 import '../services/encryption_service.dart';
@@ -30,6 +31,50 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     _checkPermission();
     _loadConversations();
     _checkEncryption();
+
+    // Listen for new messages from NotificationService and auto-refresh
+    NotificationService.instance.newMessageNotifier.addListener(_onNewMessage);
+  }
+
+  @override
+  void dispose() {
+    NotificationService.instance.newMessageNotifier.removeListener(_onNewMessage);
+    WidgetsBinding.instance.removeObserver(this);
+    _searchController.dispose();
+    _tabController.dispose();
+    super.dispose();
+  }
+
+  /// Called by the newMessageNotifier whenever a message is saved.
+  /// Reloads conversations directly from DB without re-triggering notification polling.
+  void _onNewMessage() {
+    _reloadConversationsFromDB();
+  }
+
+  /// Reload conversations from DB only (no notification refresh), to avoid loops.
+  Future<void> _reloadConversationsFromDB() async {
+    try {
+      final conversations = await DatabaseHelper.instance.getConversations()
+          .timeout(const Duration(seconds: 10), onTimeout: () {
+        return <Map<String, dynamic>>[];
+      });
+      if (mounted) {
+        setState(() {
+          _conversations = conversations;
+          _filteredConversations = _searchController.text.isEmpty
+              ? conversations
+              : conversations
+                  .where((conv) => conv['sender']
+                      .toString()
+                      .toLowerCase()
+                      .contains(_searchController.text.toLowerCase()))
+                  .toList();
+          _isLoading = false;
+        });
+      }
+    } catch (e) {
+      debugPrint('[HomeScreen] Error reloading conversations: $e');
+    }
   }
 
   @override
@@ -102,21 +147,13 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     });
   }
 
-  Widget _getAppIconWidget(String packageName, {double size = 24}) {
+  Widget _getAppIcon(String packageName, {double size = 12, Color? color}) {
     if (packageName.contains('whatsapp')) {
-      return Image.asset(
-        'assets/whatsapp_logo.png',
-        width: size,
-        height: size,
-      );
+      return FaIcon(FontAwesomeIcons.whatsapp, size: size, color: color ?? Colors.green);
     } else if (packageName.contains('instagram')) {
-      return Image.asset(
-        'assets/instagram_logo.png',
-        width: size,
-        height: size,
-      );
+      return FaIcon(FontAwesomeIcons.instagram, size: size, color: color ?? Colors.pinkAccent);
     }
-    return Icon(Icons.message, size: size);
+    return Icon(Icons.notifications, size: size, color: color ?? Colors.grey);
   }
 
   String _formatTimestamp(int timestamp) {
@@ -132,43 +169,6 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       return DateFormat('EEEE').format(date);
     } else {
       return DateFormat('MMM dd').format(date);
-    }
-  }
-
-  // Sanitize text to remove invalid UTF-16 characters that could crash the app
-  String _sanitizeText(String? text) {
-    if (text == null || text.isEmpty) return '';
-    try {
-      // Remove isolated surrogate code units which cause UTF-16 errors
-      final buffer = StringBuffer();
-      for (int i = 0; i < text.length; i++) {
-        final codeUnit = text.codeUnitAt(i);
-        // Check if it's a high surrogate (0xD800-0xDBFF)
-        if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
-          // Check if next character is a valid low surrogate
-          if (i + 1 < text.length) {
-            final nextCodeUnit = text.codeUnitAt(i + 1);
-            if (nextCodeUnit >= 0xDC00 && nextCodeUnit <= 0xDFFF) {
-              // Valid surrogate pair - keep both
-              buffer.writeCharCode(codeUnit);
-              buffer.writeCharCode(nextCodeUnit);
-              i++; // Skip the low surrogate
-              continue;
-            }
-          }
-          // Isolated high surrogate - replace with replacement character
-          buffer.write('\uFFFD');
-        } else if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) {
-          // Isolated low surrogate - replace with replacement character
-          buffer.write('\uFFFD');
-        } else {
-          buffer.writeCharCode(codeUnit);
-        }
-      }
-      return buffer.toString();
-    } catch (e) {
-      // If anything fails, return a safe fallback
-      return text.replaceAll(RegExp(r'[\uD800-\uDFFF]'), '\uFFFD');
     }
   }
 
@@ -289,7 +289,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     return Scaffold(
       appBar: AppBar(
         title: const Text(
-          'Silent Save',
+          'SilentSave',
           style: TextStyle(fontWeight: FontWeight.bold),
         ),
         actions: [
@@ -307,13 +307,13 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         ],
         bottom: TabBar(
           controller: _tabController,
-          tabs: [
+          tabs: const [
             Tab(
-              icon: Image.asset('assets/whatsapp_logo.png', width: 28, height: 28),
+              icon: FaIcon(FontAwesomeIcons.whatsapp, size: 24, color: Colors.green),
               text: 'WhatsApp',
             ),
             Tab(
-              icon: Image.asset('assets/instagram_logo.png', width: 28, height: 28),
+              icon: FaIcon(FontAwesomeIcons.instagram, size: 24, color: Colors.pinkAccent),
               text: 'Instagram',
             ),
           ],
@@ -418,26 +418,13 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
   Widget _buildEmptyState(String appPackage) {
     final appName = appPackage.contains('whatsapp') ? 'WhatsApp' : 'Instagram';
-    final isWhatsApp = appPackage.contains('whatsapp');
     
     return Center(
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Container(
-            width: 120,
-            height: 120,
-            padding: const EdgeInsets.all(20),
-            decoration: BoxDecoration(
-              color: Colors.grey.shade800.withOpacity(0.5),
-              shape: BoxShape.circle,
-            ),
-            child: Image.asset(
-              isWhatsApp ? 'assets/whatsapp_logo.png' : 'assets/instagram_logo.png',
-              fit: BoxFit.contain,
-            ),
-          ),
-          const SizedBox(height: 24),
+          _getAppIcon(appPackage, size: 80),
+          const SizedBox(height: 16),
           Text(
             _hasPermission
                 ? 'No $appName messages yet'
@@ -492,17 +479,15 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     final String lastMessage = conversation['lastMessage']?.toString() ?? '';
     final String lastSenderName = conversation['lastSenderName']?.toString() ?? '';
     final String sender = conversation['sender']?.toString() ?? 'Unknown';
-    final String? avatarPath = conversation['avatarPath']?.toString();
-    
-    // Check if avatar file exists
+    final String? avatarPath = conversation['latestAvatarPath']?.toString();
     final bool hasAvatar = avatarPath != null && 
                            avatarPath.isNotEmpty && 
                            File(avatarPath).existsSync();
     
     // Build preview text with sender name for group chats
-    String previewText = _sanitizeText(lastMessage);
+    String previewText = lastMessage;
     if (isGroupChat && lastSenderName.isNotEmpty && lastSenderName != sender) {
-      previewText = '${_sanitizeText(lastSenderName)}: $previewText';
+      previewText = '$lastSenderName: $lastMessage';
     }
     
     // Truncate preview to reasonable length
@@ -541,6 +526,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                 builder: (context) => ConversationScreen(
                   sender: sender,
                   app: conversation['app']?.toString() ?? '',
+                  initialAvatarPath: hasAvatar ? avatarPath : null,
                 ),
               ),
             ).then((_) => _loadConversations());
@@ -564,6 +550,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                           end: Alignment.bottomRight,
                         ),
                         shape: BoxShape.circle,
+                        image: hasAvatar ? DecorationImage(
+                          image: FileImage(File(avatarPath)),
+                          fit: BoxFit.cover,
+                        ) : null,
                         boxShadow: [
                           BoxShadow(
                             color: (isGroupChat ? Colors.teal : Colors.deepPurple).withOpacity(0.3),
@@ -571,10 +561,6 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                             offset: const Offset(0, 2),
                           ),
                         ],
-                        image: hasAvatar ? DecorationImage(
-                          image: FileImage(File(avatarPath!)),
-                          fit: BoxFit.cover,
-                        ) : null,
                       ),
                       child: hasAvatar ? null : Center(
                         child: isGroupChat
@@ -601,11 +587,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                           shape: BoxShape.circle,
                           border: Border.all(color: Colors.grey.shade800, width: 2),
                         ),
-                        child: ClipOval(
-                          child: _getAppIconWidget(
-                            conversation['app']?.toString() ?? '',
-                            size: 16,
-                          ),
+                        child: Center(
+                          child: _getAppIcon(conversation['app']?.toString() ?? '', size: 10),
                         ),
                       ),
                     ),
@@ -735,11 +718,4 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     );
   }
 
-  @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    _searchController.dispose();
-    _tabController.dispose();
-    super.dispose();
-  }
 }

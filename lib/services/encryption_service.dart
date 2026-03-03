@@ -174,8 +174,36 @@ class EncryptionService {
     }
   }
 
+  /// Check if text looks like AES-encrypted base64 output.
+  /// Plain text (with spaces, emojis, punctuation) will fail this check,
+  /// preventing noisy "Invalid or corrupted pad block" errors.
+  bool _isLikelyEncrypted(String text) {
+    if (text.isEmpty || text.length < 24) return false;
+    // AES-CBC output in base64: only base64 chars, length is multiple of 4
+    if (text.length % 4 != 0) return false;
+    // Quick scan: if text contains spaces, newlines, or common non-base64 chars, it's plain text
+    for (int i = 0; i < text.length; i++) {
+      final c = text.codeUnitAt(i);
+      final isBase64 = (c >= 65 && c <= 90) ||  // A-Z
+                       (c >= 97 && c <= 122) || // a-z
+                       (c >= 48 && c <= 57) ||  // 0-9
+                       c == 43 || c == 47 || c == 61; // + / =
+      if (!isBase64) return false;
+    }
+    return true;
+  }
+
+  // Throttle decryption error logging
+  int _decryptErrorCount = 0;
+  static const int _maxDecryptErrors = 3;
+
   Future<String> decrypt(String encryptedText) async {
     try {
+      // Quick check: if text doesn't look like base64-encoded ciphertext, return as-is
+      if (!_isLikelyEncrypted(encryptedText)) {
+        return encryptedText;
+      }
+
       if (_encrypter == null || _iv == null) {
         await initializeEncryption();
       }
@@ -185,9 +213,17 @@ class EncryptionService {
       }
 
       final encrypted = Encrypted.fromBase64(encryptedText);
-      return _encrypter!.decrypt(encrypted, iv: _iv);
+      final result = _encrypter!.decrypt(encrypted, iv: _iv);
+      _decryptErrorCount = 0; // Reset on success
+      return result;
     } catch (e) {
-      debugPrint('[EncryptionService] Decryption error: $e');
+      _decryptErrorCount++;
+      if (_decryptErrorCount <= _maxDecryptErrors) {
+        debugPrint('[EncryptionService] Decryption error ($_decryptErrorCount): $e');
+        if (_decryptErrorCount == _maxDecryptErrors) {
+          debugPrint('[EncryptionService] Suppressing further decryption errors');
+        }
+      }
       return encryptedText; // Return as-is if decryption fails
     }
   }

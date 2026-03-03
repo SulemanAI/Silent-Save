@@ -1,10 +1,10 @@
 # SilentSave - Personal Message Archive App
 
-**SilentSave** is a personal Android app that captures and stores WhatsApp and Instagram DM messages from notification previews. All data remains offline and private.
+**SilentSave** is an open-source Android app that captures and stores WhatsApp and Instagram DM messages from notification previews. All data remains offline and private on your device.
 
 ## ⚠️ Important Notice
 
-This app is for **personal use only** and should not be published to any app store. It captures notification previews for archival purposes.
+This app captures notification previews for personal archival purposes. It is **not intended for distribution on app stores**. Please use responsibly and in compliance with local laws.
 
 ## Features
 
@@ -231,7 +231,7 @@ val cleanupRequest = PeriodicWorkRequestBuilder<CleanupWorker>(
 
 ## 📝 License
 
-This is personal software for private use. Not licensed for distribution or commercial use.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
 
 ## ⚠️ Disclaimer
 
@@ -239,11 +239,17 @@ This app is designed for personal archival purposes. Users are responsible for e
 
 ## 🤝 Contributing
 
-This is a personal project, but you can fork it and customize for your own use.
+Contributions are welcome! Feel free to open issues and submit pull requests.
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
 ## 📞 Support
 
-For issues or questions, please refer to the source code comments or Flutter/Android documentation.
+For issues or questions, please [open an issue](../../issues) on GitHub.
 
 ---
 

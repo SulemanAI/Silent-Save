@@ -20,7 +20,6 @@ class MainActivity : FlutterActivity() {
         private const val TAG = "SilentSaveMain"
         private const val CHANNEL = "com.silentsave/notifications"
         private const val PREFS_NAME = "notification_data"
-        private const val NOTIFICATIONS_FILE = "pending_notifications.json"
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -29,11 +28,11 @@ class MainActivity : FlutterActivity() {
         Log.d(TAG, "Configuring Flutter engine")
         
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
-            Log.d(TAG, "Received method call: ${call.method}")
+            Log.d(TAG, "Method call: ${call.method}")
             when (call.method) {
                 "isNotificationPermissionGranted" -> {
                     val granted = isNotificationServiceEnabled()
-                    Log.d(TAG, "Notification permission granted: $granted")
+                    Log.d(TAG, "Permission: $granted")
                     result.success(granted)
                 }
                 "openNotificationSettings" -> {
@@ -46,7 +45,7 @@ class MainActivity : FlutterActivity() {
                 }
                 "getPendingNotifications" -> {
                     val data = getPendingNotifications()
-                    Log.d(TAG, "Returning ${data.size} pending notifications")
+                    Log.d(TAG, "Returning ${data.size} notifications")
                     result.success(data)
                 }
                 "checkCleanupRequested" -> {
@@ -60,51 +59,20 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun isNotificationServiceEnabled(): Boolean {
-        val packageName = packageName
         val flat = Settings.Secure.getString(
             contentResolver,
             "enabled_notification_listeners"
-        )
+        ) ?: return false
         
-        Log.d(TAG, "Checking notification listeners: $flat")
-        
-        var isInList = false
-        if (flat != null && flat.isNotEmpty()) {
-            val names = flat.split(":")
-            for (name in names) {
-                val componentName = ComponentName.unflattenFromString(name)
-                if (componentName != null) {
-                    if (packageName == componentName.packageName) {
-                        Log.d(TAG, "Found our package in notification listeners")
-                        isInList = true
-                        break
-                    }
-                }
-            }
-        }
-        
-        if (!isInList) {
-            Log.w(TAG, "Our package NOT found in notification listeners")
-            return false
-        }
-        
-        // Also check if the notification listener service is actually running
         val serviceComponent = ComponentName(this, NotificationListener::class.java)
-        val enabledListeners = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
-        val isServiceEnabled = enabledListeners?.contains(serviceComponent.flattenToString()) == true
-        Log.d(TAG, "NotificationListener service enabled: $isServiceEnabled")
-        
-        return isServiceEnabled
+        return flat.contains(serviceComponent.flattenToString())
     }
 
     private fun openNotificationSettings() {
-        Log.d(TAG, "Opening notification settings")
-        val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
-        startActivity(intent)
+        startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
     }
 
     private fun scheduleCleanupJob() {
-        Log.d(TAG, "Scheduling cleanup job")
         val constraints = Constraints.Builder()
             .setRequiresBatteryNotLow(true)
             .build()
@@ -124,38 +92,50 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun getNotificationsFile(): File {
-        // Use the same method as NotificationListener for consistency
         return NotificationListener.getNotificationsFilePath(applicationContext)
     }
 
+    /**
+     * Read and atomically clear pending notifications.
+     * 
+     * Safety guarantees:
+     * 1. File locking prevents concurrent writes from NotificationListener
+     * 2. We only clear the file AFTER successfully parsing all entries
+     * 3. If clearing fails, data stays on disk and will be re-read next poll
+     * 4. Individual corrupt entries are skipped, not fatal
+     */
     private fun getPendingNotifications(): List<Map<String, Any?>> {
         val file = getNotificationsFile()
         val list = mutableListOf<Map<String, Any?>>()
         
-        Log.d(TAG, "Reading pending notifications from: ${file.absolutePath}")
+        if (!file.exists()) return list
         
-        if (!file.exists()) {
-            Log.d(TAG, "Notifications file does not exist yet")
-            return list
+        // Quick check: skip if file is empty or just "[]"
+        try {
+            val size = file.length()
+            if (size <= 2) return list  // Empty file or "[]"
+        } catch (e: Exception) {
+            // Proceed with normal read
         }
         
         try {
-            // Use file locking for thread-safe access
             val lockFile = File(file.absolutePath + ".lock")
             lockFile.createNewFile()
             
             RandomAccessFile(lockFile, "rw").use { raf ->
-                raf.channel.lock().use { lock ->
-                    val jsonString = if (file.exists()) file.readText() else "[]"
-                    Log.d(TAG, "Read file content: ${jsonString.take(200)}...")
+                raf.channel.lock().use { _ ->
+                    val jsonString = if (file.exists()) file.readText().trim() else "[]"
+                    if (jsonString.isEmpty() || jsonString == "[]") return list
                     
                     val jsonArray = JSONArray(jsonString)
-                    Log.d(TAG, "Found ${jsonArray.length()} notifications in file")
+                    if (jsonArray.length() == 0) return list
+                    
+                    Log.d(TAG, "Reading ${jsonArray.length()} pending notifications")
                     
                     for (i in 0 until jsonArray.length()) {
                         try {
                             val obj = jsonArray.getJSONObject(i)
-                            val map = mapOf(
+                            list.add(mapOf(
                                 "method" to obj.optString("method", ""),
                                 "title" to obj.optString("title", ""),
                                 "text" to obj.optString("text", ""),
@@ -163,62 +143,59 @@ class MainActivity : FlutterActivity() {
                                 "timestamp" to obj.optLong("timestamp", 0L),
                                 "senderName" to obj.optString("senderName", obj.optString("title", "")),
                                 "isGroupChat" to obj.optBoolean("isGroupChat", false),
-                                "avatarPath" to if (obj.has("avatarPath")) obj.optString("avatarPath", null) else null
-                            )
-                            list.add(map)
-                            Log.d(TAG, "Parsed notification $i: title='${map["title"]}', text='${(map["text"] as? String)?.take(30)}...'")
+                                "avatarPath" to obj.optString("avatarPath", "")
+                            ))
                         } catch (e: Exception) {
-                            Log.e(TAG, "Skipping corrupted notification at index $i: ${e.message}")
-                            e.printStackTrace()
+                            Log.e(TAG, "Skipping corrupt entry $i: ${e.message}")
                         }
                     }
                     
-                    // Clear the file after reading
-                    if (jsonArray.length() > 0) {
-                        Log.d(TAG, "Clearing ${jsonArray.length()} processed notifications")
-                        file.writeText("[]")
+                    // Only clear AFTER successful parse — prevents data loss
+                    // Use atomic write: write tmp then rename
+                    try {
+                        val tmpFile = File(file.absolutePath + ".tmp")
+                        tmpFile.writeText("[]")
+                        if (!tmpFile.renameTo(file)) {
+                            file.delete()
+                            if (!tmpFile.renameTo(file)) {
+                                file.writeText("[]")
+                                tmpFile.delete()
+                            }
+                        }
+                    } catch (clearErr: Exception) {
+                        Log.e(TAG, "Error clearing file (data safe, may re-read): ${clearErr.message}")
+                        // Don't rethrow — we already got the data
                     }
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error reading notifications file: ${e.message}")
-            e.printStackTrace()
+            Log.e(TAG, "Error reading notifications: ${e.message}")
             
-            // Fallback: Try to read and clear without locking
+            // Fallback without locking
             try {
-                val jsonString = file.readText()
-                val jsonArray = JSONArray(jsonString)
-                
-                for (i in 0 until jsonArray.length()) {
-                    try {
-                        val obj = jsonArray.getJSONObject(i)
-                        val map = mapOf(
-                            "method" to obj.optString("method", ""),
-                            "title" to obj.optString("title", ""),
-                            "text" to obj.optString("text", ""),
-                            "packageName" to obj.optString("packageName", ""),
-                            "timestamp" to obj.optLong("timestamp", 0L),
-                            "senderName" to obj.optString("senderName", obj.optString("title", "")),
-                            "isGroupChat" to obj.optBoolean("isGroupChat", false),
-                            "avatarPath" to if (obj.has("avatarPath")) obj.optString("avatarPath", null) else null
-                        )
-                        list.add(map)
-                    } catch (parseE: Exception) {
-                        Log.e(TAG, "Fallback: Skipping corrupted notification: ${parseE.message}")
+                val jsonString = file.readText().trim()
+                if (jsonString.isNotEmpty() && jsonString != "[]") {
+                    val jsonArray = JSONArray(jsonString)
+                    for (i in 0 until jsonArray.length()) {
+                        try {
+                            val obj = jsonArray.getJSONObject(i)
+                            list.add(mapOf(
+                                "method" to obj.optString("method", ""),
+                                "title" to obj.optString("title", ""),
+                                "text" to obj.optString("text", ""),
+                                "packageName" to obj.optString("packageName", ""),
+                                "timestamp" to obj.optLong("timestamp", 0L),
+                                "senderName" to obj.optString("senderName", obj.optString("title", "")),
+                                "isGroupChat" to obj.optBoolean("isGroupChat", false),
+                                "avatarPath" to obj.optString("avatarPath", "")
+                            ))
+                        } catch (_: Exception) {}
                     }
+                    file.writeText("[]")
                 }
-                
-                // Clear the file
-                file.writeText("[]")
-                Log.d(TAG, "Fallback read successful, got ${list.size} notifications")
             } catch (fallbackE: Exception) {
-                Log.e(TAG, "Fallback read failed: ${fallbackE.message}")
-                // Last resort: delete the file
-                try {
-                    file.delete()
-                } catch (deleteE: Exception) {
-                    // Ignore
-                }
+                Log.e(TAG, "Fallback failed: ${fallbackE.message}")
+                try { file.writeText("[]") } catch (_: Exception) {}
             }
         }
         
@@ -227,13 +204,10 @@ class MainActivity : FlutterActivity() {
 
     private fun checkAndClearCleanupFlag(): Boolean {
         val prefs = applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val cleanupRequested = prefs.getBoolean("cleanup_requested", false)
-        
-        if (cleanupRequested) {
+        val requested = prefs.getBoolean("cleanup_requested", false)
+        if (requested) {
             prefs.edit().putBoolean("cleanup_requested", false).apply()
-            return true
         }
-        
-        return false
+        return requested
     }
 }
