@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SilentSave</string>
+    <string name="accessibility_service_description">SilentSave needs accessibility access to capture messages when WhatsApp or Instagram is open on screen. This helps capture messages that would otherwise be missed when notifications are suppressed.</string>
+</resources>

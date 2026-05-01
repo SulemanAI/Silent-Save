@@ -29,6 +29,9 @@ dependencies:
   # Permissions
   permission_handler: ^11.0.1
 
+  # OEM battery settings (one-time guide, SharedPreferences flag)
+  shared_preferences: ^2.2.2
+
   # Icons
   font_awesome_flutter: ^10.6.0
 

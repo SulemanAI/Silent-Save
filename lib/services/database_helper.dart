@@ -23,7 +23,7 @@ class DatabaseHelper {
 
     final db = await openDatabase(
       path,
-      version: 5,  // v5: added avatarPath column
+      version: 6,  // v6: added mediaPath column
       onCreate: _createDB,
       onUpgrade: _onUpgrade,
     );
@@ -58,6 +58,10 @@ class DatabaseHelper {
         await db.execute('ALTER TABLE messages ADD COLUMN avatarPath TEXT');
         debugPrint('[DatabaseHelper] Added missing column: avatarPath');
       }
+      if (!columnNames.contains('mediaPath')) {
+        await db.execute('ALTER TABLE messages ADD COLUMN mediaPath TEXT');
+        debugPrint('[DatabaseHelper] Added missing column: mediaPath');
+      }
     } catch (e) {
       debugPrint('[DatabaseHelper] _ensureColumns error: $e');
     }
@@ -88,6 +92,12 @@ class DatabaseHelper {
         // Column may already exist from _ensureColumns safety net
       }
     }
+    if (oldVersion < 6) {
+      // Add mediaPath column for media image previews
+      try {
+        await db.execute('ALTER TABLE messages ADD COLUMN mediaPath TEXT');
+      } catch (_) {}
+    }
   }
 
   Future<void> _createDB(Database db, int version) async {
@@ -102,7 +112,8 @@ class DatabaseHelper {
         isRead INTEGER DEFAULT 0,
         senderName TEXT,
         isGroupChat INTEGER DEFAULT 0,
-        avatarPath TEXT
+        avatarPath TEXT,
+        mediaPath TEXT
       )
     ''');
 
@@ -158,6 +169,7 @@ class DatabaseHelper {
       senderName: message.senderName,
       isGroupChat: message.isGroupChat,
       avatarPath: message.avatarPath,
+      mediaPath: message.mediaPath,
     );
     
     final result = await db.insert('messages', messageToInsert.toMap());
@@ -198,7 +210,10 @@ class DatabaseHelper {
             limit: 1,
           );
           
-          if (duplicateCheck.isNotEmpty) continue;
+          if (duplicateCheck.isNotEmpty) {
+            debugPrint('[DatabaseHelper] Dedup skip: "${message.sender}" @${message.timestamp.millisecondsSinceEpoch}ms');
+            continue;
+          }
           
           final messageToInsert = MessageModel(
             sender: message.sender,
@@ -210,6 +225,7 @@ class DatabaseHelper {
             senderName: message.senderName,
             isGroupChat: message.isGroupChat,
             avatarPath: message.avatarPath,
+            mediaPath: message.mediaPath,
           );
           
           await txn.insert('messages', messageToInsert.toMap());
@@ -249,6 +265,7 @@ class DatabaseHelper {
             senderName: messages[i].senderName,
             isGroupChat: messages[i].isGroupChat,
             avatarPath: messages[i].avatarPath,
+            mediaPath: messages[i].mediaPath,
           );
         } catch (e) {
           // If decryption fails, keep original
@@ -286,6 +303,7 @@ class DatabaseHelper {
             senderName: messages[i].senderName,
             isGroupChat: messages[i].isGroupChat,
             avatarPath: messages[i].avatarPath,
+            mediaPath: messages[i].mediaPath,
           );
         } catch (e) {
           // If decryption fails, keep original
@@ -378,6 +396,7 @@ class DatabaseHelper {
             senderName: messages[i].senderName,
             isGroupChat: messages[i].isGroupChat,
             avatarPath: messages[i].avatarPath,
+            mediaPath: messages[i].mediaPath,
           );
           
           // Filter by query on decrypted content
@@ -450,6 +469,48 @@ class DatabaseHelper {
       where: 'sender = ? AND isRead = 0',
       whereArgs: [sender],
     );
+  }
+
+  // Mark all messages as read (for "Mark all read" feature)
+  Future<int> markAllMessagesAsRead() async {
+    final db = await database;
+    return await db.update(
+      'messages',
+      {'isRead': 1},
+      where: 'isRead = 0 AND isDeleted = 0',
+    );
+  }
+
+  // Mark all messages from a specific app as read
+  Future<int> markAllMessagesAsReadByApp(String app) async {
+    final db = await database;
+    return await db.update(
+      'messages',
+      {'isRead': 1},
+      where: 'app LIKE ? AND isRead = 0 AND isDeleted = 0',
+      whereArgs: ['%$app%'],
+    );
+  }
+
+  /// Check if a message already exists in DB (for AccessibilityService dedup)
+  /// Returns true if duplicate exists within the time window
+  Future<bool> isDuplicateMessage(String sender, String message, int timestampMs) async {
+    final db = await database;
+    const dedupWindowMs = 10000; // ±10 seconds for accessibility service
+
+    final result = await db.query(
+      'messages',
+      where: 'sender = ? AND message = ? AND timestamp BETWEEN ? AND ?',
+      whereArgs: [
+        sender,
+        message,
+        timestampMs - dedupWindowMs,
+        timestampMs + dedupWindowMs,
+      ],
+      limit: 1,
+    );
+
+    return result.isNotEmpty;
   }
 
   Future<void> close() async {

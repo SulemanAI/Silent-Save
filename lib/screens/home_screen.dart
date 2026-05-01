@@ -2,6 +2,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../services/database_helper.dart';
 import '../services/notification_service.dart';
 import '../services/encryption_service.dart';
@@ -31,6 +32,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     _checkPermission();
     _loadConversations();
     _checkEncryption();
+    _checkOemBatterySettings();
 
     // Listen for new messages from NotificationService and auto-refresh
     NotificationService.instance.newMessageNotifier.addListener(_onNewMessage);
@@ -86,6 +88,63 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     }
   }
 
+  Future<void> _checkOemBatterySettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final alreadyShown = prefs.getBool('oem_battery_guide_shown') ?? false;
+      if (alreadyShown) return;
+
+      final manufacturer =
+          await NotificationService.instance.getManufacturer();
+      final lower = manufacturer.toLowerCase();
+
+      String? package;
+      if (lower.contains('xiaomi') || lower.contains('redmi')) {
+        package = 'com.miui.securitycenter';
+      } else if (lower.contains('huawei') || lower.contains('honor')) {
+        package = 'com.huawei.systemmanager';
+      } else if (lower.contains('oppo') || lower.contains('realme')) {
+        package = 'com.coloros.safecenter';
+      } else if (lower.contains('vivo')) {
+        package = 'com.vivo.permissionmanagement';
+      }
+
+      if (package == null) return;
+      if (!mounted) return;
+
+      await prefs.setBool('oem_battery_guide_shown', true);
+
+      final oemPackage = package;
+      showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Battery Optimisation'),
+          content: const Text(
+            'Your device manufacturer applies extra battery restrictions. '
+            'To keep SilentSave running in the background, please set it to '
+            '"No restrictions" or "Unrestricted" in Battery settings.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('Later'),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.of(ctx).pop();
+                NotificationService.instance
+                    .openOemBatterySettings(oemPackage);
+              },
+              child: const Text('Open Settings'),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      debugPrint('[HomeScreen] OEM battery check error: $e');
+    }
+  }
+
   Future<void> _checkPermission() async {
     final hasPermission = await NotificationService.instance.isNotificationPermissionGranted();
     debugPrint('[HomeScreen] Notification permission status: $hasPermission');
@@ -93,6 +152,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       _hasPermission = hasPermission;
     });
   }
+
+
 
   Future<void> _checkEncryption() async {
     final enabled = await EncryptionService.instance.isEncryptionEnabled();
@@ -172,6 +233,43 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     }
   }
 
+  // Sanitize text to remove invalid UTF-16 characters that could crash the app
+  String _sanitizeText(String? text) {
+    if (text == null || text.isEmpty) return '';
+    try {
+      // Remove isolated surrogate code units which cause UTF-16 errors
+      final buffer = StringBuffer();
+      for (int i = 0; i < text.length; i++) {
+        final codeUnit = text.codeUnitAt(i);
+        // Check if it's a high surrogate (0xD800-0xDBFF)
+        if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
+          // Check if next character is a valid low surrogate
+          if (i + 1 < text.length) {
+            final nextCodeUnit = text.codeUnitAt(i + 1);
+            if (nextCodeUnit >= 0xDC00 && nextCodeUnit <= 0xDFFF) {
+              // Valid surrogate pair - keep both
+              buffer.writeCharCode(codeUnit);
+              buffer.writeCharCode(nextCodeUnit);
+              i++; // Skip the low surrogate
+              continue;
+            }
+          }
+          // Isolated high surrogate - replace with replacement character
+          buffer.write('\uFFFD');
+        } else if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) {
+          // Isolated low surrogate - replace with replacement character
+          buffer.write('\uFFFD');
+        } else {
+          buffer.writeCharCode(codeUnit);
+        }
+      }
+      return buffer.toString();
+    } catch (e) {
+      // If anything fails, return a safe fallback
+      return text.replaceAll(RegExp(r'[\uD800-\uDFFF]'), '\uFFFD');
+    }
+  }
+
   void _toggleEncryption() async {
     final newValue = !_encryptionEnabled;
     
@@ -248,8 +346,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                       ),
                       const SizedBox(height: 4),
                       Text(
-                        _encryptionEnabled 
-                          ? 'Messages are encrypted' 
+                        _encryptionEnabled
+                          ? 'Messages are encrypted'
                           : 'Messages are not encrypted',
                         style: TextStyle(
                           fontSize: 14,
@@ -284,6 +382,34 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     );
   }
 
+  Future<void> _markAllAsRead() async {
+    final count = await DatabaseHelper.instance.markAllMessagesAsRead();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Marked $count messages as read'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+      _loadConversations();
+    }
+  }
+
+  Future<void> _markCurrentTabAsRead() async {
+    final app = _tabController.index == 0 ? 'com.whatsapp' : 'com.instagram.android';
+    final count = await DatabaseHelper.instance.markAllMessagesAsReadByApp(app);
+    final appName = _tabController.index == 0 ? 'WhatsApp' : 'Instagram';
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Marked $count $appName messages as read'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+      _loadConversations();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -293,6 +419,39 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           style: TextStyle(fontWeight: FontWeight.bold),
         ),
         actions: [
+          // Mark all read menu
+          PopupMenuButton<String>(
+            icon: const Icon(Icons.more_vert),
+            onSelected: (value) async {
+              if (value == 'mark_all_read') {
+                await _markAllAsRead();
+              } else if (value == 'mark_tab_read') {
+                await _markCurrentTabAsRead();
+              }
+            },
+            itemBuilder: (context) => [
+              const PopupMenuItem(
+                value: 'mark_tab_read',
+                child: Row(
+                  children: [
+                    Icon(Icons.done, size: 20),
+                    SizedBox(width: 12),
+                    Text('Mark tab as read'),
+                  ],
+                ),
+              ),
+              const PopupMenuItem(
+                value: 'mark_all_read',
+                child: Row(
+                  children: [
+                    Icon(Icons.done_all, size: 20),
+                    SizedBox(width: 12),
+                    Text('Mark all as read'),
+                  ],
+                ),
+              ),
+            ],
+          ),
           GestureDetector(
             onTap: _loadConversations,
             onLongPress: _showEncryptionOptions,
@@ -387,6 +546,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     );
   }
 
+
+
   Widget _buildSearchBar() {
     return Padding(
       padding: const EdgeInsets.all(16),
@@ -476,20 +637,21 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   Widget _buildConversationCard(Map<String, dynamic> conversation) {
     final bool isGroupChat = conversation['isGroupChat'] == 1;
     final int unreadCount = (conversation['unreadCount'] as int?) ?? 0;
-    final String lastMessage = conversation['lastMessage']?.toString() ?? '';
-    final String lastSenderName = conversation['lastSenderName']?.toString() ?? '';
-    final String sender = conversation['sender']?.toString() ?? 'Unknown';
+    final String lastMessage = _sanitizeText(conversation['lastMessage']?.toString());
+    final String lastSenderName = _sanitizeText(conversation['lastSenderName']?.toString());
+    final String rawSender = _sanitizeText(conversation['sender']?.toString());
+    final String sender = rawSender.isNotEmpty ? rawSender : 'Unknown';
     final String? avatarPath = conversation['latestAvatarPath']?.toString();
-    final bool hasAvatar = avatarPath != null && 
-                           avatarPath.isNotEmpty && 
+    final bool hasAvatar = avatarPath != null &&
+                           avatarPath.isNotEmpty &&
                            File(avatarPath).existsSync();
-    
+
     // Build preview text with sender name for group chats
     String previewText = lastMessage;
     if (isGroupChat && lastSenderName.isNotEmpty && lastSenderName != sender) {
       previewText = '$lastSenderName: $lastMessage';
     }
-    
+
     // Truncate preview to reasonable length
     if (previewText.length > 50) {
       previewText = '${previewText.substring(0, 47)}...';

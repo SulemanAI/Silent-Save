@@ -7,10 +7,16 @@ import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.content.Context
 import android.util.Log
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -26,7 +32,7 @@ class NotificationListener : NotificationListenerService() {
         private const val WHATSAPP_BUSINESS_PACKAGE = "com.whatsapp.w4b"
         private const val INSTAGRAM_PACKAGE = "com.instagram.android"
         private const val NOTIFICATIONS_FILE = "pending_notifications.json"
-        private const val MAX_QUEUE_SIZE = 500
+        private const val MAX_QUEUE_SIZE = 2000
         
         // Dedup: Use LinkedHashSet for proper FIFO eviction order
         // Store SHA-256 hashes instead of full strings to save memory
@@ -47,6 +53,8 @@ class NotificationListener : NotificationListenerService() {
             Regex("^\\d+\\s+new\\s+notification.*$", RegexOption.IGNORE_CASE)
         )
         
+        // ONLY skip true system/status notifications — NOT actual message content.
+        // Previously this list was too aggressive and dropped legit messages.
         private val SUMMARY_PATTERNS = listOf(
             Regex("^Check your messages$", RegexOption.IGNORE_CASE),
             Regex("^You have new messages?$", RegexOption.IGNORE_CASE),
@@ -55,12 +63,11 @@ class NotificationListener : NotificationListenerService() {
             Regex("^Missed (voice|video) call$", RegexOption.IGNORE_CASE),
             Regex("^Ongoing (voice|video) call$", RegexOption.IGNORE_CASE),
             Regex("^Ringing\\.\\.\\.?$", RegexOption.IGNORE_CASE),
-            Regex("^Status from .+$", RegexOption.IGNORE_CASE),
             Regex("^New status updates?$", RegexOption.IGNORE_CASE),
             Regex("^Backup in progress.*$", RegexOption.IGNORE_CASE),
             Regex("^Checking for new messages.*$", RegexOption.IGNORE_CASE),
             Regex("^Waiting for network.*$", RegexOption.IGNORE_CASE),
-            Regex("^Connecting.*$", RegexOption.IGNORE_CASE),
+            Regex("^Connecting\\.{0,3}$", RegexOption.IGNORE_CASE),
             Regex("^WhatsApp Web is currently active$", RegexOption.IGNORE_CASE),
             Regex("^WhatsApp Web.*$", RegexOption.IGNORE_CASE),
             Regex("^End-to-end encrypted$", RegexOption.IGNORE_CASE)
@@ -103,6 +110,12 @@ class NotificationListener : NotificationListenerService() {
             if (!dir.exists()) dir.mkdirs()
             return dir
         }
+
+        fun getMediaDir(context: Context): File {
+            val dir = File(context.filesDir, "media")
+            if (!dir.exists()) dir.mkdirs()
+            return dir
+        }
         
         /**
          * Compute a short SHA-256 hash of the dedup key to save memory.
@@ -125,6 +138,10 @@ class NotificationListener : NotificationListenerService() {
     private lateinit var dedupPrefs: SharedPreferences
     // Track how many messages saved since last persist, to batch disk writes
     private var savesSinceLastPersist = 0
+    
+    // Partial WakeLock to keep the CPU alive while processing notifications.
+    // Acquired in onListenerConnected, released in onListenerDisconnected/onDestroy.
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -217,6 +234,20 @@ class NotificationListener : NotificationListenerService() {
         super.onListenerConnected()
         Log.i(TAG, "=== NotificationListener CONNECTED ===")
         
+        // Start the foreground KeepAliveService to prevent OEM battery managers
+        // from killing the app process. This is the #1 fix for missed messages.
+        try {
+            KeepAliveService.start(applicationContext)
+            Log.i(TAG, "KeepAliveService started from NLS connect")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start KeepAliveService: ${e.message}")
+        }
+        
+        // Acquire a partial WakeLock to keep the CPU alive for notification processing.
+        // PARTIAL_WAKE_LOCK only prevents the CPU from sleeping — it does NOT keep
+        // the screen on, so there is no UX impact.
+        acquireProcessingWakeLock()
+        
         try {
             val file = getNotificationsFile()
             ensureValidNotificationsFile(file)
@@ -224,12 +255,28 @@ class NotificationListener : NotificationListenerService() {
             Log.e(TAG, "Error on connect: ${e.message}")
         }
         
-        try {
-            val count = activeNotifications?.size ?: 0
-            Log.i(TAG, "Active notifications on connect: $count")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error reading active notifications: ${e.message}")
-        }
+        // Re-process every currently visible notification so nothing is missed
+        // when the service first starts or reconnects after being unbound
+        // (e.g. phone reboot, permission re-grant, system-initiated rebind).
+        // Runs on a background thread to avoid blocking the service callback.
+        // Dedup hashes restored in onCreate() prevent re-saving already-saved messages.
+        Thread {
+            try {
+                val active = activeNotifications
+                if (!active.isNullOrEmpty()) {
+                    Log.i(TAG, "Re-processing ${active.size} active notification(s) on connect")
+                    for (sbn in active) {
+                        try { onNotificationPosted(sbn) } catch (e: Exception) {
+                            Log.e(TAG, "Error re-processing active sbn: ${e.message}")
+                        }
+                    }
+                } else {
+                    Log.i(TAG, "No active notifications to re-process on connect")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error processing active notifications on connect: ${e.message}")
+            }
+        }.start()
     }
 
     override fun onListenerDisconnected() {
@@ -237,6 +284,7 @@ class NotificationListener : NotificationListenerService() {
         Log.w(TAG, "=== NotificationListener DISCONNECTED ===")
         
         persistProcessedIds()
+        releaseWakeLock()
         
         try {
             requestRebind(android.content.ComponentName(this, NotificationListener::class.java))
@@ -244,11 +292,58 @@ class NotificationListener : NotificationListenerService() {
         } catch (e: Exception) {
             Log.e(TAG, "Error requesting rebind: ${e.message}")
         }
+        
+        // Also trigger an immediate health check to rebind as fast as possible
+        try {
+            NlsHealthWorker.runNow(applicationContext)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to trigger health check: ${e.message}")
+        }
     }
     
     override fun onDestroy() {
         persistProcessedIds()
+        releaseWakeLock()
         super.onDestroy()
+    }
+    
+    private fun releaseWakeLock() {
+        try {
+            wakeLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                    Log.d(TAG, "WakeLock released")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "WakeLock release failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Acquire (or renew) a partial WakeLock to keep the CPU alive.
+     * Called on connect, and on every notification posted to ensure
+     * the CPU doesn't sleep between notifications.
+     */
+    private fun acquireProcessingWakeLock() {
+        try {
+            if (wakeLock == null) {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                wakeLock = pm.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "SilentSave::NLSWakeLock"
+                ).apply {
+                    setReferenceCounted(false)
+                }
+            }
+            // 25-minute timeout — continuously renewed on each notification
+            // so it never expires as long as notifications keep arriving.
+            // When notifications stop, the lock auto-releases after 25 min
+            // (the KeepAliveService has its own perpetual lock as backup).
+            wakeLock?.acquire(25 * 60 * 1000L)
+        } catch (e: Exception) {
+            Log.w(TAG, "WakeLock acquire failed: ${e.message}")
+        }
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
@@ -258,11 +353,19 @@ class NotificationListener : NotificationListenerService() {
         
         // O(1) package check
         if (packageName !in TARGET_PACKAGES) return
+        
+        // Renew WakeLock on every notification to prevent CPU sleep
+        acquireProcessingWakeLock()
+        
+        Log.d(TAG, ">>> onNotificationPosted from $packageName")
 
         val notification = sbn.notification ?: return
         
         // Skip group summaries
-        if ((notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
+        if ((notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0) {
+            Log.d(TAG, "Skipping group summary notification")
+            return
+        }
         
         val extras = notification.extras ?: return
 
@@ -272,31 +375,41 @@ class NotificationListener : NotificationListenerService() {
         val rawTitle = rawConversationTitle ?: rawAndroidTitle
         val title = cleanGroupName(rawTitle, extras)
         
+        Log.d(TAG, "Title: '$title', rawTitle: '$rawTitle'")
+        
         // Skip system/empty notifications
-        if (!shouldProcessNotification(packageName, title, extras)) return
+        if (!shouldProcessNotification(packageName, title, extras)) {
+            Log.d(TAG, "Skipping: shouldProcessNotification returned false")
+            return
+        }
         
         val isGroupChat = rawConversationTitle != null
         
         // Extract and save the profile picture from the notification
         // For groups: saves group DP (from large icon). For personal: saves sender DP.
         val avatarPath = extractAndSaveAvatar(notification, extras, title, packageName, isGroupChat)
+
+        // Extract BigPictureStyle image if present (photo/video thumbnail/sticker).
+        // Returns null for plain-text messages; non-null only when the notification
+        // carries an actual picture (e.g. WhatsApp "📷 Photo" messages).
+        val mediaPicturePath = extractAndSaveMediaPicture(extras, title, packageName, sbn.postTime)
         
         // Process in priority order
         // If MessagingStyle exists, use it exclusively (even if all messages were deduped)
         // to prevent fallthrough to less reliable methods that could cause duplicates
-        val msgStyleResult = processMessagingStyleAll(extras, title, packageName, sbn.postTime, isGroupChat, avatarPath)
+        val msgStyleResult = processMessagingStyleAll(extras, title, packageName, sbn.postTime, isGroupChat, avatarPath, mediaPicturePath)
         val processed = if (msgStyleResult != 0) {
             // MessagingStyle had content — don't fallthrough
             maxOf(msgStyleResult, 0)
         } else {
             // No MessagingStyle — try other extraction methods
-            val textResult = processTextLinesAll(extras, title, packageName, sbn.postTime, isGroupChat, avatarPath)
+            val textResult = processTextLinesAll(extras, title, packageName, sbn.postTime, isGroupChat, avatarPath, mediaPicturePath)
             if (textResult != 0) {
                 maxOf(textResult, 0)
             } else {
-                processRemoteInputLatest(extras, title, packageName, sbn.postTime, isGroupChat, avatarPath)
+                processRemoteInputLatest(extras, title, packageName, sbn.postTime, isGroupChat, avatarPath, mediaPicturePath)
                     .takeIf { it > 0 }
-                    ?: processSingleMessage(extras, title, packageName, sbn.postTime, isGroupChat, avatarPath)
+                    ?: processSingleMessage(extras, title, packageName, sbn.postTime, isGroupChat, avatarPath, mediaPicturePath)
             }
         }
         
@@ -317,12 +430,23 @@ class NotificationListener : NotificationListenerService() {
                 return false
             }
         } else {
-            // Instagram: skip blank titles
+            // Instagram: be VERY permissive — Instagram sends DMs, story replies,
+            // group chat messages, and mentions all as notifications.
+            // Only skip truly blank notifications.
             if (title.isBlank()) return false
-            // Skip pure summary Instagram notifications
+            
+            // ONLY skip if title is "Instagram" AND text is a pure count-only summary.
+            // Do NOT skip if the text contains actual message content.
             if (title.equals("Instagram", ignoreCase = true)) {
-                val text = extras.getCharSequence("android.text")?.toString() ?: ""
-                if (text.isBlank() || isCountSummaryMessage(text)) return false
+                val text = extras.getCharSequence("android.text")?.toString()?.trim() ?: ""
+                // Only skip if text is EMPTY or PURELY a count summary like "5 new messages"
+                if (text.isBlank()) return false
+                if (isCountSummaryMessage(text)) {
+                    Log.d(TAG, "Skipping Instagram count summary: '$text'")
+                    return false
+                }
+                // Text has actual content (DM, mention, etc.) — PROCESS it
+                Log.d(TAG, "Instagram title='Instagram' but has content: '${text.take(50)}'")
             }
         }
         return true
@@ -389,8 +513,12 @@ class NotificationListener : NotificationListenerService() {
                 // Method 2: Legacy large icon bitmap
                 if (bitmap == null) {
                     try {
-                        @Suppress("DEPRECATION")
-                        bitmap = extras.getParcelable<Bitmap>("android.largeIcon")
+                        bitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            extras.getParcelable("android.largeIcon", Bitmap::class.java)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            extras.getParcelable<Bitmap>("android.largeIcon")
+                        }
                     } catch (e: Exception) {
                         Log.d(TAG, "Legacy largeIcon extraction failed: ${e.message}")
                     }
@@ -400,10 +528,22 @@ class NotificationListener : NotificationListenerService() {
                 
                 // Method 1: MessagingStyle Person icon
                 try {
-                    val messages = extras.getParcelableArray("android.messages")
-                    if (messages != null && messages.isNotEmpty()) {
-                        val lastMsg = messages.last() as? Bundle
-                        val senderPerson = lastMsg?.getParcelable<android.app.Person>("sender_person")
+                    @Suppress("DEPRECATION")
+                    val msgArr = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        extras.getParcelableArray("android.messages", Bundle::class.java)
+                    } else {
+                        extras.getParcelableArray("android.messages")
+                    }
+                    if (msgArr != null && msgArr.isNotEmpty()) {
+                        val lastMsg = msgArr.last() as? Bundle
+                        val senderPerson = lastMsg?.let {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                it.getParcelable("sender_person", android.app.Person::class.java)
+                            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                                @Suppress("DEPRECATION")
+                                it.getParcelable<android.app.Person>("sender_person")
+                            } else null
+                        }
                         val icon = senderPerson?.icon
                         if (icon != null) {
                             val drawable = icon.loadDrawable(applicationContext)
@@ -434,8 +574,12 @@ class NotificationListener : NotificationListenerService() {
                 // Method 3: Legacy large icon bitmap
                 if (bitmap == null) {
                     try {
-                        @Suppress("DEPRECATION")
-                        bitmap = extras.getParcelable<Bitmap>("android.largeIcon")
+                        bitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            extras.getParcelable("android.largeIcon", Bitmap::class.java)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            extras.getParcelable<Bitmap>("android.largeIcon")
+                        }
                     } catch (e: Exception) {
                         Log.d(TAG, "Legacy largeIcon extraction failed: ${e.message}")
                     }
@@ -466,7 +610,12 @@ class NotificationListener : NotificationListenerService() {
         messageBundle: Bundle, senderName: String, packageName: String
     ): String? {
         try {
-            val senderPerson = messageBundle.getParcelable<android.app.Person>("sender_person")
+            val senderPerson = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                messageBundle.getParcelable("sender_person", android.app.Person::class.java)
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                @Suppress("DEPRECATION")
+                messageBundle.getParcelable<android.app.Person>("sender_person")
+            } else null
             val icon = senderPerson?.icon ?: return null
             val drawable = icon.loadDrawable(applicationContext) ?: return null
             val bitmap = (drawable as? BitmapDrawable)?.bitmap ?: return null
@@ -502,6 +651,47 @@ class NotificationListener : NotificationListenerService() {
     }
 
     /**
+     * Extract and save the BigPictureStyle image from the notification.
+     * WhatsApp uses android.picture for photo/sticker messages — this is the
+     * actual image preview shown in the expanded notification shade.
+     * Returns the saved JPEG file path, or null when no picture is present
+     * (i.e. for plain text, voice, or video messages without a thumbnail).
+     */
+    private fun extractAndSaveMediaPicture(
+        extras: Bundle, title: String, packageName: String, timestamp: Long
+    ): String? {
+        try {
+            val picture: Bitmap? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                extras.getParcelable("android.picture", Bitmap::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                extras.getParcelable<Bitmap>("android.picture")
+            }
+            if (picture == null || picture.width <= 1 || picture.height <= 1) return null
+
+            val safeTitle = title.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(30)
+            val appPrefix = when {
+                packageName.contains("whatsapp") -> "wa"
+                packageName.contains("instagram") -> "ig"
+                else -> "other"
+            }
+            val fileName = "${appPrefix}_media_${safeTitle}_${timestamp}.jpg"
+            val mediaDir = getMediaDir(applicationContext)
+            val mediaFile = File(mediaDir, fileName)
+
+            FileOutputStream(mediaFile).use { fos ->
+                picture.compress(Bitmap.CompressFormat.JPEG, 85, fos)
+                fos.flush()
+            }
+            Log.d(TAG, "Media picture saved: $fileName (${picture.width}x${picture.height})")
+            return mediaFile.absolutePath
+        } catch (e: Exception) {
+            Log.e(TAG, "Error extracting media picture: ${e.message}")
+            return null
+        }
+    }
+
+    /**
      * MessagingStyle: Process ALL unseen messages from the bundle in a single
      * batch file write.
      * 
@@ -516,26 +706,44 @@ class NotificationListener : NotificationListenerService() {
      */
     private fun processMessagingStyleAll(
         extras: Bundle, title: String, packageName: String,
-        postTime: Long, isGroupChat: Boolean, avatarPath: String? = null
+        postTime: Long, isGroupChat: Boolean, avatarPath: String? = null,
+        mediaPicturePath: String? = null
     ): Int {
         try {
-            val messages = extras.getParcelableArray("android.messages")
-            if (messages.isNullOrEmpty()) return 0
+            // API 33+ deprecates the untyped getParcelableArray — use typed form to avoid
+            // silent null returns that cause the entire MessagingStyle path to be skipped.
+            @Suppress("DEPRECATION")
+            val rawMessages = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                extras.getParcelableArray("android.messages", Bundle::class.java)
+            } else {
+                extras.getParcelableArray("android.messages")
+            }
+            if (rawMessages.isNullOrEmpty()) return 0
             
             val toSave = mutableListOf<JSONObject>()
             var hadValidMessages = false
             
-            for (msg in messages) {
+            for (msg in rawMessages) {
                 val bundle = msg as? Bundle ?: continue
                 
                 val msgText = bundle.getCharSequence("text")?.toString()
-                if (msgText.isNullOrBlank() || isSummaryMessage(msgText)) continue
+                // Only apply count-summary filter here — these are actual message BODY texts,
+                // not notification-level summaries. The full isSummaryMessage() is too
+                // aggressive and drops legitimate messages matching patterns like
+                // "Status from: …" or "typing..." sent as chat content.
+                if (msgText.isNullOrBlank() || isCountSummaryMessage(msgText)) continue
                 
                 hadValidMessages = true
                 
                 val msgSender = bundle.getCharSequence("sender")?.toString()
+                // API 33+ requires typed getParcelable to avoid silent null returns.
                 val senderPerson = try {
-                    bundle.getParcelable<android.app.Person>("sender_person")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        bundle.getParcelable("sender_person", android.app.Person::class.java)
+                    } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                        @Suppress("DEPRECATION")
+                        bundle.getParcelable<android.app.Person>("sender_person")
+                    } else null
                 } catch (e: Exception) { null }
                 val senderName = msgSender ?: senderPerson?.name?.toString() ?: title
                 val msgTime = bundle.getLong("time", postTime)
@@ -546,6 +754,7 @@ class NotificationListener : NotificationListenerService() {
                 
                 val isDuplicate = synchronized(processedHashes) {
                     if (processedHashes.contains(hash)) {
+                        Log.d(TAG, "Dedup: skipping duplicate (hash=$hash) '$msgText'")
                         true
                     } else {
                         processedHashes.add(hash)
@@ -575,6 +784,12 @@ class NotificationListener : NotificationListenerService() {
                     if (avatarPath != null) put("avatarPath", avatarPath)
                 })
             }
+
+            // Attribute the picture to the LAST (most recent) message in the batch —
+            // android.picture is notification-level, not per-message.
+            if (mediaPicturePath != null && toSave.isNotEmpty()) {
+                toSave.last().put("mediaPath", mediaPicturePath)
+            }
             
             if (toSave.isNotEmpty()) {
                 val saved = saveNotificationsBatch(toSave)
@@ -601,7 +816,8 @@ class NotificationListener : NotificationListenerService() {
      */
     private fun processTextLinesAll(
         extras: Bundle, title: String, packageName: String,
-        postTime: Long, isGroupChat: Boolean, avatarPath: String? = null
+        postTime: Long, isGroupChat: Boolean, avatarPath: String? = null,
+        mediaPicturePath: String? = null
     ): Int {
         try {
             val textLines = extras.getCharSequenceArray("android.textLines")
@@ -618,8 +834,14 @@ class NotificationListener : NotificationListenerService() {
                 
                 val (senderName, actualMessage) = extractSenderFromText(lineText, title, isGroupChat)
                 
-                // Use title+text+index as dedup key (no per-message timestamp available)
-                val dedupKey = "textline|$title|$actualMessage|$index"
+                // Use title+text+postTime as dedup key — deliberately excludes the
+                // array index. WhatsApp/Instagram keep all prior messages in the
+                // textLines bundle and add new ones, so indices shift on every new
+                // message. Including the index caused already-saved messages to appear
+                // unique (different hash) when they moved to a different position.
+                // We DO include postTime because without it, repeated identical messages
+                // ("ok", "hello", emoji reactions) get incorrectly deduplicated.
+                val dedupKey = "textline|$title|$actualMessage|$postTime"
                 val hash = computeHash(dedupKey)
                 
                 val isDuplicate = synchronized(processedHashes) {
@@ -648,6 +870,10 @@ class NotificationListener : NotificationListenerService() {
                     if (avatarPath != null) put("avatarPath", avatarPath)
                 })
             }
+
+            if (mediaPicturePath != null && toSave.isNotEmpty()) {
+                toSave.last().put("mediaPath", mediaPicturePath)
+            }
             
             if (toSave.isNotEmpty()) {
                 val saved = saveNotificationsBatch(toSave)
@@ -668,7 +894,8 @@ class NotificationListener : NotificationListenerService() {
      */
     private fun processRemoteInputLatest(
         extras: Bundle, title: String, packageName: String,
-        postTime: Long, isGroupChat: Boolean, avatarPath: String? = null
+        postTime: Long, isGroupChat: Boolean, avatarPath: String? = null,
+        mediaPicturePath: String? = null
     ): Int {
         try {
             val history = extras.getCharSequenceArray("android.remoteInputHistory")
@@ -682,7 +909,7 @@ class NotificationListener : NotificationListenerService() {
                 title = title, text = newest,
                 packageName = packageName, timestamp = postTime,
                 senderName = title, isGroupChat = isGroupChat,
-                avatarPath = avatarPath
+                avatarPath = avatarPath, mediaPath = mediaPicturePath
             )
         } catch (e: Exception) {
             Log.e(TAG, "Error in processRemoteInputLatest: ${e.message}")
@@ -692,20 +919,28 @@ class NotificationListener : NotificationListenerService() {
 
     /**
      * Fallback single message extraction from various notification extras.
+     * Prioritizes bigText (expanded notification) over text (collapsed view)
+     * because bigText often contains the full message content.
      */
     private fun processSingleMessage(
         extras: Bundle, title: String, packageName: String,
-        postTime: Long, isGroupChat: Boolean, avatarPath: String? = null
+        postTime: Long, isGroupChat: Boolean, avatarPath: String? = null,
+        mediaPicturePath: String? = null
     ): Int {
-        var text = extras.getCharSequence("android.text")?.toString() ?: ""
-        val bigText = extras.getCharSequence("android.bigText")?.toString() ?: ""
+        // PRIORITY: bigText first (expanded view has full content), then text (collapsed view)
+        val bigText = extras.getCharSequence("android.bigText")?.toString()?.trim() ?: ""
+        val smallText = extras.getCharSequence("android.text")?.toString()?.trim() ?: ""
         val tickerText = extras.getCharSequence("android.tickerText")?.toString() ?: ""
         val subText = extras.getCharSequence("android.subText")?.toString() ?: ""
         val infoText = extras.getCharSequence("android.infoText")?.toString() ?: ""
-        
-        // Prefer bigText if it's richer, then try fallbacks
-        if (bigText.isNotBlank() && bigText.length > text.length) text = bigText
-        if (text.isBlank()) text = listOf(tickerText, subText, infoText).firstOrNull { it.isNotBlank() } ?: ""
+
+        // Use bigText as primary source, fall back to smallText only if bigText is empty
+        var text = when {
+            bigText.isNotBlank() && !isCountSummaryMessage(bigText) -> bigText
+            smallText.isNotBlank() -> smallText
+            else -> listOf(tickerText, subText, infoText).firstOrNull { it.isNotBlank() } ?: ""
+        }
+
         if (text.isBlank() || isCountSummaryMessage(text)) return 0
         
         // Instagram with title="Instagram": extract sender from text
@@ -717,7 +952,7 @@ class NotificationListener : NotificationListenerService() {
                 title = resolvedTitle, text = message,
                 packageName = packageName, timestamp = postTime,
                 senderName = sender, isGroupChat = false,
-                avatarPath = avatarPath
+                avatarPath = avatarPath, mediaPath = mediaPicturePath
             )
         }
         
@@ -728,7 +963,7 @@ class NotificationListener : NotificationListenerService() {
             title = title, text = actualMessage,
             packageName = packageName, timestamp = postTime,
             senderName = senderName, isGroupChat = isGroupChat,
-            avatarPath = avatarPath
+            avatarPath = avatarPath, mediaPath = mediaPicturePath
         )
     }
 
@@ -761,32 +996,23 @@ class NotificationListener : NotificationListenerService() {
         val trimmed = text.trim()
         if (trimmed.isEmpty() || trimmed.length < 2) return true
         if (isCountSummaryMessage(trimmed)) return true
+        // Only match EXACT system patterns — if the message is longer than 60 chars
+        // it's almost certainly actual content, not a system summary
+        if (trimmed.length > 60) return false
         return SUMMARY_PATTERNS.any { it.matches(trimmed) }
     }
 
     override fun onNotificationRemoved(sbn: StatusBarNotification?) {
+        // Intentional NO-OP: Previously this saved "removed" events to the queue file,
+        // which wasted slots in the 500-item queue and caused real messages to be
+        // evicted. The Flutter side already ignores these events (the handler is a
+        // no-op), so there is zero value in capturing them.
+        // Read-state is managed exclusively by the Flutter UI when the user opens
+        // a conversation, not by OS-level notification dismissals.
         if (sbn == null) return
         val packageName = sbn.packageName ?: return
         if (packageName !in TARGET_PACKAGES) return
-
-        val notification = sbn.notification ?: return
-        val extras = notification.extras ?: return
-
-        val rawConversationTitle = extras.getCharSequence("android.conversationTitle")?.toString()
-        val rawTitle = rawConversationTitle ?: extras.getCharSequence("android.title")?.toString() ?: ""
-        val title = cleanGroupName(rawTitle, extras)
-        val text = extras.getCharSequence("android.text")?.toString() ?: ""
-
-        if (title.isNotBlank() && 
-            !title.equals("WhatsApp", ignoreCase = true) &&
-            !title.equals("WhatsApp Business", ignoreCase = true)) {
-            saveNotification(
-                method = "onNotificationRemoved",
-                title = title, text = text,
-                packageName = packageName, timestamp = sbn.postTime,
-                senderName = title, isGroupChat = rawConversationTitle != null
-            )
-        }
+        Log.d(TAG, "Notification removed from $packageName (ignored — not saved to queue)")
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -811,7 +1037,7 @@ class NotificationListener : NotificationListenerService() {
         method: String, title: String, text: String,
         packageName: String, timestamp: Long,
         senderName: String, isGroupChat: Boolean,
-        avatarPath: String? = null
+        avatarPath: String? = null, mediaPath: String? = null
     ): Int {
         // Dedup check using content hash
         val dedupKey = "$title|$text|$timestamp"
@@ -875,6 +1101,7 @@ class NotificationListener : NotificationListenerService() {
                         put("senderName", senderName)
                         put("isGroupChat", isGroupChat)
                         if (avatarPath != null) put("avatarPath", avatarPath)
+                        if (mediaPath != null) put("mediaPath", mediaPath)
                     })
                     
                     // Write to temp file first, then rename (atomic on most filesystems)
@@ -911,6 +1138,7 @@ class NotificationListener : NotificationListenerService() {
                     put("senderName", senderName)
                     put("isGroupChat", isGroupChat)
                     if (avatarPath != null) put("avatarPath", avatarPath)
+                    if (mediaPath != null) put("mediaPath", mediaPath)
                 })
                 file.writeText(jsonArray.toString())
                 Log.d(TAG, "Fallback save OK")

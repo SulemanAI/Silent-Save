@@ -1,11 +1,16 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
-    
+
     <!-- Required permissions for notification listener -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Allows showing the system dialog to request battery optimization exemption,
+         keeping NotificationListenerService alive on Android 6+ / 12+. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <application
         android:label="Silent Save"
         android:name="${applicationName}"
@@ -32,8 +37,11 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
-        
-        <!-- Notification Listener Service -->
+
+        <!-- Notification Listener Service (Event-Driven Architecture)
+             Android manages the lifecycle natively. The OS wakes the service
+             on each notification, saves the message, then sleeps.
+             More OEM-resilient than a persistent foreground service. -->
         <service
             android:name=".NotificationListener"
             android:label="SilentSave Notification Listener"
@@ -45,7 +53,28 @@
                 <action android:name="android.service.notification.NotificationListenerService" />
             </intent-filter>
         </service>
-        
+
+        <!-- KeepAlive Foreground Service: prevents OEM battery kill of NLS process -->
+        <service
+            android:name=".KeepAliveService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Boot Receiver: ensures NLS rebinds after device reboot -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true"
+            android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
         <!-- Cleanup Worker -->
         <provider
             android:name="androidx.startup.InitializationProvider"
@@ -56,7 +85,7 @@
                 android:name="androidx.work.WorkManagerInitializer"
                 android:value="androidx.startup" />
         </provider>
-        
+
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

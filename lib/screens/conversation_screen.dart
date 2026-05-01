@@ -250,7 +250,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    widget.sender,
+                    _sanitizeText(widget.sender),
                     style: const TextStyle(
                       fontWeight: FontWeight.bold,
                       fontSize: 16,
@@ -337,7 +337,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
           ),
           const SizedBox(height: 8),
           Text(
-            'Messages from ${widget.sender} will appear here',
+            'Messages from ${_sanitizeText(widget.sender)} will appear here',
             style: TextStyle(
               fontSize: 14,
               color: Colors.grey.shade600,
@@ -471,7 +471,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
       if (reversedIndex - 1 >= 0) {
         final prevItem = items[reversedIndex - 1];
         if (!prevItem.isHeader && prevItem.message != null) {
-          previousSenderName = prevItem.message!.senderName ?? prevItem.message!.sender;
+          previousSenderName = _sanitizeText(prevItem.message!.senderName ?? prevItem.message!.sender);
         }
       }
       return _buildMessageBubble(item.message!, previousSenderName);
@@ -567,7 +567,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
 
   /// Show options menu when long-pressing a message (copy, etc.)
   void _showMessageOptions(BuildContext context, MessageModel message) {
-    final senderName = message.senderName ?? message.sender;
+    final senderName = _sanitizeText(message.senderName ?? message.sender);
     
     showModalBottomSheet(
       context: context,
@@ -653,8 +653,8 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   }
 
   Widget _buildMessageBubble(MessageModel message, String? previousSenderName) {
-    final senderName = message.senderName ?? message.sender;
-    
+    final senderName = _sanitizeText(message.senderName ?? message.sender);
+
     // Determine if we should show the sender name header
     // Show it in group chats when the sender changes from the previous message
     bool showSenderHeader = _isGroupChat && senderName != previousSenderName;
@@ -713,16 +713,37 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // Message text
-                  Text(
-                    _sanitizeText(message.message),
-                    style: const TextStyle(
-                      fontSize: 15,
-                      color: Colors.white,
-                      height: 1.4,
+                  // Media image preview (photo / sticker / video thumbnail)
+                  if (message.mediaPath != null &&
+                      message.mediaPath!.isNotEmpty &&
+                      File(message.mediaPath!).existsSync()) ...[  
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(12),
+                      child: Image.file(
+                        File(message.mediaPath!),
+                        fit: BoxFit.cover,
+                        width: double.infinity,
+                        height: 200,
+                        errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 6),
+                    const SizedBox(height: 8),
+                  ],
+                  // Message text — hide if it's just a generic media label and image is shown
+                  if (!_isGenericMediaLabel(message.message) ||
+                      message.mediaPath == null ||
+                      message.mediaPath!.isEmpty ||
+                      !File(message.mediaPath!).existsSync()) ...[  
+                    Text(
+                      _sanitizeText(message.message),
+                      style: const TextStyle(
+                        fontSize: 15,
+                        color: Colors.white,
+                        height: 1.4,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                  ],
                   // Timestamp and read status
                   Row(
                     mainAxisSize: MainAxisSize.min,
@@ -751,6 +772,21 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
         ],
       ),
     );
+  }
+  /// Returns true if [text] is a generic notification label that adds no
+  /// meaningful information when a media image is already shown.
+  bool _isGenericMediaLabel(String text) {
+    final lower = text.trim().toLowerCase();
+    const labels = {
+      'photo', 'image', 'video', 'sticker', 'gif', 'document',
+      'image omitted', 'video omitted', 'audio omitted',
+      'voice message', 'voice message omitted',
+    };
+    if (labels.contains(lower)) return true;
+    if (lower.startsWith('📷') || lower.startsWith('📹') ||
+        lower.startsWith('🎤') || lower.startsWith('🎵') ||
+        lower.startsWith('🎞')) return true;
+    return false;
   }
 }
 

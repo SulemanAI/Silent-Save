@@ -20,7 +20,7 @@ void main() async {
   // Run app first, then schedule cleanup in background
   runApp(const SilentSaveApp());
   
-  // Schedule cleanup after app is running (non-blocking)
+  // Schedule cleanup and request battery optimization exemption after app is running.
   Future.delayed(const Duration(seconds: 2), () async {
     try {
       await NotificationService.instance.scheduleCleanupJob()
@@ -29,6 +29,14 @@ void main() async {
       });
     } catch (e) {
       debugPrint('Cleanup job scheduling failed: $e');
+    }
+    try {
+      await NotificationService.instance.requestBatteryOptimizationExemption()
+          .timeout(const Duration(seconds: 5), onTimeout: () {
+        debugPrint('Battery optimization exemption request timed out');
+      });
+    } catch (e) {
+      debugPrint('Battery optimization exemption request failed: $e');
     }
   });
 }

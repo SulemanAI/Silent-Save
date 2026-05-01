@@ -3,9 +3,12 @@ package com.silentsave.silentsave
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
-import androidx.core.app.NotificationManagerCompat
+
 import androidx.work.*
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -24,8 +27,19 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        
+
         Log.d(TAG, "Configuring Flutter engine")
+
+        // Start the foreground KeepAliveService to prevent OEM battery kill
+        try {
+            KeepAliveService.start(applicationContext)
+            Log.i(TAG, "KeepAliveService started from MainActivity")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start KeepAliveService: ${e.message}")
+        }
+
+        // Schedule NLS health check worker to keep NLS alive on aggressive OEM phones
+        NlsHealthWorker.schedule(applicationContext)
         
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
             Log.d(TAG, "Method call: ${call.method}")
@@ -51,6 +65,55 @@ class MainActivity : FlutterActivity() {
                 "checkCleanupRequested" -> {
                     result.success(checkAndClearCleanupFlag())
                 }
+                "isBatteryOptimizationExempt" -> {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                        result.success(pm.isIgnoringBatteryOptimizations(packageName))
+                    } else {
+                        result.success(true)
+                    }
+                }
+                "requestBatteryOptimizationExemption" -> {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                        if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                            startActivity(Intent(
+                                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                Uri.parse("package:$packageName")
+                            ))
+                        }
+                    }
+                    result.success(null)
+                }
+                "getManufacturer" -> {
+                    result.success(android.os.Build.MANUFACTURER)
+                }
+                "openOemBatterySettings" -> {
+                    val pkg = call.argument<String>("package")
+                    if (pkg != null) {
+                        try {
+                            val intent = Intent(Intent.ACTION_MAIN)
+                            intent.setPackage(pkg)
+                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            startActivity(intent)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "OEM battery settings not found for package: $pkg")
+                        }
+                    }
+                    result.success(null)
+                }
+                "requestNlsRebind" -> {
+                    // Manually trigger NLS rebind - useful when user notices missing notifications
+                    try {
+                        val componentName = ComponentName(this, NotificationListener::class.java)
+                        android.service.notification.NotificationListenerService.requestRebind(componentName)
+                        Log.i(TAG, "Manual NLS rebind requested")
+                        result.success(true)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to request rebind: ${e.message}")
+                        result.success(false)
+                    }
+                }
                 else -> {
                     result.notImplemented()
                 }
@@ -63,10 +126,12 @@ class MainActivity : FlutterActivity() {
             contentResolver,
             "enabled_notification_listeners"
         ) ?: return false
-        
+
         val serviceComponent = ComponentName(this, NotificationListener::class.java)
         return flat.contains(serviceComponent.flattenToString())
     }
+
+
 
     private fun openNotificationSettings() {
         startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
@@ -143,7 +208,8 @@ class MainActivity : FlutterActivity() {
                                 "timestamp" to obj.optLong("timestamp", 0L),
                                 "senderName" to obj.optString("senderName", obj.optString("title", "")),
                                 "isGroupChat" to obj.optBoolean("isGroupChat", false),
-                                "avatarPath" to obj.optString("avatarPath", "")
+                                "avatarPath" to obj.optString("avatarPath", ""),
+                                "mediaPath" to obj.optString("mediaPath", "")
                             ))
                         } catch (e: Exception) {
                             Log.e(TAG, "Skipping corrupt entry $i: ${e.message}")
@@ -187,7 +253,8 @@ class MainActivity : FlutterActivity() {
                                 "timestamp" to obj.optLong("timestamp", 0L),
                                 "senderName" to obj.optString("senderName", obj.optString("title", "")),
                                 "isGroupChat" to obj.optBoolean("isGroupChat", false),
-                                "avatarPath" to obj.optString("avatarPath", "")
+                                "avatarPath" to obj.optString("avatarPath", ""),
+                                "mediaPath" to obj.optString("mediaPath", "")
                             ))
                         } catch (_: Exception) {}
                     }

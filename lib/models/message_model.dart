@@ -9,6 +9,7 @@ class MessageModel {
   final String? senderName; // Individual sender name (for group chats, shows who sent the message)
   final bool? isGroupChat; // Whether this message is from a group chat
   final String? avatarPath; // Path to sender's profile picture
+  final String? mediaPath;  // Path to saved media image (photo/sticker/video thumb)
 
   MessageModel({
     this.id,
@@ -21,6 +22,7 @@ class MessageModel {
     this.senderName,
     this.isGroupChat = false,
     this.avatarPath,
+    this.mediaPath,
   });
 
   Map<String, dynamic> toMap() {
@@ -39,6 +41,9 @@ class MessageModel {
     // when the column doesn't exist yet in older databases
     if (avatarPath != null) {
       map['avatarPath'] = avatarPath;
+    }
+    if (mediaPath != null) {
+      map['mediaPath'] = mediaPath;
     }
     return map;
   }
@@ -61,6 +66,7 @@ class MessageModel {
       senderName: map['senderName'] ?? map['sender'] ?? 'Unknown',
       isGroupChat: map['isGroupChat'] == 1,
       avatarPath: map['avatarPath'],
+      mediaPath: map['mediaPath'],
     );
   }
 }
