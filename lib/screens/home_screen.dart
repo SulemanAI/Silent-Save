@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../services/database_helper.dart';
 import '../services/notification_service.dart';
 import '../services/encryption_service.dart';
+import '../models/message_model.dart';
 import 'conversation_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -15,13 +16,17 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
+enum SortOption { recent, mostMessages, leastMessages }
+
 class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   final TextEditingController _searchController = TextEditingController();
   List<Map<String, dynamic>> _conversations = [];
   List<Map<String, dynamic>> _filteredConversations = [];
+  List<MessageModel> _searchResults = [];
   bool _isLoading = true;
   bool _hasPermission = false;
   bool _encryptionEnabled = false;
+  SortOption _sortOption = SortOption.recent;
   late TabController _tabController;
 
   @override
@@ -53,6 +58,49 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     _reloadConversationsFromDB();
   }
 
+  Future<void> _performSearch(String query) async {
+    if (query.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _searchResults = [];
+        _filteredConversations = List.from(_conversations);
+      });
+      _applySortAndFilter();
+    } else {
+      // 1. Search all messages in DB for this query
+      final allMatchingMessages = await DatabaseHelper.instance.searchMessages(query);
+
+      if (!mounted) return;
+      setState(() {
+        _searchResults = allMatchingMessages;
+      });
+    }
+  }
+
+  void _applySortAndFilter() {
+    if (_searchController.text.isNotEmpty) {
+      // We don't apply conversation sorting logic to the purely query-based search results list in this version
+      return; 
+    }
+    
+    // When no search is active, we filter from the base conversations list
+    List<Map<String, dynamic>> filtered = List.from(_conversations);
+
+    if (_sortOption == SortOption.mostMessages) {
+      filtered.sort((a, b) => (b['messageCount'] as int).compareTo(a['messageCount'] as int));
+    } else if (_sortOption == SortOption.leastMessages) {
+      filtered.sort((a, b) => (a['messageCount'] as int).compareTo(b['messageCount'] as int));
+    } else {
+      filtered.sort((a, b) => (b['lastTimestamp'] as int).compareTo(a['lastTimestamp'] as int));
+    }
+
+    if (mounted) {
+      setState(() {
+        _filteredConversations = filtered;
+      });
+    }
+  }
+
   /// Reload conversations from DB only (no notification refresh), to avoid loops.
   Future<void> _reloadConversationsFromDB() async {
     try {
@@ -63,16 +111,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       if (mounted) {
         setState(() {
           _conversations = conversations;
-          _filteredConversations = _searchController.text.isEmpty
-              ? conversations
-              : conversations
-                  .where((conv) => conv['sender']
-                      .toString()
-                      .toLowerCase()
-                      .contains(_searchController.text.toLowerCase()))
-                  .toList();
           _isLoading = false;
         });
+        _applySortAndFilter();
       }
     } catch (e) {
       debugPrint('[HomeScreen] Error reloading conversations: $e');
@@ -110,10 +151,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       }
 
       if (package == null) return;
-      if (!mounted) return;
-
+      
       await prefs.setBool('oem_battery_guide_shown', true);
 
+      if (!mounted) return;
       final oemPackage = package;
       showDialog<void>(
         context: context,
@@ -182,9 +223,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       });
       setState(() {
         _conversations = conversations;
-        _filteredConversations = conversations;
         _isLoading = false;
       });
+      _applySortAndFilter();
     } catch (e) {
       debugPrint('[HomeScreen] Error loading conversations: $e');
       setState(() {
@@ -195,17 +236,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     }
   }
 
-  void _filterConversations(String query) {
-    setState(() {
-      if (query.isEmpty) {
-        _filteredConversations = _conversations;
-      } else {
-        _filteredConversations = _conversations
-            .where((conv) =>
-                conv['sender'].toString().toLowerCase().contains(query.toLowerCase()))
-            .toList();
-      }
-    });
+  void _filterConversations(String _) {
+    _performSearch(_searchController.text);
   }
 
   Widget _getAppIcon(String packageName, {double size = 12, Color? color}) {
@@ -363,7 +395,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                     Navigator.pop(context);
                     _toggleEncryption();
                   },
-                  activeColor: Colors.green,
+                  activeThumbColor: Colors.green,
                 ),
               ],
             ),
@@ -485,13 +517,15 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           Expanded(
             child: _isLoading
                 ? const Center(child: CircularProgressIndicator())
-                : TabBarView(
-                    controller: _tabController,
-                    children: [
-                      _buildConversationList('com.whatsapp'),
-                      _buildConversationList('com.instagram.android'),
-                    ],
-                  ),
+                : _searchController.text.isNotEmpty
+                    ? _buildSearchResultsList()
+                    : TabBarView(
+                        controller: _tabController,
+                        children: [
+                          _buildConversationList('com.whatsapp'),
+                          _buildConversationList('com.instagram.android'),
+                        ],
+                      ),
           ),
         ],
       ),
@@ -503,7 +537,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       margin: const EdgeInsets.all(16),
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: Colors.orange.shade900.withOpacity(0.3),
+        color: Colors.orange.shade900.withValues(alpha: 0.3),
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: Colors.orange, width: 1),
       ),
@@ -550,29 +584,114 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
   Widget _buildSearchBar() {
     return Padding(
-      padding: const EdgeInsets.all(16),
-      child: TextField(
-        controller: _searchController,
-        onChanged: _filterConversations,
-        decoration: InputDecoration(
-          hintText: 'Search conversations...',
-          prefixIcon: const Icon(Icons.search),
-          suffixIcon: _searchController.text.isNotEmpty
-              ? IconButton(
-                  icon: const Icon(Icons.clear),
-                  onPressed: () {
-                    _searchController.clear();
-                    _filterConversations('');
-                  },
-                )
-              : null,
-          filled: true,
-          fillColor: Colors.grey.shade900,
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: BorderSide.none,
+      padding: const EdgeInsets.only(left: 16, right: 16, top: 16, bottom: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          TextField(
+            controller: _searchController,
+            onChanged: _filterConversations,
+            decoration: InputDecoration(
+              hintText: 'Search conversations...',
+              prefixIcon: const Icon(Icons.search),
+              suffixIcon: _searchController.text.isNotEmpty
+                  ? IconButton(
+                      icon: const Icon(Icons.clear),
+                      onPressed: () {
+                        _searchController.clear();
+                        _filterConversations('');
+                        FocusScope.of(context).unfocus();
+                      },
+                    )
+                  : null,
+              filled: true,
+              fillColor: Colors.grey.shade900,
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: BorderSide.none,
+              ),
+            ),
           ),
-        ),
+          const SizedBox(height: 12),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                ChoiceChip(
+                  label: const Text('Most Recent'),
+                  selected: _sortOption == SortOption.recent,
+
+                  shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(20), 
+                  ),
+
+                  visualDensity: VisualDensity.compact, 
+                  // Reduces the padding around the text inside the chip
+                  labelPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 0), 
+                  // Reduces the internal padding of the chip itself
+                  padding: EdgeInsets.zero, 
+
+                  onSelected: (selected) {
+                    if (selected) {
+                      setState(() {
+                        _sortOption = SortOption.recent;
+                        _applySortAndFilter();
+                      });
+                    }
+                  },
+                ),
+                const SizedBox(width: 8),
+                ChoiceChip(
+                  label: const Text('Most Messages'),
+                  selected: _sortOption == SortOption.mostMessages,
+
+                  shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(20), 
+                  ),
+
+                  visualDensity: VisualDensity.compact, 
+                  // Reduces the padding around the text inside the chip
+                  labelPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 0), 
+                  // Reduces the internal padding of the chip itself
+                  padding: EdgeInsets.zero,
+
+                  onSelected: (selected) {
+                    if (selected) {
+                      setState(() {
+                        _sortOption = SortOption.mostMessages;
+                        _applySortAndFilter();
+                      });
+                    }
+                  },
+                ),
+                const SizedBox(width: 8),
+                ChoiceChip(
+                  label: const Text('Least Messages'),
+                  selected: _sortOption == SortOption.leastMessages,
+
+                  shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(20), 
+                  ),
+
+                  visualDensity: VisualDensity.compact, 
+                  // Reduces the padding around the text inside the chip
+                  labelPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 0), 
+                  // Reduces the internal padding of the chip itself
+                  padding: EdgeInsets.zero,
+
+                  onSelected: (selected) {
+                    if (selected) {
+                      setState(() {
+                        _sortOption = SortOption.leastMessages;
+                        _applySortAndFilter();
+                      });
+                    }
+                  },
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -608,6 +727,211 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildSearchResultsList() {
+    if (_searchResults.isEmpty) {
+      if (_searchController.text.isNotEmpty) {
+        return Center(
+          child: Text(
+            'No matches found for "${_searchController.text}"',
+            style: TextStyle(color: Colors.grey.shade600, fontSize: 16),
+          ),
+        );
+      }
+      return const SizedBox.shrink();
+    }
+    
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      itemCount: _searchResults.length,
+      itemBuilder: (context, index) {
+        final message = _searchResults[index];
+        final String rawSender = _sanitizeText(message.sender);
+        final String sender = rawSender.isNotEmpty ? rawSender : 'Unknown';
+        final String displaySenderName = _sanitizeText(message.senderName ?? message.sender);
+        final String appPackage = message.app;
+        
+        // Find avatar from active conversation base if possible
+        String? avatarPath;
+        try {
+          final convBase = _conversations.firstWhere(
+            (c) => c['sender'] == message.sender && c['app'] == message.app,
+          );
+          avatarPath = convBase['latestAvatarPath']?.toString();
+        } catch (_) {}
+        
+        final bool hasAvatar = avatarPath != null && avatarPath.isNotEmpty && File(avatarPath).existsSync();
+
+        return _buildSearchResultCard(
+          message: message,
+          senderText: displaySenderName,
+          actualSender: sender,
+          appPackage: appPackage,
+          avatarPath: hasAvatar ? avatarPath : null,
+        );
+      },
+    );
+  }
+
+  Widget _buildSearchResultCard({
+    required MessageModel message,
+    required String senderText,
+    required String actualSender,
+    required String appPackage,
+    String? avatarPath,
+  }) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      decoration: BoxDecoration(
+        color: Colors.grey.shade900.withValues(alpha: 0.3),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: Colors.grey.shade800.withValues(alpha: 0.5),
+          width: 1,
+        ),
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(16),
+          splashColor: Colors.deepPurple.shade300.withValues(alpha: 0.2),
+          highlightColor: Colors.deepPurple.shade200.withValues(alpha: 0.1),
+          onTap: () {
+            FocusScope.of(context).unfocus();
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (context) => ConversationScreen(
+                  sender: actualSender,
+                  app: appPackage,
+                  initialAvatarPath: avatarPath,
+                ),
+              ),
+            );
+          },
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                CircleAvatar(
+                  radius: 20,
+                  backgroundColor: Colors.deepPurple.shade800,
+                  backgroundImage: avatarPath != null ? FileImage(File(avatarPath)) : null,
+                  child: avatarPath == null
+                      ? Text(
+                          senderText.isNotEmpty ? senderText[0].toUpperCase() : '?',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16,
+                          ),
+                        )
+                      : null,
+                ),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Row(
+                              children: [
+                                Flexible(
+                                  child: Text(
+                                    senderText,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 16,
+                                      color: Colors.white,
+                                    ),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                                const SizedBox(width: 6),
+                                _getAppIcon(appPackage, size: 12),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            _formatTimestamp(message.timestamp.millisecondsSinceEpoch),
+                            style: TextStyle(
+                              color: Colors.grey.shade500,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      // Provide highlight logic
+                      _buildHighlightText(message.message, _searchController.text),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHighlightText(String text, String query) {
+    if (query.isEmpty) {
+      return Text(
+        text,
+        style: TextStyle(color: Colors.grey.shade400, fontSize: 14),
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+      );
+    }
+
+    final String lowerText = text.toLowerCase();
+    final String lowerQuery = query.toLowerCase();
+
+    final List<TextSpan> spans = [];
+    int start = 0;
+    int indexOfMatch = lowerText.indexOf(lowerQuery, start);
+
+    while (indexOfMatch != -1) {
+      if (indexOfMatch > start) {
+        spans.add(TextSpan(
+          text: text.substring(start, indexOfMatch),
+          style: TextStyle(color: Colors.grey.shade400, fontSize: 14),
+        ));
+      }
+
+      spans.add(TextSpan(
+        text: text.substring(indexOfMatch, indexOfMatch + query.length),
+        style: TextStyle(
+          color: Colors.black,
+          backgroundColor: Colors.orange.shade300,
+          fontWeight: FontWeight.bold,
+          fontSize: 14,
+        ),
+      ));
+
+      start = indexOfMatch + query.length;
+      indexOfMatch = lowerText.indexOf(lowerQuery, start);
+    }
+
+    if (start < text.length) {
+      spans.add(TextSpan(
+        text: text.substring(start),
+        style: TextStyle(color: Colors.grey.shade400, fontSize: 14),
+      ));
+    }
+
+    return RichText(
+      maxLines: 3,
+      overflow: TextOverflow.ellipsis,
+      text: TextSpan(children: spans),
     );
   }
 
@@ -662,16 +986,16 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       decoration: BoxDecoration(
         gradient: LinearGradient(
           colors: unreadCount > 0 
-            ? [Colors.deepPurple.shade900.withOpacity(0.4), Colors.purple.shade900.withOpacity(0.2)]
-            : [Colors.grey.shade900.withOpacity(0.5), Colors.grey.shade800.withOpacity(0.3)],
+            ? [Colors.deepPurple.shade900.withValues(alpha: 0.4), Colors.purple.shade900.withValues(alpha: 0.2)]
+            : [Colors.grey.shade900.withValues(alpha: 0.5), Colors.grey.shade800.withValues(alpha: 0.3)],
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         ),
         borderRadius: BorderRadius.circular(16),
         border: Border.all(
           color: unreadCount > 0 
-            ? Colors.deepPurple.shade400.withOpacity(0.5)
-            : Colors.grey.shade700.withOpacity(0.3),
+            ? Colors.deepPurple.shade400.withValues(alpha: 0.5)
+            : Colors.grey.shade700.withValues(alpha: 0.3),
           width: 1,
         ),
       ),
@@ -679,9 +1003,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         color: Colors.transparent,
         child: InkWell(
           borderRadius: BorderRadius.circular(16),
-          splashColor: Colors.deepPurple.shade300.withOpacity(0.2),
-          highlightColor: Colors.deepPurple.shade200.withOpacity(0.1),
+          splashColor: Colors.deepPurple.shade300.withValues(alpha: 0.2),
+          highlightColor: Colors.deepPurple.shade200.withValues(alpha: 0.1),
           onTap: () {
+            FocusScope.of(context).unfocus();
             Navigator.push(
               context,
               MaterialPageRoute(
@@ -692,6 +1017,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                 ),
               ),
             ).then((_) => _loadConversations());
+            // );
           },
           child: Padding(
             padding: const EdgeInsets.all(14),
@@ -718,7 +1044,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                         ) : null,
                         boxShadow: [
                           BoxShadow(
-                            color: (isGroupChat ? Colors.teal : Colors.deepPurple).withOpacity(0.3),
+                            color: (isGroupChat ? Colors.teal : Colors.deepPurple).withValues(alpha: 0.3),
                             blurRadius: 8,
                             offset: const Offset(0, 2),
                           ),
@@ -784,7 +1110,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                                   Container(
                                     padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                                     decoration: BoxDecoration(
-                                      color: Colors.teal.shade700.withOpacity(0.7),
+                                      color: Colors.teal.shade700.withValues(alpha: 0.7),
                                       borderRadius: BorderRadius.circular(8),
                                     ),
                                     child: const Text(

@@ -34,6 +34,7 @@ dependencies:
 
   # Icons
   font_awesome_flutter: ^10.6.0
+  scrollable_positioned_list: ^0.3.8
 
 dev_dependencies:
   flutter_test:

@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import '../models/message_model.dart';
 import '../services/database_helper.dart';
 
@@ -30,6 +31,16 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   String? _avatarPath;
   String? _avatarsDir; // For looking up sender-specific avatars in groups
 
+  bool _isSearching = false;
+  final TextEditingController _searchController = TextEditingController();
+  
+  // Highlighting and scrolling
+  String _searchQuery = '';
+  final List<int> _matchIndices = [];
+  int _currentMatchIndex = -1;
+  final ItemScrollController _itemScrollController = ItemScrollController();
+  final List<_ListItem> _displayItems = [];
+
   @override
   void initState() {
     super.initState();
@@ -41,6 +52,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _searchController.dispose();
     super.dispose();
   }
 
@@ -91,6 +103,117 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
       _isGroupChat = isGroup;
       _avatarPath = latestAvatarPath;
       _isLoading = false;
+      
+      _updateDisplayItems();
+      
+      if (_isSearching && _searchController.text.isNotEmpty) {
+        _filterMessages(_searchController.text);
+      }
+    });
+  }
+
+  void _updateDisplayItems() {
+    _displayItems.clear();
+    var activeMessages = _messages.where((msg) => msg.isDeleted != true).toList();
+    
+    // Deduplicate
+    final seen = <String>{};
+    activeMessages = activeMessages.where((msg) {
+      final key = '${msg.message}||${msg.timestamp.millisecondsSinceEpoch}';
+      if (seen.contains(key)) return false;
+      seen.add(key);
+      return true;
+    }).toList();
+
+    if (activeMessages.isEmpty) return;
+    
+    // Build display items from Newest (index 0) to Oldest
+    // activeMessages is descending (newest at index 0).
+    for (int i = 0; i < activeMessages.length; i++) {
+        final message = activeMessages[i];
+        final messageDate = DateTime(message.timestamp.year, message.timestamp.month, message.timestamp.day);
+        
+        _displayItems.add(_ListItem(isHeader: false, message: message, messageIndex: i));
+        
+        // Add header after the last message of the day (which appears above it in UI)
+        bool needsHeader = false;
+        if (i == activeMessages.length - 1) {
+            needsHeader = true;
+        } else {
+            final nextMessage = activeMessages[i + 1];
+            final nextDate = DateTime(nextMessage.timestamp.year, nextMessage.timestamp.month, nextMessage.timestamp.day);
+            if (!_isSameDay(messageDate, nextDate)) needsHeader = true;
+        }
+        
+        if (needsHeader) {
+            _displayItems.add(_ListItem(isHeader: true, date: messageDate));
+        }
+    }
+  }
+
+  void _filterMessages(String query) {
+    setState(() {
+      _searchQuery = query;
+      _matchIndices.clear();
+      
+      if (query.isNotEmpty) {
+        final queryLower = query.toLowerCase();
+        
+        // Find matches in display items
+        for (int i = 0; i < _displayItems.length; i++) {
+          final item = _displayItems[i];
+          if (!item.isHeader && item.message != null) {
+            final text = item.message!.message.toLowerCase();
+            final sender = item.message!.senderName?.toLowerCase() ?? '';
+            if (text.contains(queryLower) || sender.contains(queryLower)) {
+              _matchIndices.add(i); // i is the index in _displayItems
+            }
+          }
+        }
+        
+        if (_matchIndices.isNotEmpty) {
+          _currentMatchIndex = 0; 
+          _scrollToCurrentMatch();
+        } else {
+          _currentMatchIndex = -1;
+        }
+      } else {
+        _currentMatchIndex = -1;
+      }
+    });
+  }
+
+  void _scrollToCurrentMatch() {
+    if (_currentMatchIndex >= 0 && _currentMatchIndex < _matchIndices.length) {
+      if (_itemScrollController.isAttached) {
+        final index = _matchIndices[_currentMatchIndex];
+        _itemScrollController.scrollTo(
+          index: index,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeInOut,
+          alignment: 0.5, 
+        );
+      }
+    }
+  }
+
+  void _nextMatch() {
+    if (_matchIndices.isEmpty) return;
+    setState(() {
+      if (_currentMatchIndex < _matchIndices.length - 1) {
+        _currentMatchIndex++;
+        _scrollToCurrentMatch();
+      }
+    });
+  }
+
+  void _previousMatch() {
+    if (_matchIndices.isEmpty) return;
+    setState(() {
+      if (_currentMatchIndex > 0) {
+        _currentMatchIndex--;
+        _scrollToCurrentMatch();
+      }
     });
   }
 
@@ -240,50 +363,98 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
             ),
           ),
         ),
-        title: Row(
-          children: [
-            // Avatar
-            _buildAvatarWidget(),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+        title: _isSearching
+            ? TextField(
+                controller: _searchController,
+                autofocus: true,
+                style: const TextStyle(color: Colors.white),
+                decoration: InputDecoration(
+                  hintText: 'Search messages...',
+                  hintStyle: TextStyle(color: Colors.white.withValues(alpha: 0.7)),
+                  border: InputBorder.none,
+                ),
+                onChanged: _filterMessages,
+              )
+            : Row(
                 children: [
-                  Text(
-                    _sanitizeText(widget.sender),
-                    style: const TextStyle(
-                      fontWeight: FontWeight.bold,
-                      fontSize: 16,
-                    ),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  Row(
-                    children: [
-                      _getAppIcon(widget.app, size: 12),
-                      const SizedBox(width: 4),
-                      Text(
-                        _isGroupChat ? 'Group Chat' : 'Private Chat',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.grey.shade300,
-                        ),
-                      ),
-                      if (_messages.isNotEmpty) ...[
+                  // Avatar
+                  _buildAvatarWidget(),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
                         Text(
-                          ' • ${_messages.length} messages',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: Colors.grey.shade400,
+                          _sanitizeText(widget.sender),
+                          style: const TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16,
                           ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        Row(
+                          children: [
+                            _getAppIcon(widget.app, size: 12),
+                            const SizedBox(width: 4),
+                            Text(
+                              _isGroupChat ? 'Group Chat' : 'Private Chat',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Colors.grey.shade300,
+                              ),
+                            ),
+                            if (_messages.isNotEmpty) ...[
+                              Text(
+                                ' • ${_messages.length} messages',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.grey.shade400,
+                                ),
+                              ),
+                            ],
+                          ],
                         ),
                       ],
-                    ],
+                    ),
                   ),
                 ],
               ),
+        actions: [
+          if (_isSearching && _matchIndices.isNotEmpty) ...[
+            Center(
+              child: Text(
+                '${_currentMatchIndex + 1}/${_matchIndices.length}',
+                style: const TextStyle(fontSize: 14),
+              ),
+            ),
+            IconButton(
+              icon: const Icon(Icons.keyboard_arrow_up),
+              onPressed: _currentMatchIndex < _matchIndices.length - 1 ? _nextMatch : null,
+              tooltip: 'Older messages',
+            ),
+            IconButton(
+              icon: const Icon(Icons.keyboard_arrow_down),
+              onPressed: _currentMatchIndex > 0 ? _previousMatch : null,
+              tooltip: 'Newer messages',
             ),
           ],
-        ),
+          IconButton(
+            icon: Icon(_isSearching ? Icons.close : Icons.search),
+            onPressed: () {
+              setState(() {
+                if (_isSearching) {
+                  _isSearching = false;
+                  _searchController.clear();
+                  _searchQuery = '';
+                  _matchIndices.clear();
+                  _currentMatchIndex = -1;
+                } else {
+                  _isSearching = true;
+                }
+              });
+            },
+          ),
+        ],
       ),
       body: Container(
         decoration: BoxDecoration(
@@ -303,13 +474,13 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                 ),
               )
             : _messages.isEmpty
-                ? _buildEmptyState()
+                ? _buildEmptyState('No messages yet', 'Messages from ${_sanitizeText(widget.sender)} will appear here')
                 : _buildMessageList(),
       ),
     );
   }
 
-  Widget _buildEmptyState() {
+  Widget _buildEmptyState(String title, String subtitle) {
     return Center(
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
@@ -328,7 +499,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
           ),
           const SizedBox(height: 20),
           Text(
-            'No messages yet',
+            title,
             style: TextStyle(
               fontSize: 20,
               fontWeight: FontWeight.w600,
@@ -337,7 +508,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
           ),
           const SizedBox(height: 8),
           Text(
-            'Messages from ${_sanitizeText(widget.sender)} will appear here',
+            subtitle,
             style: TextStyle(
               fontSize: 14,
               color: Colors.grey.shade600,
@@ -350,131 +521,54 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   }
 
   Widget _buildMessageList() {
-    // Filter out deleted messages
-    var activeMessages = _messages
-        .where((msg) => msg.isDeleted != true)
-        .toList();
-    
-    // Deduplicate messages with identical content and timestamp
-    final seen = <String>{};
-    activeMessages = activeMessages.where((msg) {
-      final key = '${msg.message}||${msg.timestamp.millisecondsSinceEpoch}';
-      if (seen.contains(key)) return false;
-      seen.add(key);
-      return true;
-    }).toList();
-    
-    if (activeMessages.isEmpty) {
-      return _buildEmptyState();
+    if (_displayItems.isEmpty) {
+      if (_isSearching && _searchQuery.isNotEmpty) {
+         return _buildEmptyState('No matches', 'Try searching with a different term');
+      }
+      return _buildEmptyState('No messages yet', 'Messages from ${_sanitizeText(widget.sender)} will appear here');
     }
     
-    // Messages come from DB in DESC order (newest first)
-    // With reverse: true on ListView:
-    //   - index 0 appears at the BOTTOM of the screen
-    //   - last index appears at the TOP of the screen
-    // So we need newest message at index 0 (bottom) and oldest at last index (top)
-    // This means we keep the DESC order (newest first) - don't reverse!
-    // 
-    // WhatsApp behavior:
-    //   - Open chat → see newest message at bottom
-    //   - Scroll UP → older messages revealed at top
-    
-    // Build list with date headers
-    // reverse: true makes the list start from the bottom (newest visible first)
-    return ListView.builder(
+    return ScrollablePositionedList.builder(
       padding: const EdgeInsets.all(16),
       reverse: true,
-      itemCount: _getListItemCount(activeMessages),
+      itemCount: _displayItems.length,
+      itemScrollController: _itemScrollController,
       itemBuilder: (context, index) {
-        return _buildListItem(activeMessages, index);
+        return _buildListItem(index);
       },
     );
   }
 
-  // Calculate total items including date headers
-  // Messages are in DESC order (newest first), but we display bottom-to-top
-  // so we iterate in reverse (oldest to newest in display order from top to bottom)
-  int _getListItemCount(List<MessageModel> messages) {
-    if (messages.isEmpty) return 0;
-    
-    int count = messages.length; // All messages
-    DateTime? lastDate;
-    
-    // Iterate in reverse (oldest to newest) to count date headers
-    for (int i = messages.length - 1; i >= 0; i--) {
-      final message = messages[i];
-      final messageDate = DateTime(
-        message.timestamp.year,
-        message.timestamp.month,
-        message.timestamp.day,
-      );
-      
-      if (lastDate == null || !_isSameDay(lastDate, messageDate)) {
-        count++; // Add 1 for date header
-        lastDate = messageDate;
-      }
-    }
-    
-    return count;
-  }
-
   // Build either a date header or message bubble
-  // With reverse:true, index 0 is at bottom, last index is at top
-  // Messages are in DESC order (index 0 = newest, last = oldest)
-  // We need to map display indices to actual messages and date headers
-  Widget _buildListItem(List<MessageModel> messages, int index) {
-    // Build a list of items (messages + headers) in display order
-    // Display order for reverse:true: index 0 at bottom, so we want:
-    //   index 0 = newest message
-    //   Then going up (increasing index): older messages and date headers
-    
-    // We'll iterate through messages in ASC order (oldest first, for building top-to-bottom)
-    // Then map the requested index to the correct item
-    
-    final items = <_ListItem>[];
-    DateTime? lastDate;
-    
-    // Build items from oldest to newest (top to bottom in final display)
-    for (int i = messages.length - 1; i >= 0; i--) {
-      final message = messages[i];
-      final messageDate = DateTime(
-        message.timestamp.year,
-        message.timestamp.month,
-        message.timestamp.day,
-      );
-      
-      // Check if we need a date header before this message
-      if (lastDate == null || !_isSameDay(lastDate, messageDate)) {
-        items.add(_ListItem(isHeader: true, date: messageDate));
-        lastDate = messageDate;
-      }
-      
-      items.add(_ListItem(isHeader: false, message: message, messageIndex: i));
-    }
-    
-    // Since reverse:true, index 0 should be the last item (newest at bottom)
-    // So we access items from the end
-    final reversedIndex = items.length - 1 - index;
-    
-    if (reversedIndex < 0 || reversedIndex >= items.length) {
+  Widget _buildListItem(int index) {
+    if (index < 0 || index >= _displayItems.length) {
       return const SizedBox.shrink();
     }
     
-    final item = items[reversedIndex];
-    
+    final item = _displayItems[index];
+
     if (item.isHeader) {
       return _buildDateHeader(item.date!);
     } else {
-      // Get the previous message (visually above) for grouping logic
-      // In our items list (oldest=0, newest=end), reversedIndex - 1 is the item above in display
+      // Get the previous message (visually above) for grouping logic.
+      // Since index 0 is at bottom, visually above is index + 1
       String? previousSenderName;
-      if (reversedIndex - 1 >= 0) {
-        final prevItem = items[reversedIndex - 1];
+      if (index + 1 < _displayItems.length) {
+        final prevItem = _displayItems[index + 1];
         if (!prevItem.isHeader && prevItem.message != null) {
           previousSenderName = _sanitizeText(prevItem.message!.senderName ?? prevItem.message!.sender);
         }
       }
-      return _buildMessageBubble(item.message!, previousSenderName);
+      
+      final isMatched = _matchIndices.contains(index);
+      final isCurrentMatch = _currentMatchIndex >= 0 && _matchIndices.isNotEmpty && _matchIndices[_currentMatchIndex] == index;
+      
+      return _buildMessageBubble(
+        item.message!,
+        previousSenderName,
+        isMatched: isMatched,
+        isCurrentMatch: isCurrentMatch,
+      );
     }
   }
 
@@ -486,11 +580,11 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
           decoration: BoxDecoration(
-            color: Colors.grey.shade800.withOpacity(0.8),
+            color: Colors.grey.shade800.withValues(alpha: 0.8),
             borderRadius: BorderRadius.circular(16),
             boxShadow: [
               BoxShadow(
-                color: Colors.black.withOpacity(0.2),
+                color: Colors.black.withValues(alpha: 0.2),
                 blurRadius: 4,
                 offset: const Offset(0, 2),
               ),
@@ -532,7 +626,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
               fit: BoxFit.cover,
             ),
             border: Border.all(
-              color: senderColor.withOpacity(0.5),
+              color: senderColor.withValues(alpha: 0.5),
               width: 1,
             ),
           ),
@@ -545,10 +639,10 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
       width: 28,
       height: 28,
       decoration: BoxDecoration(
-        color: senderColor.withOpacity(0.2),
+        color: senderColor.withValues(alpha: 0.2),
         shape: BoxShape.circle,
         border: Border.all(
-          color: senderColor.withOpacity(0.5),
+          color: senderColor.withValues(alpha: 0.5),
           width: 1,
         ),
       ),
@@ -652,7 +746,51 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     );
   }
 
-  Widget _buildMessageBubble(MessageModel message, String? previousSenderName) {
+  Widget _buildHighlightText(String text, bool isCurrentMatch) {
+    if (_searchQuery.isEmpty) return Text(text, style: const TextStyle(fontSize: 15, color: Colors.white, height: 1.4));
+    
+    final queryStr = _searchQuery.toLowerCase();
+    final lowerText = text.toLowerCase();
+    final spans = <TextSpan>[];
+    int start = 0;
+    
+    while (true) {
+      final index = lowerText.indexOf(queryStr, start);
+      if (index == -1) {
+        spans.add(TextSpan(text: text.substring(start)));
+        break;
+      }
+      
+      if (index > start) {
+        spans.add(TextSpan(text: text.substring(start, index)));
+      }
+      
+      spans.add(TextSpan(
+        text: text.substring(index, index + queryStr.length),
+        style: TextStyle(
+          backgroundColor: isCurrentMatch ? Colors.orange : Colors.yellow.withValues(alpha: 0.5),
+          color: isCurrentMatch ? Colors.black : Colors.white,
+          fontWeight: FontWeight.bold,
+        ),
+      ));
+      
+      start = index + queryStr.length;
+    }
+    
+    return RichText(
+      text: TextSpan(
+        style: const TextStyle(fontSize: 15, color: Colors.white, height: 1.4),
+        children: spans,
+      ),
+    );
+  }
+
+  Widget _buildMessageBubble(
+    MessageModel message, 
+    String? previousSenderName, {
+    bool isMatched = false,
+    bool isCurrentMatch = false,
+  }) {
     final senderName = _sanitizeText(message.senderName ?? message.sender);
 
     // Determine if we should show the sender name header
@@ -695,19 +833,27 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
               decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  colors: _isGroupChat
-                      ? [senderColor.withOpacity(0.15), senderColor.withOpacity(0.08)]
-                      : [Colors.deepPurple.shade800.withOpacity(0.5), Colors.purple.shade900.withOpacity(0.3)],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                ),
+                gradient: isCurrentMatch
+                    ? LinearGradient(
+                        colors: [Colors.orange.shade800.withValues(alpha: 0.9), Colors.deepOrange.shade900.withValues(alpha: 0.8)],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      )
+                    : LinearGradient(
+                        colors: _isGroupChat
+                            ? [senderColor.withValues(alpha: 0.15), senderColor.withValues(alpha: 0.08)]
+                            : [Colors.deepPurple.shade800.withValues(alpha: 0.5), Colors.purple.shade900.withValues(alpha: 0.3)],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
                 borderRadius: BorderRadius.circular(16),
                 border: Border.all(
-                  color: _isGroupChat 
-                      ? senderColor.withOpacity(0.3) 
-                      : Colors.deepPurple.shade600.withOpacity(0.3),
-                  width: 1,
+                  color: isCurrentMatch
+                      ? Colors.orangeAccent
+                      : _isGroupChat 
+                          ? senderColor.withValues(alpha: 0.3) 
+                          : Colors.deepPurple.shade600.withValues(alpha: 0.3),
+                  width: isCurrentMatch ? 2 : 1,
                 ),
               ),
               child: Column(
@@ -734,14 +880,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                       message.mediaPath == null ||
                       message.mediaPath!.isEmpty ||
                       !File(message.mediaPath!).existsSync()) ...[  
-                    Text(
-                      _sanitizeText(message.message),
-                      style: const TextStyle(
-                        fontSize: 15,
-                        color: Colors.white,
-                        height: 1.4,
-                      ),
-                    ),
+                    _buildHighlightText(_sanitizeText(message.message), isCurrentMatch),
                     const SizedBox(height: 6),
                   ],
                   // Timestamp and read status
@@ -782,10 +921,14 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
       'image omitted', 'video omitted', 'audio omitted',
       'voice message', 'voice message omitted',
     };
-    if (labels.contains(lower)) return true;
+    if (labels.contains(lower)) {
+      return true;
+    }
     if (lower.startsWith('📷') || lower.startsWith('📹') ||
         lower.startsWith('🎤') || lower.startsWith('🎵') ||
-        lower.startsWith('🎞')) return true;
+        lower.startsWith('🎞')) {
+      return true;
+    }
     return false;
   }
 }
