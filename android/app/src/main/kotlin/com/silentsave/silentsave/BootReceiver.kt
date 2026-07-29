@@ -49,6 +49,14 @@ class BootReceiver : BroadcastReceiver() {
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start KeepAliveService: ${e.message}")
             }
+
+            // Start MediaWatcherService — begins watching WhatsApp media folder
+            try {
+                MediaWatcherService.start(context)
+                Log.i(TAG, "MediaWatcherService started on boot/update")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start MediaWatcherService: ${e.message}")
+            }
             
             // Request NLS rebind after boot
             try {

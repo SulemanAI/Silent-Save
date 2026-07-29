@@ -1,7 +1,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Required permissions for notification listener -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
@@ -10,6 +9,13 @@
     <!-- Allows showing the system dialog to request battery optimization exemption,
          keeping NotificationListenerService alive on Android 6+ / 12+. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- MediaStore access for reading WhatsApp media on Android 13+ -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <!-- Fallback for Android < 13 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
 
     <application
         android:label="Silent Save"
@@ -61,6 +67,16 @@
             android:stopWithTask="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- MediaWatcherService: ContentObserver for WhatsApp media files.
+             Non-foreground — relies on KeepAliveService process to stay alive.
+             START_STICKY so OS restarts it if killed.
+             NOTE: No foregroundServiceType — intentionally not a foreground service
+             to avoid consuming the dataSync 6h/24h budget on Android 14+. -->
+        <service
+            android:name=".MediaWatcherService"
+            android:exported="false"
+            android:stopWithTask="false" />
+
         <!-- Boot Receiver: ensures NLS rebinds after device reboot -->
         <receiver
             android:name=".BootReceiver"
@@ -102,5 +118,8 @@
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
         </intent>
+        <!-- Package visibility: required on Android 11+ to detect if WhatsApp is installed -->
+        <package android:name="com.whatsapp" />
+        <package android:name="com.whatsapp.w4b" />
     </queries>
 </manifest>

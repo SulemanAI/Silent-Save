@@ -35,6 +35,11 @@ dependencies:
   # Icons
   font_awesome_flutter: ^10.6.0
   scrollable_positioned_list: ^0.3.8
+  gal: ^2.3.3
+  flutter_slidable: ^4.0.3
+  video_player: ^2.10.1
+  audioplayers: ^6.7.1
+  get_thumbnail_video: ^0.7.3
 
 dev_dependencies:
   flutter_test:

@@ -2,8 +2,10 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'database_helper.dart';
 import '../models/message_model.dart';
+import '../utils/timestamp_matcher.dart';
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 
 /// Regex to strip WhatsApp's dynamic unread count suffix from group titles.
 /// Matches patterns like: " (5 messages)", " (2 new messages)", " (12 messages)"
@@ -127,6 +129,7 @@ class NotificationService with WidgetsBindingObserver {
       _requestNlsRebind();
       // Check for any notifications that arrived while app was in background
       _checkForNewNotifications();
+      _checkForNewMedia();
       _checkForCleanup();
       // Restart poll timer
       _startPollTimer();
@@ -144,9 +147,12 @@ class NotificationService with WidgetsBindingObserver {
   /// at the app.
   void _startPollTimer() {
     _stopPollTimer();
-    _pollTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+    // Poll every 1 second while the app is in the foreground for instant media/message updates.
+    // This is safe because the timer is killed immediately when the app goes to the background.
+    _pollTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (_appInForeground) {
         _checkForNewNotifications();
+        _checkForNewMedia();
       }
     });
   }
@@ -299,6 +305,61 @@ class NotificationService with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _checkForNewMedia() async {
+    try {
+      final List<dynamic>? results = await platform
+          .invokeListMethod('getMediaQueue')
+          .timeout(const Duration(seconds: 8), onTimeout: () => null);
+      
+      if (results == null || results.isEmpty) return;
+      
+      debugPrint('[NotificationService] Received ${results.length} media queue events');
+      
+      for (final result in results) {
+        if (result is! Map) continue;
+        final mediaEvent = Map<String, dynamic>.from(result);
+        
+        // 1 hour window to account for slow downloading videos or voice notes
+        final matchResult = await TimestampMatcher.matchMediaToNotification(mediaEvent, 3600000); 
+        
+        final attachmentData = <String, dynamic>{
+          'media_type': mediaEvent['mediaType'] ?? 'unknown',
+          'file_path': mediaEvent['filePath'] ?? '',
+          'original_uri': mediaEvent['originalUri'] ?? '',
+          'captured_at': mediaEvent['fileTimestampMs'] ?? 0,
+        };
+        
+        if (matchResult.isMatched && matchResult.matchedMessage != null) {
+          final msg = matchResult.matchedMessage!;
+          attachmentData['notification_id'] = msg['id'];
+          attachmentData['sender_name'] = msg['senderName'] ?? msg['sender'];
+          attachmentData['matched'] = 1;
+          
+          // Insert attachment
+          await DatabaseHelper.instance.insertMediaAttachment(attachmentData);
+          
+          // Update the message so ConversationScreen sees the media directly
+          await DatabaseHelper.instance.updateMessageMediaPath(msg['id'] as int, attachmentData['file_path'] as String);
+          
+        } else if (matchResult.isAmbiguous && matchResult.ambiguousCandidates != null) {
+          final ids = matchResult.ambiguousCandidates!.map((c) => c['id']).toList();
+          attachmentData['candidate_notification_ids'] = jsonEncode(ids);
+          attachmentData['matched'] = 0;
+          await DatabaseHelper.instance.insertMediaAttachment(attachmentData);
+        } else {
+          attachmentData['matched'] = 0;
+          await DatabaseHelper.instance.insertMediaAttachment(attachmentData);
+        }
+      }
+      
+      // Notify UI of new media
+      newMessageNotifier.value++;
+      
+    } catch (e) {
+      debugPrint('[NotificationService] Error checking new media: $e');
+    }
+  }
+
   Future<void> _checkForCleanup() async {
     try {
       final result = await platform.invokeMethod('checkCleanupRequested');
@@ -404,7 +465,13 @@ class NotificationService with WidgetsBindingObserver {
       await _checkForNewNotifications().timeout(
         const Duration(seconds: 10),
         onTimeout: () {
-          debugPrint('[NotificationService] Refresh timed out');
+          debugPrint('[NotificationService] Refresh notifications timed out');
+        },
+      );
+      await _checkForNewMedia().timeout(
+        const Duration(seconds: 10),
+        onTimeout: () {
+          debugPrint('[NotificationService] Refresh media timed out');
         },
       );
     } catch (e) {
@@ -452,7 +519,27 @@ class NotificationService with WidgetsBindingObserver {
     }
   }
 
+  // ══════════════════════════════════════════════════════════════════════
+  // SAF PERMISSIONS
+  // ══════════════════════════════════════════════════════════════════════
 
+  Future<bool> getSafPermissionStatus() async {
+    try {
+      return await platform.invokeMethod('getSafPermissionStatus') as bool? ?? false;
+    } catch (e) {
+      debugPrint('[NotificationService] getSafPermissionStatus error: $e');
+      return false;
+    }
+  }
+
+  Future<bool> requestWhatsAppSafPermission() async {
+    try {
+      return await platform.invokeMethod('requestWhatsAppSafPermission') as bool? ?? false;
+    } catch (e) {
+      debugPrint('[NotificationService] requestWhatsAppSafPermission error: $e');
+      return false;
+    }
+  }
 
   void dispose() {
     debugPrint('[NotificationService] Disposing...');

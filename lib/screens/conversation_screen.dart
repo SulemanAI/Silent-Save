@@ -1,12 +1,16 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import '../widgets/video_thumbnail_widget.dart';
 import 'package:intl/intl.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import '../models/message_model.dart';
 import '../services/database_helper.dart';
+import '../services/encryption_service.dart';
+import '../services/notification_service.dart';
+import '../widgets/full_screen_media_viewer.dart';
 
 class ConversationScreen extends StatefulWidget {
   final String sender;
@@ -33,6 +37,9 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
 
   bool _isSearching = false;
   final TextEditingController _searchController = TextEditingController();
+  
+  List<String> _groupMembers = [];
+  Set<String> _selectedSenders = {};
   
   // Highlighting and scrolling
   String _searchQuery = '';
@@ -98,9 +105,13 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
       }
     }
     
+    final allGroupSenders = messages.map((m) => m.senderName ?? m.sender).toSet().toList();
+    allGroupSenders.sort();
+
     setState(() {
       _messages = messages;
       _isGroupChat = isGroup;
+      _groupMembers = allGroupSenders;
       _avatarPath = latestAvatarPath;
       _isLoading = false;
       
@@ -116,10 +127,15 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     _displayItems.clear();
     var activeMessages = _messages.where((msg) => msg.isDeleted != true).toList();
     
-    // Deduplicate
+    if (_selectedSenders.isNotEmpty) {
+      activeMessages = activeMessages.where((msg) => _selectedSenders.contains(msg.senderName ?? msg.sender)).toList();
+    }
+    
+    // Deduplicate — include mediaPath in key so a "📷 Photo" message with a
+    // captured image is not merged with one that has no image.
     final seen = <String>{};
     activeMessages = activeMessages.where((msg) {
-      final key = '${msg.message}||${msg.timestamp.millisecondsSinceEpoch}';
+      final key = '${msg.message}||${msg.timestamp.millisecondsSinceEpoch}||${msg.mediaPath ?? ''}';
       if (seen.contains(key)) return false;
       seen.add(key);
       return true;
@@ -208,13 +224,134 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   }
 
   void _previousMatch() {
-    if (_matchIndices.isEmpty) return;
     setState(() {
       if (_currentMatchIndex > 0) {
         _currentMatchIndex--;
         _scrollToCurrentMatch();
       }
     });
+  }
+
+  void _showFilterDialog() {
+    String searchQuery = '';
+    
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.grey.shade900,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            final filteredMembers = _groupMembers
+                .where((m) => m.toLowerCase().contains(searchQuery.toLowerCase()))
+                .toList();
+
+            return Padding(
+              padding: EdgeInsets.only(
+                bottom: MediaQuery.of(context).viewInsets.bottom,
+              ),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+                height: MediaQuery.of(context).size.height * 0.7,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'Filter by Sender',
+                          style: TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white,
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: () {
+                            setModalState(() {
+                              _selectedSenders.clear();
+                            });
+                            setState(() {
+                              _updateDisplayItems();
+                            });
+                          },
+                          child: const Text('Clear All', style: TextStyle(color: Colors.orangeAccent)),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      style: const TextStyle(color: Colors.white),
+                      decoration: InputDecoration(
+                        hintText: 'Search members...',
+                        hintStyle: TextStyle(color: Colors.grey.shade500),
+                        prefixIcon: Icon(Icons.search, color: Colors.grey.shade400),
+                        filled: true,
+                        fillColor: Colors.grey.shade800,
+                        contentPadding: const EdgeInsets.symmetric(vertical: 0, horizontal: 16),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                      onChanged: (val) {
+                        setModalState(() {
+                          searchQuery = val;
+                        });
+                      },
+                    ),
+                    const SizedBox(height: 16),
+                    Expanded(
+                      child: filteredMembers.isEmpty
+                          ? Center(
+                              child: Text(
+                                'No members found',
+                                style: TextStyle(color: Colors.grey.shade500),
+                              ),
+                            )
+                          : ListView.builder(
+                              itemCount: filteredMembers.length,
+                              itemBuilder: (context, index) {
+                                final member = filteredMembers[index];
+                                final isSelected = _selectedSenders.contains(member);
+                                return CheckboxListTile(
+                                  contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+                                  secondary: _buildSenderAvatar(member, _getSenderColor(member)),
+                                  title: Text(member, style: const TextStyle(color: Colors.white, fontSize: 16)),
+                                  value: isSelected,
+                                  activeColor: Colors.orangeAccent,
+                                  checkColor: Colors.black,
+                                  controlAffinity: ListTileControlAffinity.trailing,
+                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                                  checkboxShape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+                                  onChanged: (val) {
+                                    setModalState(() {
+                                      if (val == true) {
+                                        _selectedSenders.add(member);
+                                      } else {
+                                        _selectedSenders.remove(member);
+                                      }
+                                    });
+                                    setState(() {
+                                      _updateDisplayItems();
+                                    });
+                                  },
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
   }
 
   Widget _getAppIcon(String packageName, {double size = 12, Color? color}) {
@@ -230,33 +367,9 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   String _sanitizeText(String? text) {
     if (text == null || text.isEmpty) return '';
     try {
-      // Remove isolated surrogate code units which cause UTF-16 errors
-      final buffer = StringBuffer();
-      for (int i = 0; i < text.length; i++) {
-        final codeUnit = text.codeUnitAt(i);
-        // Check if it's a high surrogate (0xD800-0xDBFF)
-        if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
-          // Check if next character is a valid low surrogate
-          if (i + 1 < text.length) {
-            final nextCodeUnit = text.codeUnitAt(i + 1);
-            if (nextCodeUnit >= 0xDC00 && nextCodeUnit <= 0xDFFF) {
-              // Valid surrogate pair - keep both
-              buffer.writeCharCode(codeUnit);
-              buffer.writeCharCode(nextCodeUnit);
-              i++; // Skip the low surrogate
-              continue;
-            }
-          }
-          // Isolated high surrogate - replace with replacement character
-          buffer.write('\uFFFD');
-        } else if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) {
-          // Isolated low surrogate - replace with replacement character
-          buffer.write('\uFFFD');
-        } else {
-          buffer.writeCharCode(codeUnit);
-        }
-      }
-      return buffer.toString();
+      // Dart's Runes iterator naturally handles surrogate pairs correctly 
+      // and replaces isolated surrogates with the replacement character U+FFFD.
+      return String.fromCharCodes(text.runes);
     } catch (e) {
       // If anything fails, return a safe fallback
       return text.replaceAll(RegExp(r'[\uD800-\uDFFF]'), '\uFFFD');
@@ -404,11 +517,14 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                               ),
                             ),
                             if (_messages.isNotEmpty) ...[
-                              Text(
-                                ' • ${_messages.length} messages',
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.grey.shade400,
+                              Flexible(
+                                child: Text(
+                                  ' • ${_displayItems.where((item) => !item.isHeader).length} messages',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.grey.shade400,
+                                  ),
+                                  overflow: TextOverflow.ellipsis,
                                 ),
                               ),
                             ],
@@ -438,6 +554,15 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
               tooltip: 'Newer messages',
             ),
           ],
+          if (_isGroupChat)
+            IconButton(
+              icon: Icon(
+                _selectedSenders.isNotEmpty ? Icons.filter_list_alt : Icons.filter_list,
+                color: _selectedSenders.isNotEmpty ? Colors.orangeAccent : Colors.white,
+              ),
+              onPressed: _showFilterDialog,
+              tooltip: 'Filter by sender',
+            ),
           IconButton(
             icon: Icon(_isSearching ? Icons.close : Icons.search),
             onPressed: () {
@@ -659,10 +784,14 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     );
   }
 
-  /// Show options menu when long-pressing a message (copy, etc.)
+  /// Show options menu when long-pressing a message (copy, view full image, etc.)
   void _showMessageOptions(BuildContext context, MessageModel message) {
     final senderName = _sanitizeText(message.senderName ?? message.sender);
-    
+    final hasImage = message.mediaPath != null &&
+        message.mediaPath!.isNotEmpty &&
+        File(message.mediaPath!).existsSync();
+    final isMedia = _isGenericMediaLabel(message.message);
+
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.grey.shade900,
@@ -684,53 +813,95 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                   borderRadius: BorderRadius.circular(2),
                 ),
               ),
-              // Message preview
+              // Message preview — show icon for media messages
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                child: Text(
-                  _sanitizeText(message.message).length > 100
-                      ? '${_sanitizeText(message.message).substring(0, 100)}...'
-                      : _sanitizeText(message.message),
-                  style: TextStyle(
-                    fontSize: 13,
-                    color: Colors.grey.shade400,
-                    fontStyle: FontStyle.italic,
-                  ),
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                ),
+                child: isMedia && !hasImage
+                    ? Row(
+                        children: [
+                          Icon(_mediaTypeInfo(message.message).icon,
+                              color: _mediaTypeInfo(message.message).color,
+                              size: 16),
+                          const SizedBox(width: 8),
+                          Text(
+                            _mediaTypeInfo(message.message).label,
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: Colors.grey.shade400,
+                              fontStyle: FontStyle.italic,
+                            ),
+                          ),
+                        ],
+                      )
+                    : Text(
+                        _sanitizeText(message.message).length > 100
+                            ? '${_sanitizeText(message.message).substring(0, 100)}...'
+                            : _sanitizeText(message.message),
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: Colors.grey.shade400,
+                          fontStyle: FontStyle.italic,
+                        ),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
               ),
               const Divider(height: 1, color: Colors.grey),
-              // Copy message text
-              ListTile(
-                leading: const Icon(Icons.copy, color: Colors.white70),
-                title: const Text('Copy message', style: TextStyle(color: Colors.white)),
-                onTap: () {
-                  Clipboard.setData(ClipboardData(text: message.message));
-                  Navigator.pop(ctx);
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: const Text('Message copied to clipboard'),
-                      backgroundColor: Colors.white.withValues(alpha: 0.7),
-                      behavior: SnackBarBehavior.floating,
-                      duration: const Duration(seconds: 2),
-                    ),
-                  );
-                },
-              ),
-              // Copy with sender name and timestamp
-              if (_isGroupChat)
+
+              // ── View full image (only when file exists) ────────────────
+              if (hasImage)
                 ListTile(
-                  leading: const Icon(Icons.content_copy, color: Colors.white70),
-                  title: const Text('Copy with sender info', style: TextStyle(color: Colors.white)),
+                  leading: const Icon(Icons.fullscreen, color: Colors.white70),
+                  title: const Text('View full image',
+                      style: TextStyle(color: Colors.white)),
                   onTap: () {
-                    final formattedTime = _formatMessageTime(message.timestamp);
-                    final textToCopy = '[$formattedTime] $senderName: ${message.message}';
+                    Navigator.pop(ctx);
+                    final heroTag =
+                        'media_${message.id ?? message.mediaPath.hashCode}';
+                    _openFullScreenImage(message.mediaPath!, heroTag);
+                  },
+                ),
+
+              // ── Copy message text ─────────────────────────────────────
+              if (!isMedia || !hasImage)
+                ListTile(
+                  leading: const Icon(Icons.copy, color: Colors.white70),
+                  title: const Text('Copy message',
+                      style: TextStyle(color: Colors.white)),
+                  onTap: () {
+                    Clipboard.setData(
+                        ClipboardData(text: message.message));
+                    Navigator.pop(ctx);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: const Text('Message copied to clipboard'),
+                        backgroundColor:
+                            Colors.white.withValues(alpha: 0.7),
+                        behavior: SnackBarBehavior.floating,
+                        duration: const Duration(seconds: 2),
+                      ),
+                    );
+                  },
+                ),
+
+              // ── Copy with sender info (group chats) ───────────────────
+              if (_isGroupChat && (!isMedia || !hasImage))
+                ListTile(
+                  leading:
+                      const Icon(Icons.content_copy, color: Colors.white70),
+                  title: const Text('Copy with sender info',
+                      style: TextStyle(color: Colors.white)),
+                  onTap: () {
+                    final formattedTime =
+                        _formatMessageTime(message.timestamp);
+                    final textToCopy =
+                        '[$formattedTime] $senderName: ${message.message}';
                     Clipboard.setData(ClipboardData(text: textToCopy));
                     Navigator.pop(ctx);
                     ScaffoldMessenger.of(context).showSnackBar(
                       SnackBar(
-                        content: const Text('Message with sender info copied'),
+                        content:
+                            const Text('Message with sender info copied'),
                         backgroundColor: Colors.grey.shade800,
                         behavior: SnackBarBehavior.floating,
                         duration: const Duration(seconds: 2),
@@ -738,6 +909,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                     );
                   },
                 ),
+
               const SizedBox(height: 8),
             ],
           ),
@@ -859,31 +1031,9 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // Media image preview (photo / sticker / video thumbnail)
-                  if (message.mediaPath != null &&
-                      message.mediaPath!.isNotEmpty &&
-                      File(message.mediaPath!).existsSync()) ...[  
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(12),
-                      child: Image.file(
-                        File(message.mediaPath!),
-                        fit: BoxFit.cover,
-                        width: double.infinity,
-                        height: 200,
-                        errorBuilder: (_, __, ___) => const SizedBox.shrink(),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                  ],
-                  // Message text — hide if it's just a generic media label and image is shown
-                  if (!_isGenericMediaLabel(message.message) ||
-                      message.mediaPath == null ||
-                      message.mediaPath!.isEmpty ||
-                      !File(message.mediaPath!).existsSync()) ...[  
-                    _buildHighlightText(_sanitizeText(message.message), isCurrentMatch),
-                    const SizedBox(height: 6),
-                  ],
-                  // Timestamp and read status
+                  // ── Media content: real image OR placeholder ──────────────
+                  _buildMediaContent(message, isCurrentMatch),
+                  // ── Timestamp + read tick ─────────────────────────────────
                   Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -898,8 +1048,8 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                       Icon(
                         message.isRead == true ? Icons.done_all : Icons.done,
                         size: 14,
-                        color: message.isRead == true 
-                            ? Colors.blue.shade300 
+                        color: message.isRead == true
+                            ? Colors.blue.shade300
                             : Colors.grey.shade600,
                       ),
                     ],
@@ -912,25 +1062,383 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
       ),
     );
   }
+
+  // ══════════════════════════════════════════════════════════════════════
+  // MEDIA RENDERING
+  // ══════════════════════════════════════════════════════════════════════
+
+  /// Decides what to render for a message's media content:
+  ///
+  /// Priority order (fallback chain):
+  ///   1. Real image file exists at mediaPath  → show actual image
+  ///   2. Message is a known media label       → show styled placeholder
+  ///      (file not captured yet — hook for SAF path once Phase 2 ships)
+  ///   3. Neither                              → show message text only
+  Widget _buildMediaContent(MessageModel message, bool isCurrentMatch) {
+    final isWhatsApp = message.app.toLowerCase().contains('whatsapp');
+    final mediaPath = message.mediaPath;
+    final hasFile = mediaPath != null &&
+        mediaPath.isNotEmpty &&
+        File(mediaPath).existsSync();
+    final isMedia = isWhatsApp && _isGenericMediaLabel(message.message);
+
+    if (hasFile) {
+      // ── Case 1: We have the actual captured image ─────────────────────
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildRealImage(message, mediaPath),
+          const SizedBox(height: 8),
+        ],
+      );
+    }
+
+    if (isMedia) {
+      // ── Case 2: Media was sent but file wasn't captured ───────────────
+      // Show an informative placeholder. When SAF captures the real file
+      // and updates mediaPath, this branch will never be reached again.
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildMediaPlaceholder(message.message),
+          const SizedBox(height: 8),
+        ],
+      );
+    }
+
+    // ── Case 3: Plain text message ────────────────────────────────────
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _buildHighlightText(_sanitizeText(message.message), isCurrentMatch),
+        const SizedBox(height: 6),
+      ],
+    );
+  }
+
+  /// Renders the captured image or a video/audio placeholder with a tap-to-fullscreen hero.
+  Widget _buildRealImage(MessageModel message, String path) {
+    final heroTag = 'media_${message.id ?? path.hashCode}';
+    final ext = path.toLowerCase().split('.').last;
+    final isVideo = ['mp4', 'mov', 'avi', 'mkv'].contains(ext);
+    final isAudio = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext);
+    final mediaType = isVideo ? 'video' : (isAudio ? 'audio' : 'image');
+
+    return GestureDetector(
+      onTap: () => _openFullScreenImage(path, heroTag, type: mediaType),
+      child: Hero(
+        tag: heroTag,
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(12),
+          child: (isVideo || isAudio)
+            ? Stack(
+                alignment: Alignment.center,
+                children: [
+                  if (isVideo)
+                    SizedBox(
+                      width: double.infinity,
+                      height: 220,
+                      child: VideoThumbnailWidget(videoPath: path),
+                    )
+                  else
+                    Container(
+                      width: double.infinity,
+                      height: 220,
+                      decoration: BoxDecoration(
+                        color: Colors.orange.withValues(alpha: 0.15),
+                        border: Border.all(
+                          color: Colors.orange.withValues(alpha: 0.3),
+                        ),
+                      ),
+                      child: const Center(
+                        child: Icon(Icons.mic, color: Colors.orange, size: 64),
+                      ),
+                    ),
+                  
+                  // Play overlay for both video and audio
+                  Container(
+                    width: 56,
+                    height: 56,
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.5),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(
+                      Icons.play_arrow_rounded,
+                      color: Colors.white,
+                      size: 38,
+                    ),
+                  ),
+
+                  // Optional label for Audio
+                  if (isAudio)
+                    Positioned(
+                      bottom: 24,
+                      child: Text(
+                        'Voice Note',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white.withValues(alpha: 0.9),
+                          decoration: TextDecoration.none,
+                        ),
+                      ),
+                    ),
+                ],
+              )
+            : Stack(
+                children: [
+                  Image.file(
+                    File(path),
+                    fit: BoxFit.cover,
+                    width: double.infinity,
+                    height: 220,
+                    errorBuilder: (_, __, ___) => _buildImageError(),
+                  ),
+                  // Tap-to-expand affordance
+                  Positioned(
+                    bottom: 8,
+                    right: 8,
+                    child: Container(
+                      padding: const EdgeInsets.all(4),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: 0.55),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: const Icon(
+                        Icons.fullscreen,
+                        color: Colors.white,
+                        size: 18,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+        ),
+      ),
+    );
+  }
+
+  /// Styled placeholder for media messages where the file wasn't captured
+  /// (e.g. the notification carried no BigPicture, or SAF is not yet set up).
+  Widget _buildMediaPlaceholder(String rawLabel) {
+    final info = _mediaTypeInfo(rawLabel);
+    return GestureDetector(
+      onTap: () async {
+        final hasSaf = await NotificationService.instance.getSafPermissionStatus();
+        final text = hasSaf 
+            ? 'Media not found on device. It may have been deleted before downloading, or Auto-Download is disabled in WhatsApp.'
+            : 'Full media capture coming — grant WhatsApp folder access in Settings.';
+            
+        if (!mounted) return;
+        
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                Icon(info.icon, color: Colors.white70, size: 16),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    text,
+                    style: const TextStyle(fontSize: 13, color: Colors.white),
+                  ),
+                ),
+              ],
+            ),
+            backgroundColor: Colors.grey.shade800,
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      },
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(12),
+          gradient: LinearGradient(
+            colors: [
+              info.color.withValues(alpha: 0.18),
+              info.color.withValues(alpha: 0.08),
+            ],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+          border: Border.all(
+            color: info.color.withValues(alpha: 0.35),
+            width: 1,
+          ),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 44,
+              height: 44,
+              decoration: BoxDecoration(
+                color: info.color.withValues(alpha: 0.2),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(info.icon, color: info.color, size: 24),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    info.label,
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.white.withValues(alpha: 0.9),
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    'Tap to learn more',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: Colors.grey.shade500,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Icon(
+              Icons.chevron_right_rounded,
+              color: info.color.withValues(alpha: 0.6),
+              size: 20,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildImageError() {
+    return Container(
+      height: 80,
+      color: Colors.grey.shade900,
+      child: Center(
+        child: Icon(Icons.broken_image_outlined,
+            color: Colors.grey.shade600, size: 32),
+      ),
+    );
+  }
+
+  void _openFullScreenImage(String path, String heroTag, {String? type}) {
+    Navigator.of(context).push(
+      PageRouteBuilder(
+        opaque: false,
+        barrierColor: Colors.black.withValues(alpha: 0.92),
+        pageBuilder: (ctx, animation, _) {
+          return FadeTransition(
+            opacity: animation,
+            child: FullScreenMediaViewer(path: path, heroTag: heroTag, type: type),
+          );
+        },
+      ),
+    );
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  // MEDIA TYPE HELPERS
+  // ══════════════════════════════════════════════════════════════════════
+
   /// Returns true if [text] is a generic notification label that adds no
-  /// meaningful information when a media image is already shown.
+  /// meaningful information when a media image is already shown, OR when we
+  /// want to show a media placeholder instead of raw text.
   bool _isGenericMediaLabel(String text) {
     final lower = text.trim().toLowerCase();
+    // Exact label matches (WhatsApp notification text)
     const labels = {
-      'photo', 'image', 'video', 'sticker', 'gif', 'document',
-      'image omitted', 'video omitted', 'audio omitted',
-      'voice message', 'voice message omitted',
+      'photo', 'image', 'video', 'sticker', 'gif', 'document', 'file',
+      'image omitted', 'video omitted', 'audio omitted', 'sticker omitted',
+      'voice message', 'voice message omitted', 'audio',
+      'contact card', 'location', 'live location',
     };
-    if (labels.contains(lower)) {
-      return true;
+    if (labels.contains(lower)) return true;
+
+    // Emoji-prefixed labels WhatsApp uses in BigText
+    const emojiPrefixes = ['📷', '📹', '🎤', '🎵', '🎞', '📄', '📎',
+                           '🗺', '📍', '👤', '🎥', '🖼', '🎙'];
+    for (final p in emojiPrefixes) {
+      if (lower.startsWith(p)) return true;
     }
-    if (lower.startsWith('📷') || lower.startsWith('📹') ||
-        lower.startsWith('🎤') || lower.startsWith('🎵') ||
-        lower.startsWith('🎞')) {
-      return true;
+
+    // WhatsApp business/group media patterns: "Name: 📷 Photo" or "Name: image"
+    final colonIdx = lower.indexOf(':');
+    if (colonIdx > 0 && colonIdx < lower.length - 1) {
+      final afterColon = lower.substring(colonIdx + 1).trim();
+      if (labels.contains(afterColon)) return true;
+      for (final p in emojiPrefixes) {
+        if (afterColon.startsWith(p)) return true;
+      }
     }
+
     return false;
   }
+
+  _MediaTypeInfo _mediaTypeInfo(String rawLabel) {
+    final lower = rawLabel.trim().toLowerCase();
+    if (lower.contains('voice') || lower.contains('audio') ||
+        lower.contains('🎤') || lower.contains('🎵') || lower.contains('🎙')) {
+      return _MediaTypeInfo(
+        icon: Icons.mic_rounded,
+        color: Colors.deepPurple.shade300,
+        label: 'Voice Message',
+      );
+    }
+    if (lower.contains('video') || lower.contains('📹') || lower.contains('🎥')) {
+      return _MediaTypeInfo(
+        icon: Icons.videocam_rounded,
+        color: Colors.blue.shade300,
+        label: 'Video',
+      );
+    }
+    if (lower.contains('sticker') || lower.contains('gif')) {
+      return _MediaTypeInfo(
+        icon: Icons.emoji_emotions_rounded,
+        color: Colors.amber.shade300,
+        label: 'Sticker / GIF',
+      );
+    }
+    if (lower.contains('document') || lower.contains('file') || lower.contains('📄') || lower.contains('📎')) {
+      return _MediaTypeInfo(
+        icon: Icons.insert_drive_file_rounded,
+        color: Colors.teal.shade300,
+        label: 'Document',
+      );
+    }
+    if (lower.contains('location') || lower.contains('🗺') || lower.contains('📍')) {
+      return _MediaTypeInfo(
+        icon: Icons.location_on_rounded,
+        color: Colors.red.shade300,
+        label: 'Location',
+      );
+    }
+    // Default: image / photo
+    return _MediaTypeInfo(
+      icon: Icons.image_rounded,
+      color: Colors.green.shade300,
+      label: 'Photo',
+    );
+  }
+}
+// ══════════════════════════════════════════════════════════════════════
+// MODELS
+// ══════════════════════════════════════════════════════════════════════
+
+class _MediaTypeInfo {
+  final IconData icon;
+  final Color color;
+  final String label;
+  const _MediaTypeInfo({
+    required this.icon,
+    required this.color,
+    required this.label,
+  });
 }
 
 // Helper class for list items (either date header or message)

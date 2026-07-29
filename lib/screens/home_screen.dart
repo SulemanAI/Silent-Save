@@ -7,7 +7,9 @@ import '../services/database_helper.dart';
 import '../services/notification_service.dart';
 import '../services/encryption_service.dart';
 import '../models/message_model.dart';
+import '../widgets/full_screen_media_viewer.dart';
 import 'conversation_screen.dart';
+import 'package:flutter_slidable/flutter_slidable.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -25,9 +27,15 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   List<MessageModel> _searchResults = [];
   bool _isLoading = true;
   bool _hasPermission = false;
+  bool _hasSafPermission = true; // Default true to avoid flash before check
   bool _encryptionEnabled = false;
   SortOption _sortOption = SortOption.recent;
+  String? _highlightedConversationKey;
   late TabController _tabController;
+  
+  // Variables for custom swipe-to-switch tabs gesture detection
+  double _horizontalDragTotal = 0;
+  bool _isDraggingVertically = false;
 
   @override
   void initState() {
@@ -35,6 +43,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     WidgetsBinding.instance.addObserver(this);
     _tabController = TabController(length: 2, vsync: this);
     _checkPermission();
+    _checkSafPermission();
     _loadConversations();
     _checkEncryption();
     _checkOemBatterySettings();
@@ -110,7 +119,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       });
       if (mounted) {
         setState(() {
-          _conversations = conversations;
+          _conversations = conversations.toList();
           _isLoading = false;
         });
         _applySortAndFilter();
@@ -126,6 +135,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       // App resumed from background - refresh conversations (which includes refreshing notifications)
       _loadConversations();
       _checkPermission();
+      _checkSafPermission();
     }
   }
 
@@ -194,6 +204,13 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     });
   }
 
+  Future<void> _checkSafPermission() async {
+    final hasSaf = await NotificationService.instance.getSafPermissionStatus();
+    setState(() {
+      _hasSafPermission = hasSaf;
+    });
+  }
+
 
 
   Future<void> _checkEncryption() async {
@@ -222,7 +239,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         return <Map<String, dynamic>>[];
       });
       setState(() {
-        _conversations = conversations;
+        _conversations = conversations.toList();
         _isLoading = false;
       });
       _applySortAndFilter();
@@ -233,6 +250,59 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         _filteredConversations = [];
         _isLoading = false;
       });
+    }
+  }
+
+  Future<void> _handleDeleteConversation(String sender, String appPackage) async {
+    // Save the conversation locally before removing
+    final deletedIndex = _conversations.indexWhere((c) => c['sender'] == sender && c['app'] == appPackage);
+    Map<String, dynamic>? deletedConversation;
+    if (deletedIndex != -1) {
+      deletedConversation = _conversations[deletedIndex];
+    }
+
+    // Delete from DB immediately
+    await DatabaseHelper.instance.deleteConversation(sender, appPackage);
+    
+    // Remove from list locally for immediate feedback without full reload
+    setState(() {
+      if (deletedIndex != -1) {
+        _conversations.removeAt(deletedIndex);
+        _applySortAndFilter();
+      }
+    });
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).clearSnackBars();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('Conversation deleted'),
+          duration: const Duration(seconds: 5),
+          action: SnackBarAction(
+            label: 'UNDO',
+            onPressed: () async {
+              await DatabaseHelper.instance.undoDeleteConversation(sender, appPackage);
+              if (deletedConversation != null && mounted) {
+                setState(() {
+                  _conversations.add(deletedConversation!);
+                  _applySortAndFilter();
+                  _highlightedConversationKey = 'conv_${sender}_$appPackage';
+                });
+                
+                Future.delayed(const Duration(seconds: 2), () {
+                  if (mounted) {
+                    setState(() {
+                      if (_highlightedConversationKey == 'conv_${sender}_$appPackage') {
+                        _highlightedConversationKey = null;
+                      }
+                    });
+                  }
+                });
+              }
+            },
+          ),
+        ),
+      );
     }
   }
 
@@ -269,35 +339,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   String _sanitizeText(String? text) {
     if (text == null || text.isEmpty) return '';
     try {
-      // Remove isolated surrogate code units which cause UTF-16 errors
-      final buffer = StringBuffer();
-      for (int i = 0; i < text.length; i++) {
-        final codeUnit = text.codeUnitAt(i);
-        // Check if it's a high surrogate (0xD800-0xDBFF)
-        if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
-          // Check if next character is a valid low surrogate
-          if (i + 1 < text.length) {
-            final nextCodeUnit = text.codeUnitAt(i + 1);
-            if (nextCodeUnit >= 0xDC00 && nextCodeUnit <= 0xDFFF) {
-              // Valid surrogate pair - keep both
-              buffer.writeCharCode(codeUnit);
-              buffer.writeCharCode(nextCodeUnit);
-              i++; // Skip the low surrogate
-              continue;
-            }
-          }
-          // Isolated high surrogate - replace with replacement character
-          buffer.write('\uFFFD');
-        } else if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) {
-          // Isolated low surrogate - replace with replacement character
-          buffer.write('\uFFFD');
-        } else {
-          buffer.writeCharCode(codeUnit);
-        }
-      }
-      return buffer.toString();
+      // Dart's Runes iterator naturally handles surrogate pairs correctly 
+      // and replaces isolated surrogates with the replacement character U+FFFD.
+      return String.fromCharCodes(text.runes);
     } catch (e) {
-      // If anything fails, return a safe fallback
       return text.replaceAll(RegExp(r'[\uD800-\uDFFF]'), '\uFFFD');
     }
   }
@@ -513,18 +558,45 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       body: Column(
         children: [
           if (!_hasPermission) _buildPermissionWarning(),
+          if (_hasPermission && !_hasSafPermission && _tabController.index == 0) _buildSafPermissionWarning(),
           _buildSearchBar(),
           Expanded(
             child: _isLoading
                 ? const Center(child: CircularProgressIndicator())
                 : _searchController.text.isNotEmpty
                     ? _buildSearchResultsList()
-                    : TabBarView(
-                        controller: _tabController,
-                        children: [
-                          _buildConversationList('com.whatsapp'),
-                          _buildConversationList('com.instagram.android'),
-                        ],
+                    : Listener(
+                        onPointerDown: (_) {
+                          _horizontalDragTotal = 0;
+                          _isDraggingVertically = false;
+                        },
+                        onPointerMove: (event) {
+                          if (_isDraggingVertically) return;
+                          
+                          // If moving vertically, ignore horizontal swipe
+                          if (event.delta.dy.abs() > 5 && _horizontalDragTotal.abs() < 10) {
+                            _isDraggingVertically = true;
+                            return;
+                          }
+                          
+                          _horizontalDragTotal += event.delta.dx;
+                          
+                          // Custom threshold to switch tabs
+                          if (_tabController.index == 0 && _horizontalDragTotal < -60) {
+                            _tabController.animateTo(1);
+                            _horizontalDragTotal = 0;
+                          } else if (_tabController.index == 1 && _horizontalDragTotal > 60) {
+                            _tabController.animateTo(0);
+                            _horizontalDragTotal = 0;
+                          }
+                        },
+                        child: TabBarView(
+                          controller: _tabController,
+                          children: [
+                            _buildConversationList('com.whatsapp'),
+                            _buildConversationList('com.instagram.android'),
+                          ],
+                        ),
                       ),
           ),
         ],
@@ -581,6 +653,55 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   }
 
 
+
+  Widget _buildSafPermissionWarning() {
+    return Container(
+      margin: const EdgeInsets.only(left: 16, right: 16, top: 16, bottom: 0),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.green.shade900.withValues(alpha: 0.3),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.green.shade600, width: 1),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.photo_library, color: Colors.green.shade400),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Media Capture setup',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 16,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Grant access to WhatsApp folder to save photos and videos.',
+                  style: TextStyle(fontSize: 12, color: Colors.grey.shade300),
+                ),
+              ],
+            ),
+          ),
+          FilledButton(
+            onPressed: () async {
+              final granted = await NotificationService.instance.requestWhatsAppSafPermission();
+              if (granted) {
+                _checkSafPermission();
+              }
+            },
+            style: FilledButton.styleFrom(
+              backgroundColor: Colors.green.shade600,
+            ),
+            child: const Text('Setup'),
+          ),
+        ],
+      ),
+    );
+  }
 
   Widget _buildSearchBar() {
     return Padding(
@@ -981,26 +1102,93 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       previewText = '${previewText.substring(0, 47)}...';
     }
     
-    return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: unreadCount > 0 
-            ? [Colors.deepPurple.shade900.withValues(alpha: 0.4), Colors.purple.shade900.withValues(alpha: 0.2)]
-            : [Colors.grey.shade900.withValues(alpha: 0.5), Colors.grey.shade800.withValues(alpha: 0.3)],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: unreadCount > 0 
-            ? Colors.deepPurple.shade400.withValues(alpha: 0.5)
-            : Colors.grey.shade700.withValues(alpha: 0.3),
-          width: 1,
-        ),
-      ),
-      child: Material(
-        color: Colors.transparent,
+    final String? lastMediaPath = conversation['lastMediaPath']?.toString();
+    final bool hasMediaFile = lastMediaPath != null && lastMediaPath.isNotEmpty && File(lastMediaPath).existsSync();
+    
+    bool isAudio = false;
+    bool isVideo = false;
+    if (hasMediaFile) {
+      final ext = lastMediaPath!.toLowerCase().split('.').last;
+      isAudio = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext);
+      isVideo = ['mp4', 'mov', 'avi', 'mkv'].contains(ext);
+    }
+    
+    final String appPackage = conversation['app']?.toString() ?? '';
+    final bool isWhatsApp = appPackage.contains('whatsapp');
+    
+    return Slidable(
+      key: Key('conv_${sender}_$appPackage'),
+      startActionPane: isWhatsApp ? ActionPane(
+        motion: const ScrollMotion(),
+        dismissible: DismissiblePane(onDismissed: () => _handleDeleteConversation(sender, appPackage)),
+        children: [
+          SlidableAction(
+            onPressed: (context) => _handleDeleteConversation(sender, appPackage),
+            backgroundColor: Colors.red.shade800,
+            foregroundColor: Colors.white,
+            icon: Icons.delete,
+            borderRadius: BorderRadius.circular(16),
+          ),
+        ],
+      ) : null,
+      endActionPane: !isWhatsApp ? ActionPane(
+        motion: const ScrollMotion(),
+        dismissible: DismissiblePane(onDismissed: () => _handleDeleteConversation(sender, appPackage)),
+        children: [
+          SlidableAction(
+            onPressed: (context) => _handleDeleteConversation(sender, appPackage),
+            backgroundColor: Colors.red.shade800,
+            foregroundColor: Colors.white,
+            icon: Icons.delete,
+            borderRadius: BorderRadius.circular(16),
+          ),
+        ],
+      ) : null,
+      child: TweenAnimationBuilder<double>(
+        tween: Tween(begin: _highlightedConversationKey == 'conv_${sender}_$appPackage' ? 1.0 : 0.0, end: 0.0),
+        duration: const Duration(milliseconds: 1500),
+        curve: Curves.easeOut,
+        builder: (context, value, child) {
+          return Container(
+            margin: const EdgeInsets.only(bottom: 8),
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [
+                  Color.lerp(
+                    unreadCount > 0 
+                      ? Colors.deepPurple.shade900.withValues(alpha: 0.4) 
+                      : Colors.grey.shade900.withValues(alpha: 0.5),
+                    Colors.green.shade800.withValues(alpha: 0.6),
+                    value,
+                  )!,
+                  Color.lerp(
+                    unreadCount > 0 
+                      ? Colors.purple.shade900.withValues(alpha: 0.2) 
+                      : Colors.grey.shade800.withValues(alpha: 0.3),
+                    Colors.green.shade900.withValues(alpha: 0.3),
+                    value,
+                  )!,
+                ],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(
+                color: Color.lerp(
+                  unreadCount > 0 
+                    ? Colors.deepPurple.shade400.withValues(alpha: 0.5) 
+                    : Colors.grey.shade700.withValues(alpha: 0.3),
+                  Colors.greenAccent.withValues(alpha: 0.8),
+                  value,
+                )!,
+                width: 1 + (value * 1.5),
+              ),
+            ),
+            child: child,
+          );
+        },
+        child: Material(
+          color: Colors.transparent,
         child: InkWell(
           borderRadius: BorderRadius.circular(16),
           splashColor: Colors.deepPurple.shade300.withValues(alpha: 0.2),
@@ -1024,63 +1212,90 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             child: Row(
               children: [
                 // Avatar with group indicator
-                Stack(
-                  children: [
-                    Container(
-                      width: 56,
-                      height: 56,
-                      decoration: BoxDecoration(
-                        gradient: hasAvatar ? null : LinearGradient(
-                          colors: isGroupChat 
-                            ? [Colors.teal.shade400, Colors.cyan.shade600]
-                            : [Colors.deepPurple.shade400, Colors.purple.shade600],
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
-                        ),
-                        shape: BoxShape.circle,
-                        image: hasAvatar ? DecorationImage(
-                          image: FileImage(File(avatarPath)),
-                          fit: BoxFit.cover,
-                        ) : null,
-                        boxShadow: [
-                          BoxShadow(
-                            color: (isGroupChat ? Colors.teal : Colors.deepPurple).withValues(alpha: 0.3),
-                            blurRadius: 8,
-                            offset: const Offset(0, 2),
-                          ),
-                        ],
-                      ),
-                      child: hasAvatar ? null : Center(
-                        child: isGroupChat
-                          ? const Icon(Icons.group, color: Colors.white, size: 28)
-                          : Text(
-                              sender.isNotEmpty ? sender[0].toUpperCase() : '?',
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 22,
-                                fontWeight: FontWeight.bold,
+                GestureDetector(
+                  onTap: () {
+                    if (hasAvatar && avatarPath != null) {
+                      FocusScope.of(context).unfocus();
+                      Navigator.push(
+                        context,
+                        PageRouteBuilder(
+                          opaque: false,
+                          barrierColor: Colors.black.withValues(alpha: 0.92),
+                          pageBuilder: (ctx, animation, _) {
+                            return FadeTransition(
+                              opacity: animation,
+                              child: FullScreenMediaViewer(
+                                path: avatarPath,
+                                heroTag: 'avatar_${sender}_$appPackage',
+                                type: 'image',
                               ),
+                            );
+                          },
+                        ),
+                      );
+                    }
+                  },
+                  child: Hero(
+                    tag: 'avatar_${sender}_$appPackage',
+                    child: Stack(
+                      children: [
+                        Container(
+                          width: 56,
+                          height: 56,
+                          decoration: BoxDecoration(
+                            gradient: hasAvatar ? null : LinearGradient(
+                              colors: isGroupChat 
+                                ? [Colors.teal.shade400, Colors.cyan.shade600]
+                                : [Colors.deepPurple.shade400, Colors.purple.shade600],
+                              begin: Alignment.topLeft,
+                              end: Alignment.bottomRight,
                             ),
-                      ),
-                    ),
-                    // App badge (WhatsApp/Instagram)
-                    Positioned(
-                      right: 0,
-                      bottom: 0,
-                      child: Container(
-                        width: 20,
-                        height: 20,
-                        decoration: BoxDecoration(
-                          color: Colors.black87,
-                          shape: BoxShape.circle,
-                          border: Border.all(color: Colors.grey.shade800, width: 2),
+                            shape: BoxShape.circle,
+                            image: hasAvatar ? DecorationImage(
+                              image: FileImage(File(avatarPath!)),
+                              fit: BoxFit.cover,
+                            ) : null,
+                            boxShadow: [
+                              BoxShadow(
+                                color: (isGroupChat ? Colors.teal : Colors.deepPurple).withValues(alpha: 0.3),
+                                blurRadius: 8,
+                                offset: const Offset(0, 2),
+                              ),
+                            ],
+                          ),
+                          child: hasAvatar ? null : Center(
+                            child: isGroupChat
+                              ? const Icon(Icons.group, color: Colors.white, size: 28)
+                              : Text(
+                                  sender.isNotEmpty ? sender[0].toUpperCase() : '?',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 22,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                          ),
                         ),
-                        child: Center(
-                          child: _getAppIcon(conversation['app']?.toString() ?? '', size: 10),
+                        // App badge (WhatsApp/Instagram)
+                        Positioned(
+                          right: 0,
+                          bottom: 0,
+                          child: Container(
+                            width: 20,
+                            height: 20,
+                            decoration: BoxDecoration(
+                              color: Colors.black87,
+                              shape: BoxShape.circle,
+                              border: Border.all(color: Colors.grey.shade800, width: 2),
+                            ),
+                            child: Center(
+                              child: _getAppIcon(conversation['app']?.toString() ?? '', size: 10),
+                            ),
+                          ),
                         ),
-                      ),
+                      ],
                     ),
-                  ],
+                  ),
                 ),
                 const SizedBox(width: 14),
                 // Content
@@ -1144,17 +1359,43 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                       Row(
                         children: [
                           Expanded(
-                            child: Text(
-                              previewText.isEmpty ? 'No messages' : previewText,
-                              style: TextStyle(
-                                color: unreadCount > 0 
-                                  ? Colors.grey.shade300 
-                                  : Colors.grey.shade500,
-                                fontSize: 14,
-                                fontWeight: unreadCount > 0 ? FontWeight.w500 : FontWeight.normal,
-                              ),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
+                            child: Row(
+                              children: [
+                                if (hasMediaFile)
+                                  Container(
+                                    margin: const EdgeInsets.only(right: 6),
+                                    width: 20,
+                                    height: 20,
+                                    decoration: isAudio || isVideo ? null : BoxDecoration(
+                                      borderRadius: BorderRadius.circular(4),
+                                      image: DecorationImage(
+                                        image: FileImage(File(lastMediaPath!)),
+                                        fit: BoxFit.cover,
+                                      ),
+                                    ),
+                                    child: isVideo 
+                                      ? Icon(Icons.videocam, size: 18, color: Colors.grey.shade400)
+                                      : isAudio
+                                        ? Icon(Icons.mic, size: 18, color: Colors.grey.shade400)
+                                        : null,
+                                  ),
+                                Expanded(
+                                  child: Text(
+                                    previewText.isEmpty && hasMediaFile 
+                                      ? (isVideo ? 'Video' : isAudio ? 'Voice Note' : 'Photo') 
+                                      : (previewText.isEmpty ? 'No messages' : previewText),
+                                    style: TextStyle(
+                                      color: unreadCount > 0 
+                                        ? Colors.grey.shade300 
+                                        : Colors.grey.shade500,
+                                      fontSize: 14,
+                                      fontWeight: unreadCount > 0 ? FontWeight.w500 : FontWeight.normal,
+                                    ),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
                           if (unreadCount > 0) ...[
@@ -1202,6 +1443,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             ),
           ),
         ),
+      ),
       ),
     );
   }

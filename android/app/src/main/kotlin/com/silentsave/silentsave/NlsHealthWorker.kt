@@ -85,13 +85,21 @@ class NlsHealthWorker(
             }
 
             // Ensure KeepAliveService is running — re-start if killed by system.
-            // startForegroundService() will trigger onStartCommand() which re-acquires
-            // the WakeLock, even if the service was already running.
             try {
                 KeepAliveService.start(applicationContext)
                 Log.d(TAG, "KeepAliveService ensured running")
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to start KeepAliveService: ${e.message}")
+            }
+
+            // Ensure MediaWatcherService is running.
+            // onStartCommand also triggers scanAllSubdirs() — this doubles as the
+            // ContentObserver fallback scan for OEMs where onChange() is unreliable.
+            try {
+                MediaWatcherService.start(applicationContext)
+                Log.d(TAG, "MediaWatcherService ensured running")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to start MediaWatcherService: ${e.message}")
             }
 
             // Request rebind - this is safe even if already connected

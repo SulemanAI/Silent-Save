@@ -112,6 +112,13 @@ class KeepAliveService : Service() {
         // Schedule self-ping alarm to restart this service if killed
         scheduleSelfPingAlarm()
 
+        // Also ensure MediaWatcherService is running alongside us
+        try {
+            MediaWatcherService.start(applicationContext)
+        } catch (e: Exception) {
+            Log.w(TAG, "MediaWatcherService start failed: ${e.message}")
+        }
+
         // START_STICKY: If the system kills this service, restart it automatically
         return START_STICKY
     }

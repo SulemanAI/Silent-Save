@@ -1,11 +1,13 @@
 package com.silentsave.silentsave
 
+import android.app.Activity
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
+import android.provider.DocumentsContract
 import android.provider.Settings
 import android.util.Log
 
@@ -14,6 +16,7 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
 import java.util.concurrent.TimeUnit
@@ -23,7 +26,12 @@ class MainActivity : FlutterActivity() {
         private const val TAG = "SilentSaveMain"
         private const val CHANNEL = "com.silentsave/notifications"
         private const val PREFS_NAME = "notification_data"
+        private const val SAF_REQUEST_CODE = 2001
     }
+
+    // Holds the pending Flutter result for the SAF permission request.
+    // Set before launching ACTION_OPEN_DOCUMENT_TREE, resolved in onActivityResult.
+    private var pendingSafResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -103,7 +111,6 @@ class MainActivity : FlutterActivity() {
                     result.success(null)
                 }
                 "requestNlsRebind" -> {
-                    // Manually trigger NLS rebind - useful when user notices missing notifications
                     try {
                         val componentName = ComponentName(this, NotificationListener::class.java)
                         android.service.notification.NotificationListenerService.requestRebind(componentName)
@@ -114,9 +121,45 @@ class MainActivity : FlutterActivity() {
                         result.success(false)
                     }
                 }
-                else -> {
-                    result.notImplemented()
+
+                // ── SAF permission for WhatsApp media folder ────────────────────────
+                "requestWhatsAppSafPermission" -> {
+                    pendingSafResult = result
+                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                        addFlags(
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                        )
+                        // Hint the picker to the WhatsApp media folder.
+                        // ⚠️ ANDROID 11+ NOTE: ACTION_OPEN_DOCUMENT_TREE cannot start
+                        // AT Android/data/ or Android/media/ root on some ROMs —
+                        // the user must navigate there manually. The hint is best-effort.
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            val hint = buildSafInitialUri()
+                            if (hint != null) putExtra(DocumentsContract.EXTRA_INITIAL_URI, hint)
+                        }
+                    }
+                    try {
+                        startActivityForResult(intent, SAF_REQUEST_CODE)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to launch SAF picker: ${e.message}")
+                        pendingSafResult = null
+                        result.success(false)
+                    }
                 }
+
+                "getSafPermissionStatus" -> {
+                    result.success(MediaWatcherService.hasSafPermission(applicationContext))
+                }
+
+                // ── Media queue: read and clear media_queue.json ────────────────────
+                "getMediaQueue" -> {
+                    val data = getMediaQueue()
+                    Log.d(TAG, "Returning ${data.size} media queue entries")
+                    result.success(data)
+                }
+
+                else -> { result.notImplemented() }
             }
         }
     }
@@ -276,5 +319,132 @@ class MainActivity : FlutterActivity() {
             prefs.edit().putBoolean("cleanup_requested", false).apply()
         }
         return requested
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // SAF PERMISSION RESULT
+    // ──────────────────────────────────────────────────────────────────────
+
+    @Deprecated("Required by FlutterActivity — ActivityResultContracts requires pre-registration")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == SAF_REQUEST_CODE) {
+            val uri = data?.data
+            if (resultCode == Activity.RESULT_OK && uri != null) {
+                Log.i(TAG, "SAF grant received: $uri")
+                MediaWatcherService.onSafUriGranted(applicationContext, uri)
+                pendingSafResult?.success(true)
+            } else {
+                Log.w(TAG, "SAF picker cancelled or no URI (resultCode=$resultCode)")
+                pendingSafResult?.success(false)
+            }
+            pendingSafResult = null
+            return
+        }
+        super.onActivityResult(requestCode, resultCode, data)
+    }
+
+    /**
+     * Build a URI hint for ACTION_OPEN_DOCUMENT_TREE pointing to WhatsApp's
+     * media folder. Android 11+ moved it to Android/media/com.whatsapp/.
+     * This is a best-effort hint; the user can navigate elsewhere in the picker.
+     */
+    private fun buildSafInitialUri(): Uri? {
+        return try {
+            // Try Android 11+ scoped path first
+            val path11 = "primary:Android/media/com.whatsapp/WhatsApp/Media"
+            DocumentsContract.buildDocumentUri(
+                "com.android.externalstorage.documents",
+                path11
+            )
+        } catch (_: Exception) {
+            try {
+                // Fallback: legacy WhatsApp path (Android < 11)
+                val pathLegacy = "primary:WhatsApp/Media"
+                DocumentsContract.buildDocumentUri(
+                    "com.android.externalstorage.documents",
+                    pathLegacy
+                )
+            } catch (_: Exception) { null }
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // MEDIA QUEUE READER
+    // ──────────────────────────────────────────────────────────────────────
+
+    /**
+     * Read and atomically clear media_queue.json.
+     * Same safety guarantees as getPendingNotifications():
+     *  1. File locking prevents concurrent writes from MediaWatcherService
+     *  2. File cleared only AFTER successful parse
+     *  3. Individual corrupt entries are skipped
+     */
+    private fun getMediaQueue(): List<Map<String, Any?>> {
+        val file = MediaWatcherService.getMediaQueueFile(applicationContext)
+        val list = mutableListOf<Map<String, Any?>>()
+        if (!file.exists() || file.length() <= 2) return list
+
+        try {
+            val lockFile = File(file.absolutePath + ".lock")
+            lockFile.createNewFile()
+            RandomAccessFile(lockFile, "rw").use { raf ->
+                raf.channel.lock().use { _ ->
+                    val json = if (file.exists()) file.readText().trim() else "[]"
+                    if (json.isEmpty() || json == "[]") return list
+                    val arr = JSONArray(json)
+                    for (i in 0 until arr.length()) {
+                        try {
+                            val obj = arr.getJSONObject(i)
+                            val entry = mutableMapOf<String, Any?>(
+                                "originalUri"     to obj.optString("originalUri", ""),
+                                "mediaType"       to obj.optString("mediaType", "unknown"),
+                                "fileTimestampMs" to obj.optLong("fileTimestampMs", 0L),
+                                "sizeBytes"       to obj.optLong("sizeBytes", 0L),
+                                "displayName"     to obj.optString("displayName", "")
+                            )
+                            if (obj.has("filePath")) entry["filePath"] = obj.optString("filePath")
+                            list.add(entry)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Corrupt media queue entry $i: ${e.message}")
+                        }
+                    }
+                    // Clear after successful parse
+                    try {
+                        val tmp = File(file.absolutePath + ".tmp")
+                        tmp.writeText("[]")
+                        if (!tmp.renameTo(file)) { file.delete(); if (!tmp.renameTo(file)) { file.writeText("[]"); tmp.delete() } }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error clearing media queue (data safe): ${e.message}")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "getMediaQueue error: ${e.message}")
+            // Fallback without locking
+            try {
+                val json = file.readText().trim()
+                if (json.isNotEmpty() && json != "[]") {
+                    val arr = JSONArray(json)
+                    for (i in 0 until arr.length()) {
+                        try {
+                            val obj = arr.getJSONObject(i)
+                            val entry = mutableMapOf<String, Any?>(
+                                "originalUri"     to obj.optString("originalUri", ""),
+                                "mediaType"       to obj.optString("mediaType", "unknown"),
+                                "fileTimestampMs" to obj.optLong("fileTimestampMs", 0L),
+                                "sizeBytes"       to obj.optLong("sizeBytes", 0L),
+                                "displayName"     to obj.optString("displayName", "")
+                            )
+                            if (obj.has("filePath")) entry["filePath"] = obj.optString("filePath")
+                            list.add(entry)
+                        } catch (_: Exception) {}
+                    }
+                    file.writeText("[]")
+                }
+            } catch (fb: Exception) {
+                Log.e(TAG, "getMediaQueue fallback failed: ${fb.message}")
+            }
+        }
+        return list
     }
 }

@@ -45,5 +45,10 @@ flutter {
 
 dependencies {
     implementation("androidx.work:work-runtime-ktx:2.9.0")
+    // DocumentFile: SAF tree traversal (stable)
+    implementation("androidx.documentfile:documentfile:1.0.1")
+    // security-crypto: EncryptedFile for future at-rest encryption path.
+    // NOTE: intentionally on alpha — no stable release exists. Documented at call site.
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
 }
 

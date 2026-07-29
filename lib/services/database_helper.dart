@@ -23,7 +23,7 @@ class DatabaseHelper {
 
     final db = await openDatabase(
       path,
-      version: 6,  // v6: added mediaPath column
+      version: 7,  // v7: added media_attachments table
       onCreate: _createDB,
       onUpgrade: _onUpgrade,
     );
@@ -98,6 +98,10 @@ class DatabaseHelper {
         await db.execute('ALTER TABLE messages ADD COLUMN mediaPath TEXT');
       } catch (_) {}
     }
+    if (oldVersion < 7) {
+      // Add media_attachments table for SAF-captured WhatsApp media files
+      await _createMediaAttachmentsTable(db);
+    }
   }
 
   Future<void> _createDB(Database db, int version) async {
@@ -118,13 +122,46 @@ class DatabaseHelper {
     ''');
 
     // Indexes for queries
-    await db.execute('CREATE INDEX idx_timestamp ON messages(timestamp)');
-    await db.execute('CREATE INDEX idx_sender ON messages(sender)');
-    // Composite index for fast dedup checks
     await db.execute('''
-      CREATE INDEX idx_dedup ON messages(sender, app, message, timestamp)
+      CREATE INDEX IF NOT EXISTS idx_dedup
+      ON messages(sender, app, message, timestamp)
     ''');
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS idx_sender
+      ON messages(sender)
+    ''');
+
+    // media_attachments table (v7)
+    await _createMediaAttachmentsTable(db);
   }
+
+  /// Creates the media_attachments table.
+  /// Called from _createDB (fresh install) and _onUpgrade (v7 migration).
+  Future<void> _createMediaAttachmentsTable(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS media_attachments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        notification_id INTEGER,
+        candidate_notification_ids TEXT,
+        media_type TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        original_uri TEXT NOT NULL,
+        sender_name TEXT,
+        captured_at INTEGER NOT NULL,
+        matched INTEGER NOT NULL DEFAULT 0
+      )
+    ''');
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS idx_media_notification
+      ON media_attachments(notification_id)
+    ''');
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS idx_media_captured
+      ON media_attachments(captured_at)
+    ''');
+    debugPrint('[DatabaseHelper] media_attachments table created');
+  }
+
 
   Future<int> insertMessage(MessageModel message) async {
     final db = await database;
@@ -327,6 +364,7 @@ class DatabaseHelper {
         m.senderName as lastSenderName,
         m.isGroupChat,
         m.avatarPath,
+        m.mediaPath as lastMediaPath,
         (SELECT COUNT(*) FROM messages m2 WHERE m2.sender = m.sender AND m2.app = m.app AND m2.isDeleted = 0) as messageCount,
         (SELECT COUNT(*) FROM messages m3 WHERE m3.sender = m.sender AND m3.app = m.app AND m3.isRead = 0 AND m3.isDeleted = 0) as unreadCount,
         (SELECT avatarPath FROM messages m5 WHERE m5.sender = m.sender AND m5.app = m.app AND m5.avatarPath IS NOT NULL AND m5.avatarPath != '' ORDER BY m5.timestamp DESC LIMIT 1) as latestAvatarPath
@@ -437,6 +475,28 @@ class DatabaseHelper {
     );
   }
 
+  // Delete all messages in a conversation
+  Future<int> deleteConversation(String sender, String app) async {
+    final db = await database;
+    return await db.update(
+      'messages',
+      {'isDeleted': 1},
+      where: 'sender = ? AND app = ?',
+      whereArgs: [sender, app],
+    );
+  }
+
+  // Undo delete all messages in a conversation
+  Future<int> undoDeleteConversation(String sender, String app) async {
+    final db = await database;
+    return await db.update(
+      'messages',
+      {'isDeleted': 0},
+      where: 'sender = ? AND app = ?',
+      whereArgs: [sender, app],
+    );
+  }
+
   // Mark message as deleted by matching sender and message content
   Future<int> markMessageAsDeletedByContent(String sender, String message) async {
     final db = await database;
@@ -511,6 +571,79 @@ class DatabaseHelper {
     );
 
     return result.isNotEmpty;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  // MEDIA ATTACHMENTS (v7)
+  // ══════════════════════════════════════════════════════════════════════
+
+  Future<int> insertMediaAttachment(Map<String, dynamic> data) async {
+    final db = await database;
+    return await db.insert(
+      'media_attachments',
+      data,
+      conflictAlgorithm: ConflictAlgorithm.ignore,
+    );
+  }
+
+  /// Finds unassigned WhatsApp messages from the last [windowMs] milliseconds.
+  /// Used by the matching algorithm to find candidates for a newly captured media file.
+  Future<List<Map<String, dynamic>>> getRecentWhatsAppMessages(int windowMs, int fileTimestampMs) async {
+    final db = await database;
+    final minTs = fileTimestampMs - windowMs;
+    final maxTs = fileTimestampMs + windowMs;
+    
+    return await db.query(
+      'messages',
+      where: 'app LIKE ? AND timestamp BETWEEN ? AND ? AND (mediaPath IS NULL OR mediaPath NOT LIKE ?)',
+      whereArgs: ['%whatsapp%', minTs, maxTs, '%media_attachments%'],
+      orderBy: 'timestamp DESC',
+    );
+  }
+  
+  /// Gets all media attachments for a specific notification ID
+  Future<List<Map<String, dynamic>>> getMediaAttachmentsForMessage(int messageId) async {
+    final db = await database;
+    return await db.query(
+      'media_attachments',
+      where: 'notification_id = ? AND matched = 1',
+      whereArgs: [messageId],
+    );
+  }
+  
+  /// Updates a media attachment with its matched notification ID
+  Future<int> updateMediaAttachmentMatch(int attachmentId, int messageId) async {
+    final db = await database;
+    return await db.update(
+      'media_attachments',
+      {
+        'notification_id': messageId,
+        'matched': 1,
+      },
+      where: 'id = ?',
+      whereArgs: [attachmentId],
+    );
+  }
+
+  /// Updates the mediaPath of a message when a SAF file is successfully matched.
+  /// This allows ConversationScreen to render the image directly.
+  Future<int> updateMessageMediaPath(int messageId, String mediaPath) async {
+    final db = await database;
+    return await db.update(
+      'messages',
+      {'mediaPath': mediaPath},
+      where: 'id = ?',
+      whereArgs: [messageId],
+    );
+  }
+
+  /// Removes matched attachments that no longer have a valid message
+  Future<int> cleanOrphanedMediaAttachments() async {
+    final db = await database;
+    return await db.rawDelete('''
+      DELETE FROM media_attachments 
+      WHERE matched = 1 AND notification_id NOT IN (SELECT id FROM messages)
+    ''');
   }
 
   Future<void> close() async {
