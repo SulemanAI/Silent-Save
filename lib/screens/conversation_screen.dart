@@ -8,7 +8,6 @@ import 'package:path_provider/path_provider.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import '../models/message_model.dart';
 import '../services/database_helper.dart';
-import '../services/encryption_service.dart';
 import '../services/notification_service.dart';
 import '../widgets/full_screen_media_viewer.dart';
 
@@ -39,7 +38,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   final TextEditingController _searchController = TextEditingController();
   
   List<String> _groupMembers = [];
-  Set<String> _selectedSenders = {};
+  final Set<String> _selectedSenders = {};
   
   // Highlighting and scrolling
   String _searchQuery = '';
@@ -52,15 +51,23 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    NotificationService.instance.newMessageNotifier.addListener(_onNewMessageReceived);
     _avatarPath = widget.initialAvatarPath;
     _loadMessages();
   }
 
   @override
   void dispose() {
+    NotificationService.instance.newMessageNotifier.removeListener(_onNewMessageReceived);
     WidgetsBinding.instance.removeObserver(this);
     _searchController.dispose();
     super.dispose();
+  }
+
+  void _onNewMessageReceived() {
+    if (mounted) {
+      _loadMessages(isSilent: true);
+    }
   }
 
   @override
@@ -70,10 +77,12 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     }
   }
 
-  Future<void> _loadMessages() async {
-    setState(() {
-      _isLoading = true;
-    });
+  Future<void> _loadMessages({bool isSilent = false}) async {
+    if (!isSilent) {
+      setState(() {
+        _isLoading = true;
+      });
+    }
 
     // Mark all messages as read when opening the conversation
     await DatabaseHelper.instance.markMessagesAsRead(widget.sender);
@@ -108,19 +117,21 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     final allGroupSenders = messages.map((m) => m.senderName ?? m.sender).toSet().toList();
     allGroupSenders.sort();
 
-    setState(() {
-      _messages = messages;
-      _isGroupChat = isGroup;
-      _groupMembers = allGroupSenders;
-      _avatarPath = latestAvatarPath;
-      _isLoading = false;
-      
-      _updateDisplayItems();
-      
-      if (_isSearching && _searchController.text.isNotEmpty) {
-        _filterMessages(_searchController.text);
-      }
-    });
+    if (mounted) {
+      setState(() {
+        _messages = messages;
+        _isGroupChat = isGroup;
+        _groupMembers = allGroupSenders;
+        _avatarPath = latestAvatarPath;
+        _isLoading = false;
+        
+        _updateDisplayItems();
+        
+        if (_isSearching && _searchController.text.isNotEmpty) {
+          _filterMessages(_searchController.text);
+        }
+      });
+    }
   }
 
   void _updateDisplayItems() {
@@ -449,7 +460,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
         child: _isGroupChat
           ? const Icon(Icons.group, color: Colors.white, size: 20)
           : Text(
-              widget.sender.isNotEmpty ? widget.sender[0].toUpperCase() : '?',
+              widget.sender.isNotEmpty ? widget.sender.characters.first.toUpperCase() : '?',
               style: const TextStyle(
                 color: Colors.white,
                 fontSize: 18,
@@ -573,6 +584,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                   _searchQuery = '';
                   _matchIndices.clear();
                   _currentMatchIndex = -1;
+                  FocusScope.of(context).unfocus();
                 } else {
                   _isSearching = true;
                 }
@@ -773,7 +785,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
       ),
       child: Center(
         child: Text(
-          senderName.isNotEmpty ? senderName[0].toUpperCase() : '?',
+          senderName.isNotEmpty ? senderName.characters.first.toUpperCase() : '?',
           style: TextStyle(
             fontSize: 13,
             fontWeight: FontWeight.bold,
@@ -1084,10 +1096,17 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
 
     if (hasFile) {
       // ── Case 1: We have the actual captured image ─────────────────────
+      final isGeneric = _isGenericMediaLabel(message.message);
+      final hasCaption = !isGeneric && message.message.trim().isNotEmpty;
+
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           _buildRealImage(message, mediaPath),
+          if (hasCaption) ...[
+            const SizedBox(height: 6),
+            _buildHighlightText(_sanitizeText(message.message), isCurrentMatch),
+          ],
           const SizedBox(height: 8),
         ],
       );
@@ -1353,7 +1372,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     final lower = text.trim().toLowerCase();
     // Exact label matches (WhatsApp notification text)
     const labels = {
-      'photo', 'image', 'video', 'sticker', 'gif', 'document', 'file',
+      'photo', 'image', 'video', 'sticker', 'gif',
       'image omitted', 'video omitted', 'audio omitted', 'sticker omitted',
       'voice message', 'voice message omitted', 'audio',
       'contact card', 'location', 'live location',
@@ -1361,7 +1380,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     if (labels.contains(lower)) return true;
 
     // Emoji-prefixed labels WhatsApp uses in BigText
-    const emojiPrefixes = ['📷', '📹', '🎤', '🎵', '🎞', '📄', '📎',
+    const emojiPrefixes = ['📷', '📹', '🎤', '🎵', '🎞',
                            '🗺', '📍', '👤', '🎥', '🖼', '🎙'];
     for (final p in emojiPrefixes) {
       if (lower.startsWith(p)) return true;

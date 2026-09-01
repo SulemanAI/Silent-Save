@@ -23,7 +23,7 @@ class DatabaseHelper {
 
     final db = await openDatabase(
       path,
-      version: 7,  // v7: added media_attachments table
+      version: 8,  // v8: added indexes for getConversations performance
       onCreate: _createDB,
       onUpgrade: _onUpgrade,
     );
@@ -102,6 +102,16 @@ class DatabaseHelper {
       // Add media_attachments table for SAF-captured WhatsApp media files
       await _createMediaAttachmentsTable(db);
     }
+    if (oldVersion < 8) {
+      await db.execute('''
+        CREATE INDEX IF NOT EXISTS idx_conversations_base 
+        ON messages(sender, app, isDeleted, timestamp)
+      ''');
+      await db.execute('''
+        CREATE INDEX IF NOT EXISTS idx_conversations_unread 
+        ON messages(sender, app, isDeleted, isRead)
+      ''');
+    }
   }
 
   Future<void> _createDB(Database db, int version) async {
@@ -129,6 +139,14 @@ class DatabaseHelper {
     await db.execute('''
       CREATE INDEX IF NOT EXISTS idx_sender
       ON messages(sender)
+    ''');
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS idx_conversations_base 
+      ON messages(sender, app, isDeleted, timestamp)
+    ''');
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS idx_conversations_unread 
+      ON messages(sender, app, isDeleted, isRead)
     ''');
 
     // media_attachments table (v7)
@@ -586,17 +604,18 @@ class DatabaseHelper {
     );
   }
 
-  /// Finds unassigned WhatsApp messages from the last [windowMs] milliseconds.
-  /// Used by the matching algorithm to find candidates for a newly captured media file.
+  /// Finds WhatsApp messages within [windowMs] of [fileTimestampMs] that have
+  /// no media assigned yet. Only NULL mediaPath rows are returned — any message
+  /// that already has a photo (BigPicture, per-message URI, or SAF) is excluded,
+  /// preventing the same message from being matched twice.
   Future<List<Map<String, dynamic>>> getRecentWhatsAppMessages(int windowMs, int fileTimestampMs) async {
     final db = await database;
     final minTs = fileTimestampMs - windowMs;
     final maxTs = fileTimestampMs + windowMs;
-    
     return await db.query(
       'messages',
-      where: 'app LIKE ? AND timestamp BETWEEN ? AND ? AND (mediaPath IS NULL OR mediaPath NOT LIKE ?)',
-      whereArgs: ['%whatsapp%', minTs, maxTs, '%media_attachments%'],
+      where: 'app LIKE ? AND timestamp BETWEEN ? AND ? AND mediaPath IS NULL',
+      whereArgs: ['%whatsapp%', minTs, maxTs],
       orderBy: 'timestamp DESC',
     );
   }

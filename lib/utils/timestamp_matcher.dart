@@ -15,7 +15,7 @@ class TimestampMatcher {
 
     // FIRST FILTER: Only consider messages that are actually of this media type!
     final mediaType = mediaEvent['mediaType'] as String? ?? 'unknown';
-    final validCandidates = candidates.where((candidate) {
+    var targetCandidates = candidates.where((candidate) {
       final msgText = (candidate['message'] as String? ?? '').toLowerCase();
       
       if (mediaType == 'image' && (msgText.contains('photo') || msgText.contains('image') || msgText.contains('📷') || msgText.contains('🖼'))) {
@@ -28,16 +28,24 @@ class TimestampMatcher {
       return false;
     }).toList();
 
-    if (validCandidates.isEmpty) {
+    // Secondary fallback: If no explicit keyword matches, accept candidates within 60s
+    if (targetCandidates.isEmpty) {
+      targetCandidates = candidates.where((candidate) {
+        final int ts = candidate['timestamp'] as int? ?? 0;
+        return (ts - fileTimestampMs).abs() <= 60000;
+      }).toList();
+    }
+
+    if (targetCandidates.isEmpty) {
       return MatchResult.unmatched();
     }
 
-    if (validCandidates.length == 1) {
-      return MatchResult.matched(validCandidates.first);
+    if (targetCandidates.length == 1) {
+      return MatchResult.matched(targetCandidates.first);
     }
 
     // Multiple candidates found, calculate absolute deltas
-    final sortedCandidates = List<Map<String, dynamic>>.from(validCandidates);
+    final sortedCandidates = List<Map<String, dynamic>>.from(targetCandidates);
     sortedCandidates.sort((a, b) {
       final int tsA = a['timestamp'] as int;
       final int tsB = b['timestamp'] as int;
@@ -49,12 +57,6 @@ class TimestampMatcher {
       return deltaA.compareTo(deltaB);
     });
 
-    final int bestTs = sortedCandidates[0]['timestamp'] as int;
-    final int secondBestTs = sortedCandidates[1]['timestamp'] as int;
-    
-    final bestDelta = (bestTs - fileTimestampMs).abs();
-    final secondBestDelta = (secondBestTs - fileTimestampMs).abs();
-    
     // Since fulfilled candidates are now filtered out by getRecentWhatsAppMessages,
     // we can safely take the best remaining match even if multiple messages arrived at the exact same time (e.g. photo albums).
     return MatchResult.matched(sortedCandidates[0]);

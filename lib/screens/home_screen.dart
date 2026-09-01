@@ -22,6 +22,7 @@ enum SortOption { recent, mostMessages, leastMessages }
 
 class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   final TextEditingController _searchController = TextEditingController();
+  final FocusNode _searchFocusNode = FocusNode();
   List<Map<String, dynamic>> _conversations = [];
   List<Map<String, dynamic>> _filteredConversations = [];
   List<MessageModel> _searchResults = [];
@@ -57,6 +58,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     NotificationService.instance.newMessageNotifier.removeListener(_onNewMessage);
     WidgetsBinding.instance.removeObserver(this);
     _searchController.dispose();
+    _searchFocusNode.dispose();
     _tabController.dispose();
     super.dispose();
   }
@@ -132,6 +134,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
+      _searchFocusNode.unfocus();
       // App resumed from background - refresh conversations (which includes refreshing notifications)
       _loadConversations();
       _checkPermission();
@@ -221,9 +224,12 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   }
 
   Future<void> _loadConversations() async {
-    setState(() {
-      _isLoading = true;
-    });
+    _searchFocusNode.unfocus();
+    if (_conversations.isEmpty) {
+      setState(() {
+        _isLoading = true;
+      });
+    }
 
     try {
       // First, refresh notifications to process any pending ones (with timeout)
@@ -711,6 +717,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         children: [
           TextField(
             controller: _searchController,
+            focusNode: _searchFocusNode,
             onChanged: _filterConversations,
             decoration: InputDecoration(
               hintText: 'Search conversations...',
@@ -721,7 +728,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                       onPressed: () {
                         _searchController.clear();
                         _filterConversations('');
-                        FocusScope.of(context).unfocus();
+                        _searchFocusNode.unfocus();
                       },
                     )
                   : null,
@@ -920,7 +927,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           splashColor: Colors.deepPurple.shade300.withValues(alpha: 0.2),
           highlightColor: Colors.deepPurple.shade200.withValues(alpha: 0.1),
           onTap: () {
-            FocusScope.of(context).unfocus();
+            _searchFocusNode.unfocus();
             Navigator.push(
               context,
               MaterialPageRoute(
@@ -930,7 +937,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                   initialAvatarPath: avatarPath,
                 ),
               ),
-            );
+            ).then((_) {
+              _searchFocusNode.unfocus();
+              _loadConversations();
+            });
           },
           child: Padding(
             padding: const EdgeInsets.all(16),
@@ -943,7 +953,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                   backgroundImage: avatarPath != null ? FileImage(File(avatarPath)) : null,
                   child: avatarPath == null
                       ? Text(
-                          senderText.isNotEmpty ? senderText[0].toUpperCase() : '?',
+                          senderText.isNotEmpty ? senderText.characters.first.toUpperCase() : '?',
                           style: const TextStyle(
                             color: Colors.white,
                             fontWeight: FontWeight.bold,
@@ -1194,7 +1204,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           splashColor: Colors.deepPurple.shade300.withValues(alpha: 0.2),
           highlightColor: Colors.deepPurple.shade200.withValues(alpha: 0.1),
           onTap: () {
-            FocusScope.of(context).unfocus();
+            _searchFocusNode.unfocus();
             Navigator.push(
               context,
               MaterialPageRoute(
@@ -1204,8 +1214,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                   initialAvatarPath: hasAvatar ? avatarPath : null,
                 ),
               ),
-            ).then((_) => _loadConversations());
-            // );
+            ).then((_) {
+              _searchFocusNode.unfocus();
+              _loadConversations();
+            });
           },
           child: Padding(
             padding: const EdgeInsets.all(14),
@@ -1215,7 +1227,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                 GestureDetector(
                   onTap: () {
                     if (hasAvatar && avatarPath != null) {
-                      FocusScope.of(context).unfocus();
+                      _searchFocusNode.unfocus();
                       Navigator.push(
                         context,
                         PageRouteBuilder(
@@ -1267,7 +1279,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                             child: isGroupChat
                               ? const Icon(Icons.group, color: Colors.white, size: 28)
                               : Text(
-                                  sender.isNotEmpty ? sender[0].toUpperCase() : '?',
+                                  sender.isNotEmpty ? sender.characters.first.toUpperCase() : '?',
                                   style: const TextStyle(
                                     color: Colors.white,
                                     fontSize: 22,

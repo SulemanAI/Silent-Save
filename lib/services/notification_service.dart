@@ -319,8 +319,9 @@ class NotificationService with WidgetsBindingObserver {
         if (result is! Map) continue;
         final mediaEvent = Map<String, dynamic>.from(result);
         
-        // 1 hour window to account for slow downloading videos or voice notes
-        final matchResult = await TimestampMatcher.matchMediaToNotification(mediaEvent, 3600000); 
+        // 24-hour window: covers existing placeholder messages saved before SAF ran.
+        // Widened from 1h to catch old "Video"/"Photo" messages that never got a file.
+        final matchResult = await TimestampMatcher.matchMediaToNotification(mediaEvent, 86400000);
         
         final attachmentData = <String, dynamic>{
           'media_type': mediaEvent['mediaType'] ?? 'unknown',
@@ -341,6 +342,8 @@ class NotificationService with WidgetsBindingObserver {
           // Update the message so ConversationScreen sees the media directly
           await DatabaseHelper.instance.updateMessageMediaPath(msg['id'] as int, attachmentData['file_path'] as String);
           
+          // Notify UI immediately so the conversation view refreshes without waiting
+          newMessageNotifier.value++;
         } else if (matchResult.isAmbiguous && matchResult.ambiguousCandidates != null) {
           final ids = matchResult.ambiguousCandidates!.map((c) => c['id']).toList();
           attachmentData['candidate_notification_ids'] = jsonEncode(ids);

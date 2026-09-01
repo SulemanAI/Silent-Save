@@ -3,8 +3,12 @@ package com.silentsave.silentsave
 import android.app.Notification
 import android.content.SharedPreferences
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.Icon
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -369,6 +373,29 @@ class NotificationListener : NotificationListenerService() {
         
         val extras = notification.extras ?: return
 
+        // ── DIAGNOSTIC: Dump all notification extras keys and types ──
+        try {
+            val keySet = extras.keySet()
+            Log.i(TAG, "╔══ NOTIFICATION EXTRAS DUMP (${keySet.size} keys) ══")
+            for (key in keySet) {
+                val value = extras.get(key)
+                val typeStr = value?.javaClass?.simpleName ?: "null"
+                val preview = when (value) {
+                    is CharSequence -> "\"${value.toString().take(80)}\""
+                    is Bitmap -> "Bitmap(${value.width}x${value.height})"
+                    is Icon -> "Icon($value)"
+                    is Uri -> "Uri($value)"
+                    is Array<*> -> "Array[${value.size}]"
+                    is Bundle -> "Bundle(${value.keySet().joinToString(",")})"
+                    else -> value?.toString()?.take(60) ?: "null"
+                }
+                Log.i(TAG, "║  $key [$typeStr] = $preview")
+            }
+            Log.i(TAG, "╚══════════════════════════════════════════════")
+        } catch (e: Exception) {
+            Log.i(TAG, "Extras dump failed: ${e.message}")
+        }
+
         // Extract core fields — clean the group name to remove dynamic count suffixes
         val rawConversationTitle = extras.getCharSequence("android.conversationTitle")?.toString()
         val rawAndroidTitle = extras.getCharSequence("android.title")?.toString() ?: ""
@@ -393,6 +420,7 @@ class NotificationListener : NotificationListenerService() {
         // Returns null for plain-text messages; non-null only when the notification
         // carries an actual picture (e.g. WhatsApp "📷 Photo" messages).
         val mediaPicturePath = extractAndSaveMediaPicture(extras, title, packageName, sbn.postTime)
+        Log.i(TAG, "mediaPicturePath=$mediaPicturePath for '$title'")
         
         // Process in priority order
         // If MessagingStyle exists, use it exclusively (even if all messages were deduped)
@@ -464,6 +492,115 @@ class NotificationListener : NotificationListenerService() {
      * root cause of the duplicate flood that killed message capture.
      */
     /**
+     * Safely convert any Drawable into a standard ARGB_8888 Bitmap.
+     * Handles BitmapDrawable, AdaptiveIconDrawable, VectorDrawable, and custom drawables.
+     */
+    private fun drawableToBitmap(drawable: Drawable): Bitmap? {
+        try {
+            if (drawable is BitmapDrawable && drawable.bitmap != null) {
+                val bmp = drawable.bitmap
+                if (bmp.width > 1 && bmp.height > 1) return bmp
+            }
+            val width = if (drawable.intrinsicWidth > 0) drawable.intrinsicWidth else 512
+            val height = if (drawable.intrinsicHeight > 0) drawable.intrinsicHeight else 512
+            if (width <= 1 || height <= 1) return null
+
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bitmap)
+            drawable.setBounds(0, 0, canvas.width, canvas.height)
+            drawable.draw(canvas)
+            return bitmap
+        } catch (e: Exception) {
+            Log.d(TAG, "drawableToBitmap failed: ${e.message}")
+            return null
+        }
+    }
+
+    /**
+     * Extract a Bitmap from a Bundle key, supporting Bitmap, Icon, Uri, and String URIs.
+     * Compatible with Android 8 through 15 (including API 31+ pictureIcon and API 33+ typed parcelables).
+     */
+    private fun extractBitmapFromBundle(bundle: Bundle, key: String): Bitmap? {
+        try {
+            val value = bundle.get(key)
+            if (value is Bitmap) {
+                if (value.width > 1 && value.height > 1) return value
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && value is Icon) {
+                val drawable = value.loadDrawable(applicationContext)
+                if (drawable != null) {
+                    val bmp = drawableToBitmap(drawable)
+                    if (bmp != null) return bmp
+                }
+            }
+            if (value is Uri) {
+                val bmp = contentResolver.openInputStream(value)?.use { BitmapFactory.decodeStream(it) }
+                if (bmp != null && bmp.width > 1 && bmp.height > 1) return bmp
+            }
+            if (value is String && (value.startsWith("content://") || value.startsWith("file://"))) {
+                val uri = Uri.parse(value)
+                val bmp = contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
+                if (bmp != null && bmp.width > 1 && bmp.height > 1) return bmp
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "extractBitmapFromBundle error ($key): ${e.message}")
+        }
+
+        // Typed parcelable fallback for API 33+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            try {
+                val bmp = bundle.getParcelable(key, Bitmap::class.java)
+                if (bmp != null && bmp.width > 1 && bmp.height > 1) return bmp
+            } catch (_: Exception) {}
+            try {
+                val icon = bundle.getParcelable(key, Icon::class.java)
+                if (icon != null) {
+                    val drawable = icon.loadDrawable(applicationContext)
+                    if (drawable != null) {
+                        val bmp = drawableToBitmap(drawable)
+                        if (bmp != null) return bmp
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        return null
+    }
+
+    /**
+     * Save a bitmap image to the media cache directory.
+     */
+    private fun saveBitmapToFile(
+        bitmap: Bitmap, title: String, packageName: String, timestamp: Long, prefix: String = "media"
+    ): String? {
+        return try {
+            if (bitmap.width <= 1 || bitmap.height <= 1) return null
+
+            val safeTitle = title.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(30)
+            val appPrefix = when {
+                packageName.contains("whatsapp") -> "wa"
+                packageName.contains("instagram") -> "ig"
+                else -> "other"
+            }
+            val fileName = "${appPrefix}_${prefix}_${safeTitle}_${timestamp}.jpg"
+            val mediaDir = getMediaDir(applicationContext)
+            val mediaFile = File(mediaDir, fileName)
+
+            // Return cached file if already saved for this exact timestamp
+            if (mediaFile.exists() && mediaFile.length() > 0) return mediaFile.absolutePath
+
+            FileOutputStream(mediaFile).use { fos ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 85, fos)
+                fos.flush()
+            }
+            Log.d(TAG, "$prefix picture saved: $fileName (${bitmap.width}x${bitmap.height})")
+            mediaFile.absolutePath
+        } catch (e: Exception) {
+            Log.e(TAG, "Error saving bitmap to file: ${e.message}")
+            null
+        }
+    }
+
+    /**
      * Extract and save avatar for the conversation.
      * For GROUP chats: saves the group DP (from notification large icon).
      * For PERSONAL chats: saves the sender DP (from messaging style person, then large icon).
@@ -495,38 +632,23 @@ class NotificationListener : NotificationListenerService() {
 
             if (isGroupChat) {
                 // For GROUP chats: use notification large icon (this is the GROUP DP)
-                // Do NOT use sender_person here — that gives the individual sender's DP
-                
-                // Method 1: Notification large icon (group DP)
                 try {
                     val largeIcon = notification.getLargeIcon()
                     if (largeIcon != null) {
                         val drawable = largeIcon.loadDrawable(applicationContext)
-                        if (drawable is BitmapDrawable) {
-                            bitmap = drawable.bitmap
+                        if (drawable != null) {
+                            bitmap = drawableToBitmap(drawable)
                         }
                     }
                 } catch (e: Exception) {
                     Log.d(TAG, "Large icon extraction failed: ${e.message}")
                 }
 
-                // Method 2: Legacy large icon bitmap
                 if (bitmap == null) {
-                    try {
-                        bitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            extras.getParcelable("android.largeIcon", Bitmap::class.java)
-                        } else {
-                            @Suppress("DEPRECATION")
-                            extras.getParcelable<Bitmap>("android.largeIcon")
-                        }
-                    } catch (e: Exception) {
-                        Log.d(TAG, "Legacy largeIcon extraction failed: ${e.message}")
-                    }
+                    bitmap = extractBitmapFromBundle(extras, "android.largeIcon")
                 }
             } else {
                 // For PERSONAL chats: prefer sender_person (most accurate individual DP)
-                
-                // Method 1: MessagingStyle Person icon
                 try {
                     @Suppress("DEPRECATION")
                     val msgArr = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -547,8 +669,8 @@ class NotificationListener : NotificationListenerService() {
                         val icon = senderPerson?.icon
                         if (icon != null) {
                             val drawable = icon.loadDrawable(applicationContext)
-                            if (drawable is BitmapDrawable) {
-                                bitmap = drawable.bitmap
+                            if (drawable != null) {
+                                bitmap = drawableToBitmap(drawable)
                             }
                         }
                     }
@@ -556,14 +678,13 @@ class NotificationListener : NotificationListenerService() {
                     Log.d(TAG, "MessagingStyle avatar extraction failed: ${e.message}")
                 }
 
-                // Method 2: Notification large icon
                 if (bitmap == null) {
                     try {
                         val largeIcon = notification.getLargeIcon()
                         if (largeIcon != null) {
                             val drawable = largeIcon.loadDrawable(applicationContext)
-                            if (drawable is BitmapDrawable) {
-                                bitmap = drawable.bitmap
+                            if (drawable != null) {
+                                bitmap = drawableToBitmap(drawable)
                             }
                         }
                     } catch (e: Exception) {
@@ -571,18 +692,8 @@ class NotificationListener : NotificationListenerService() {
                     }
                 }
 
-                // Method 3: Legacy large icon bitmap
                 if (bitmap == null) {
-                    try {
-                        bitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            extras.getParcelable("android.largeIcon", Bitmap::class.java)
-                        } else {
-                            @Suppress("DEPRECATION")
-                            extras.getParcelable<Bitmap>("android.largeIcon")
-                        }
-                    } catch (e: Exception) {
-                        Log.d(TAG, "Legacy largeIcon extraction failed: ${e.message}")
-                    }
+                    bitmap = extractBitmapFromBundle(extras, "android.largeIcon")
                 }
             }
 
@@ -618,7 +729,7 @@ class NotificationListener : NotificationListenerService() {
             } else null
             val icon = senderPerson?.icon ?: return null
             val drawable = icon.loadDrawable(applicationContext) ?: return null
-            val bitmap = (drawable as? BitmapDrawable)?.bitmap ?: return null
+            val bitmap = drawableToBitmap(drawable) ?: return null
             
             if (bitmap.width <= 1 || bitmap.height <= 1) return null
             
@@ -652,22 +763,61 @@ class NotificationListener : NotificationListenerService() {
 
     /**
      * Extract and save the BigPictureStyle image from the notification.
-     * WhatsApp uses android.picture for photo/sticker messages — this is the
-     * actual image preview shown in the expanded notification shade.
-     * Returns the saved JPEG file path, or null when no picture is present
-     * (i.e. for plain text, voice, or video messages without a thumbnail).
+     *
+     * WhatsApp / Instagram / standard messaging apps attach images via:
+     * 1. android.pictureIcon (API 31+ Android 12+ BigPictureStyle Icon - PRIMARY on modern Android)
+     * 2. android.picture (Legacy BigPictureStyle Bitmap or Icon on Android < 12)
+     * 3. android.largeIcon.big (BigPictureStyle expanded large icon)
+     * 4. android.backgroundImageUri (Background image URI)
      */
     private fun extractAndSaveMediaPicture(
         extras: Bundle, title: String, packageName: String, timestamp: Long
     ): String? {
         try {
-            val picture: Bitmap? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                extras.getParcelable("android.picture", Bitmap::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                extras.getParcelable<Bitmap>("android.picture")
+            val pictureKeys = listOf(
+                "android.pictureIcon",
+                "android.picture",
+                "android.largeIcon.big",
+                "android.backgroundImageUri"
+            )
+
+            for (key in pictureKeys) {
+                val bitmap = extractBitmapFromBundle(extras, key)
+                if (bitmap != null && bitmap.width > 1 && bitmap.height > 1) {
+                    val path = saveBitmapToFile(bitmap, title, packageName, timestamp, "media")
+                    if (path != null) {
+                        Log.i(TAG, "✓ Extracted media picture from extra '$key' for '$title'")
+                        return path
+                    }
+                }
             }
-            if (picture == null || picture.width <= 1 || picture.height <= 1) return null
+        } catch (e: Exception) {
+            Log.e(TAG, "Error extracting media picture: ${e.message}")
+        }
+        return null
+    }
+
+    /**
+     * Extract and save a media image from a content:// URI embedded in a
+     * MessagingStyle message bundle.
+     *
+     * WhatsApp attaches photo previews to individual messages via
+     * Notification.MessagingStyle.Message.setData(mimeType, uri) on Android 10+.
+     * Android grants the NLS temporary read permission for these URIs.
+     *
+     * This is the PRIMARY capture path for WhatsApp photos — more reliable than
+     * android.picture (BigPicture) which WhatsApp omits on many notification styles.
+     * Returns null if the URI is inaccessible or the bitmap cannot be decoded.
+     */
+    private fun extractImageFromContentUri(
+        uri: Uri, title: String, packageName: String, timestamp: Long
+    ): String? {
+        return try {
+            val bitmap = contentResolver.openInputStream(uri)?.use { inputStream ->
+                BitmapFactory.decodeStream(inputStream)
+            } ?: return null
+
+            if (bitmap.width <= 1 || bitmap.height <= 1) return null
 
             val safeTitle = title.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(30)
             val appPrefix = when {
@@ -675,19 +825,75 @@ class NotificationListener : NotificationListenerService() {
                 packageName.contains("instagram") -> "ig"
                 else -> "other"
             }
-            val fileName = "${appPrefix}_media_${safeTitle}_${timestamp}.jpg"
+            val fileName = "${appPrefix}_msgmedia_${safeTitle}_${timestamp}.jpg"
             val mediaDir = getMediaDir(applicationContext)
             val mediaFile = File(mediaDir, fileName)
 
+            // Return cached file if already extracted for this exact timestamp
+            if (mediaFile.exists() && mediaFile.length() > 0) return mediaFile.absolutePath
+
             FileOutputStream(mediaFile).use { fos ->
-                picture.compress(Bitmap.CompressFormat.JPEG, 85, fos)
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 85, fos)
                 fos.flush()
             }
-            Log.d(TAG, "Media picture saved: $fileName (${picture.width}x${picture.height})")
-            return mediaFile.absolutePath
+            Log.d(TAG, "Per-message media saved: ${mediaFile.name} (${bitmap.width}x${bitmap.height})")
+            mediaFile.absolutePath
         } catch (e: Exception) {
-            Log.e(TAG, "Error extracting media picture: ${e.message}")
-            return null
+            Log.e(TAG, "extractImageFromContentUri failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Enqueue a captured picture file into media_queue.json so the Flutter-side
+     * TimestampMatcher can retroactively link it to an existing DB message row.
+     *
+     * This is needed for the common WhatsApp double-post pattern:
+     *   1st post  → text "Photo" arrives, message saved to DB (mediaPath=null)
+     *   2nd post  → BigPicture arrives, but the message is now a duplicate so
+     *               toSave is empty and the picture would otherwise be discarded.
+     *
+     * By writing to media_queue.json, Flutter's _checkForNewMedia() picks it up
+     * and calls updateMessageMediaPath() on the matched row.
+     */
+    private fun enqueuePictureToMediaQueue(picturePath: String, timestampMs: Long) {
+        try {
+            val pictureFile = File(picturePath)
+            if (!pictureFile.exists() || pictureFile.length() == 0L) return
+
+            val mediaQueueFile = File(applicationContext.filesDir, "media_queue.json")
+            val lockFile = File(mediaQueueFile.absolutePath + ".lock")
+            lockFile.createNewFile()
+
+            val event = JSONObject().apply {
+                put("originalUri", "bigpicture://$picturePath")
+                put("mediaType", "image")
+                put("filePath", picturePath)
+                put("fileTimestampMs", timestampMs)
+                put("sizeBytes", pictureFile.length())
+                put("displayName", pictureFile.name)
+            }
+
+            RandomAccessFile(lockFile, "rw").use { raf ->
+                raf.channel.lock().use { _ ->
+                    val existing = try {
+                        val txt = if (mediaQueueFile.exists()) mediaQueueFile.readText().trim() else "[]"
+                        if (txt.isEmpty() || txt == "[]") JSONArray() else JSONArray(txt)
+                    } catch (_: Exception) { JSONArray() }
+
+                    existing.put(event)
+
+                    val tmp = File(mediaQueueFile.absolutePath + ".tmp")
+                    tmp.writeText(existing.toString())
+                    if (!tmp.renameTo(mediaQueueFile)) {
+                        mediaQueueFile.writeText(existing.toString())
+                        tmp.delete()
+                    }
+                }
+            }
+            Log.d(TAG, "BigPicture enqueued to media_queue for TimestampMatcher: ${pictureFile.name}")
+        } catch (e: Exception) {
+            Log.e(TAG, "enqueuePictureToMediaQueue failed: ${e.message}")
         }
     }
 
@@ -725,13 +931,89 @@ class NotificationListener : NotificationListenerService() {
             
             for (msg in rawMessages) {
                 val bundle = msg as? Bundle ?: continue
+                val msgTime = bundle.getLong("time", postTime)
+
+                // ── DIAGNOSTIC: Dump every key in this message bundle ──
+                try {
+                    val msgKeys = bundle.keySet()
+                    val rawText = bundle.getCharSequence("text")?.toString()?.take(40) ?: "<null>"
+                    Log.i(TAG, "╔══ MSG BUNDLE ($rawText) — ${msgKeys.size} keys ══")
+                    for (key in msgKeys) {
+                        val value = bundle.get(key)
+                        val typeStr = value?.javaClass?.simpleName ?: "null"
+                        val preview = when (value) {
+                            is CharSequence -> "\"${value.toString().take(80)}\""
+                            is Bitmap -> "Bitmap(${value.width}x${value.height})"
+                            is Icon -> "Icon($value)"
+                            is Uri -> "Uri($value)"
+                            is Bundle -> "Bundle(${value.keySet().joinToString(",")})"
+                            else -> value?.toString()?.take(60) ?: "null"
+                        }
+                        Log.i(TAG, "║  MSG.$key [$typeStr] = $preview")
+                    }
+                    Log.i(TAG, "╚══════════════════════════════════════════════")
+                } catch (e: Exception) {
+                    Log.i(TAG, "Message bundle dump failed: ${e.message}")
+                }
+
+                // PRIMARY photo capture: extract per-message image URI from the MessagingStyle
+                // bundle. WhatsApp uses Notification.MessagingStyle.Message.setData(mimeType, uri)
+                // to attach photo previews to individual messages on Android 10+.
+                var perMessageMediaPath: String? = null
+                try {
+                    val msgMimeType = bundle.getString("type") ?: bundle.getString("dataMimeType")
+                    val msgDataUri: Uri? = try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            bundle.getParcelable("uri", Uri::class.java) 
+                                ?: bundle.getParcelable("dataUri", Uri::class.java)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            (bundle.getParcelable("uri") ?: bundle.getParcelable("dataUri"))
+                        }
+                    } catch (_: Exception) {
+                        val u = bundle.get("uri") ?: bundle.get("dataUri")
+                        when (u) {
+                            is Uri -> u
+                            is String -> Uri.parse(u)
+                            else -> null
+                        }
+                    }
+
+                    Log.i(TAG, "  → mimeType=$msgMimeType, uri=$msgDataUri")
+
+                    if (msgDataUri != null && (msgMimeType == null || msgMimeType.startsWith("image/"))) {
+                        perMessageMediaPath = extractImageFromContentUri(msgDataUri, title, packageName, msgTime)
+                        if (perMessageMediaPath != null) {
+                            Log.i(TAG, "✓ Per-message image captured from URI for '$title'")
+                        } else {
+                            Log.w(TAG, "✗ extractImageFromContentUri RETURNED NULL for $msgDataUri")
+                        }
+                    }
+
+                    if (perMessageMediaPath == null) {
+                        val msgBitmap = extractBitmapFromBundle(bundle, "android.pictureIcon")
+                            ?: extractBitmapFromBundle(bundle, "android.picture")
+                            ?: extractBitmapFromBundle(bundle, "icon")
+                            ?: extractBitmapFromBundle(bundle, "bitmap")
+                            ?: extractBitmapFromBundle(bundle, "image")
+                        if (msgBitmap != null) {
+                            perMessageMediaPath = saveBitmapToFile(msgBitmap, title, packageName, msgTime, "msgmedia")
+                            Log.i(TAG, "✓ Per-message bitmap extracted from bundle for '$title'")
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.i(TAG, "Per-message URI extraction skipped: ${e.message}")
+                }
                 
-                val msgText = bundle.getCharSequence("text")?.toString()
-                // Only apply count-summary filter here — these are actual message BODY texts,
-                // not notification-level summaries. The full isSummaryMessage() is too
-                // aggressive and drops legitimate messages matching patterns like
-                // "Status from: …" or "typing..." sent as chat content.
-                if (msgText.isNullOrBlank() || isCountSummaryMessage(msgText)) continue
+                val rawMsgText = bundle.getCharSequence("text")?.toString()
+                // If message body text is blank but media is attached, provide a default label
+                val msgText = if (rawMsgText.isNullOrBlank()) {
+                    if (perMessageMediaPath != null || mediaPicturePath != null) "Photo" else continue
+                } else {
+                    rawMsgText
+                }
+
+                if (isCountSummaryMessage(msgText)) continue
                 
                 hadValidMessages = true
                 
@@ -746,7 +1028,6 @@ class NotificationListener : NotificationListenerService() {
                     } else null
                 } catch (e: Exception) { null }
                 val senderName = msgSender ?: senderPerson?.name?.toString() ?: title
-                val msgTime = bundle.getLong("time", postTime)
                 
                 // Dedup check
                 val dedupKey = "$title|$msgText|$msgTime"
@@ -772,7 +1053,7 @@ class NotificationListener : NotificationListenerService() {
                 if (isGroupChat) {
                     extractAndSaveSenderAvatar(bundle, senderName, packageName)
                 }
-                
+
                 toSave.add(JSONObject().apply {
                     put("method", "onNotificationReceived")
                     put("title", title)
@@ -782,13 +1063,23 @@ class NotificationListener : NotificationListenerService() {
                     put("senderName", senderName)
                     put("isGroupChat", isGroupChat)
                     if (avatarPath != null) put("avatarPath", avatarPath)
+                    // Per-message URI media takes priority over notification-level BigPicture
+                    if (perMessageMediaPath != null) put("mediaPath", perMessageMediaPath)
                 })
             }
 
-            // Attribute the picture to the LAST (most recent) message in the batch —
-            // android.picture is notification-level, not per-message.
+            // FALLBACK: Attribute the notification-level android.picture (BigPicture)
+            // only to the message that doesn't already have a per-message media path.
+            // Prefer messages whose text matches generic media labels ("Photo", "📷 Photo", etc.)
             if (mediaPicturePath != null && toSave.isNotEmpty()) {
-                toSave.last().put("mediaPath", mediaPicturePath)
+                val genericMediaLabels = setOf("photo", "image", "video", "📷 photo", "📹 video", "sticker", "gif", "📷", "📹", "🖼")
+                val target = toSave.lastOrNull { 
+                    !it.has("mediaPath") && genericMediaLabels.any { label -> 
+                        it.optString("text").lowercase().contains(label) 
+                    }
+                } ?: toSave.lastOrNull { !it.has("mediaPath") }
+                
+                target?.put("mediaPath", mediaPicturePath)
             }
             
             if (toSave.isNotEmpty()) {
@@ -797,7 +1088,16 @@ class NotificationListener : NotificationListenerService() {
                 if (savesSinceLastPersist >= 15) persistProcessedIds()
                 return saved
             }
-            
+
+            // All messages were duplicates (toSave is empty). If a BigPicture was captured
+            // in this notification update, the direct-assignment path above did nothing.
+            // Enqueue the picture to media_queue.json so TimestampMatcher can retroactively
+            // link it to the already-saved DB row (the WhatsApp double-post pattern).
+            if (mediaPicturePath != null && hadValidMessages) {
+                enqueuePictureToMediaQueue(mediaPicturePath, postTime)
+                Log.d(TAG, "BigPicture enqueued for deduped notification — TimestampMatcher will link it")
+            }
+
             // Return -1 if had valid messages but all were deduped,
             // to prevent fallthrough to less reliable extraction methods
             return if (hadValidMessages) -1 else 0
@@ -872,7 +1172,14 @@ class NotificationListener : NotificationListenerService() {
             }
 
             if (mediaPicturePath != null && toSave.isNotEmpty()) {
-                toSave.last().put("mediaPath", mediaPicturePath)
+                val genericMediaLabels = setOf("photo", "image", "video", "📷 photo", "📹 video", "sticker", "gif", "📷", "📹", "🖼")
+                val target = toSave.lastOrNull { 
+                    !it.has("mediaPath") && genericMediaLabels.any { label -> 
+                        it.optString("text").lowercase().contains(label) 
+                    }
+                } ?: toSave.lastOrNull { !it.has("mediaPath") }
+                
+                target?.put("mediaPath", mediaPicturePath)
             }
             
             if (toSave.isNotEmpty()) {

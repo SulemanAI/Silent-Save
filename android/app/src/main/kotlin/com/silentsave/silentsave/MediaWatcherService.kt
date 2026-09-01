@@ -50,7 +50,10 @@ class MediaWatcherService : Service() {
         private val WA_MEDIA_SUBDIRS = setOf(
             "WhatsApp Images",
             "WhatsApp Video",
-            "WhatsApp Voice Notes"
+            "WhatsApp Voice Notes",
+            "WhatsApp Business Images",
+            "WhatsApp Business Video",
+            "WhatsApp Business Voice Notes"
         )
 
         private val MIME_TO_TYPE = mapOf(
