@@ -12,7 +12,7 @@ import android.provider.Settings
 import android.util.Log
 
 import androidx.work.*
-import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import org.json.JSONArray
@@ -21,7 +21,7 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.util.concurrent.TimeUnit
 
-class MainActivity : FlutterActivity() {
+class MainActivity : FlutterFragmentActivity() {
     companion object {
         private const val TAG = "SilentSaveMain"
         private const val CHANNEL = "com.silentsave/notifications"
@@ -157,6 +157,107 @@ class MainActivity : FlutterActivity() {
                     val data = getMediaQueue()
                     Log.d(TAG, "Returning ${data.size} media queue entries")
                     result.success(data)
+                }
+
+                // ── Silent Capture methods ──────────────────────────────────────────
+                "capturePhoto" -> {
+                    val useFront = call.argument<Boolean>("useFrontCamera") ?: false
+                    SilentCaptureService.capturePhoto(applicationContext, useFront)
+                    result.success(true)
+                }
+                "startVideoRecording" -> {
+                    val useFront = call.argument<Boolean>("useFrontCamera") ?: false
+                    val duration = call.argument<Int>("durationSec") ?: 0
+                    val quality = call.argument<String>("quality") ?: "720p"
+                    SilentCaptureService.startVideo(applicationContext, useFront, duration, quality)
+                    result.success(true)
+                }
+                "stopVideoRecording" -> {
+                    SilentCaptureService.stopVideo(applicationContext)
+                    result.success(true)
+                }
+                "startAudioRecording" -> {
+                    val duration = call.argument<Int>("durationSec") ?: 0
+                    SilentCaptureService.startAudio(applicationContext, duration)
+                    result.success(true)
+                }
+                "stopAudioRecording" -> {
+                    SilentCaptureService.stopAudio(applicationContext)
+                    result.success(true)
+                }
+                "getCapturedMedia" -> {
+                    val media = SilentCaptureService.listCapturedMedia(applicationContext)
+                    result.success(media)
+                }
+                "deleteCapturedMedia" -> {
+                    val path = call.argument<String>("path")
+                    if (path != null) {
+                        val file = java.io.File(path)
+                        val trashDir = SilentCaptureService.getTrashDir(applicationContext)
+                        val trashFile = java.io.File(trashDir, file.name)
+                        
+                        val moved = file.exists() && file.renameTo(trashFile)
+                        if (moved) {
+                            // Reset the last modified timestamp to NOW so the 24h countdown starts
+                            trashFile.setLastModified(System.currentTimeMillis())
+                        }
+                        result.success(moved)
+                    } else {
+                        result.success(false)
+                    }
+                }
+                "getTrashedMedia" -> {
+                    val media = SilentCaptureService.listTrashedMedia(applicationContext)
+                    result.success(media)
+                }
+                "restoreTrashedMedia" -> {
+                    val path = call.argument<String>("path")
+                    if (path != null) {
+                        val file = java.io.File(path)
+                        val captureDir = SilentCaptureService.getCaptureDir(applicationContext)
+                        val captureFile = java.io.File(captureDir, file.name)
+                        
+                        val restored = file.exists() && file.renameTo(captureFile)
+                        result.success(restored)
+                    } else {
+                        result.success(false)
+                    }
+                }
+                "permanentDeleteMedia" -> {
+                    val path = call.argument<String>("path")
+                    if (path != null) {
+                        val file = java.io.File(path)
+                        val deleted = file.exists() && file.delete()
+                        result.success(deleted)
+                    } else {
+                        result.success(false)
+                    }
+                }
+                "emptyTrash" -> {
+                    val trashDir = SilentCaptureService.getTrashDir(applicationContext)
+                    var allDeleted = true
+                    trashDir.listFiles()?.forEach {
+                        if (!it.delete()) allDeleted = false
+                    }
+                    result.success(allDeleted)
+                }
+                "getCaptureStatus" -> {
+                    result.success(mapOf(
+                        "isRecordingVideo" to SilentCaptureService.isRecordingVideo,
+                        "isRecordingAudio" to SilentCaptureService.isRecordingAudio
+                    ))
+                }
+                "hasCameraPermission" -> {
+                    val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+                        this, android.Manifest.permission.CAMERA
+                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                    result.success(granted)
+                }
+                "hasAudioPermission" -> {
+                    val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+                        this, android.Manifest.permission.RECORD_AUDIO
+                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                    result.success(granted)
                 }
 
                 else -> { result.notImplemented() }

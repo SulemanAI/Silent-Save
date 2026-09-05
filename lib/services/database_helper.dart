@@ -331,13 +331,15 @@ class DatabaseHelper {
     return messages;
   }
 
-  Future<List<MessageModel>> getMessagesBySender(String sender) async {
+  Future<List<MessageModel>> getMessagesBySender(String sender, {int? limit, int? offset}) async {
     final db = await database;
     final result = await db.query(
       'messages',
       where: 'sender = ?',
       whereArgs: [sender],
       orderBy: 'timestamp DESC',
+      limit: limit,
+      offset: offset,
     );
     
     final messages = result.map((map) => MessageModel.fromMap(map)).toList();
@@ -366,6 +368,69 @@ class DatabaseHelper {
       }
     }
     
+    return messages;
+  }
+
+  Future<List<MessageModel>> getMediaMessagesBySender(String sender) async {
+    final db = await database;
+    final result = await db.query(
+      'messages',
+      where: 'sender = ? AND mediaPath IS NOT NULL AND mediaPath != ""',
+      whereArgs: [sender],
+      orderBy: 'timestamp DESC',
+    );
+    
+    return result.map((map) => MessageModel.fromMap(map)).toList();
+  }
+
+  Future<List<Map<String, dynamic>>> getDailyMessageCounts(String sender) async {
+    final db = await database;
+    final result = await db.rawQuery('''
+      SELECT 
+        date(timestamp / 1000, 'unixepoch', 'localtime') as day,
+        COUNT(*) as count
+      FROM messages
+      WHERE sender = ? AND isDeleted = 0
+      GROUP BY day
+      ORDER BY day ASC
+    ''', [sender]);
+    return result;
+  }
+
+  Future<Map<String, int>> getChatStatsSummary(String sender) async {
+    final db = await database;
+    final totalResult = await db.rawQuery('SELECT COUNT(*) as count FROM messages WHERE sender = ? AND isDeleted = 0', [sender]);
+    final mediaResult = await db.rawQuery('SELECT COUNT(*) as count FROM messages WHERE sender = ? AND isDeleted = 0 AND mediaPath IS NOT NULL AND mediaPath != ""', [sender]);
+    
+    int totalCount = totalResult.isNotEmpty ? totalResult.first['count'] as int : 0;
+    int mediaCount = mediaResult.isNotEmpty ? mediaResult.first['count'] as int : 0;
+    
+    return {
+      'total': totalCount,
+      'media': mediaCount,
+    };
+  }
+
+  Future<List<String>> getAllTextMessages(String sender) async {
+    final db = await database;
+    final result = await db.query(
+      'messages',
+      columns: ['message'],
+      where: 'sender = ? AND isDeleted = 0 AND (mediaPath IS NULL OR mediaPath = "")',
+      whereArgs: [sender],
+    );
+    
+    final messages = <String>[];
+    final isEnc = await _encryptionService.isEncryptionEnabled();
+    for (var row in result) {
+      String msg = row['message'] as String;
+      if (isEnc) {
+        try {
+          msg = await _encryptionService.decrypt(msg);
+        } catch (_) {}
+      }
+      messages.add(msg);
+    }
     return messages;
   }
 

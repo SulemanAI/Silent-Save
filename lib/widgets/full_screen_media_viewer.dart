@@ -5,15 +5,19 @@ import 'package:video_player/video_player.dart';
 import 'package:audioplayers/audioplayers.dart';
 
 class FullScreenMediaViewer extends StatefulWidget {
-  final String path;
-  final String heroTag;
-  final String? type; // 'image', 'video', 'audio', etc.
+  final List<String> paths;
+  final List<String> heroTags;
+  final int initialIndex;
+  final String? type; // 'image', 'video', 'audio', etc. (fallback)
+  final bool reverseOrder;
 
   const FullScreenMediaViewer({
     super.key,
-    required this.path,
-    required this.heroTag,
+    required this.paths,
+    required this.heroTags,
+    this.initialIndex = 0,
     this.type,
+    this.reverseOrder = false,
   });
 
   @override
@@ -21,77 +25,42 @@ class FullScreenMediaViewer extends StatefulWidget {
 }
 
 class _FullScreenMediaViewerState extends State<FullScreenMediaViewer> {
-  final TransformationController _transformController = TransformationController();
+  late PageController _pageController;
+  late int _currentIndex;
+  late List<String> _paths;
+  late List<String> _heroTags;
   bool _isSaving = false;
-
-  VideoPlayerController? _videoController;
-  AudioPlayer? _audioPlayer;
-  bool _isPlaying = false;
-  Duration _position = Duration.zero;
-  Duration _duration = Duration.zero;
-  bool _isAudio = false;
-  bool _isVideo = false;
 
   @override
   void initState() {
     super.initState();
-    final ext = widget.path.toLowerCase().split('.').last;
-    _isAudio = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext) || widget.type == 'audio';
-    _isVideo = ['mp4', 'mov', 'avi', 'mkv'].contains(ext) || widget.type == 'video';
-
-    if (_isVideo) {
-      _videoController = VideoPlayerController.file(File(widget.path))
-        ..initialize().then((_) {
-          if (mounted) {
-            setState(() {
-              _duration = _videoController!.value.duration;
-            });
-            _videoController!.play();
-          }
-        });
-      _videoController!.addListener(() {
-        if (mounted) {
-          setState(() {
-            _position = _videoController!.value.position;
-            _isPlaying = _videoController!.value.isPlaying;
-          });
-        }
-      });
-    } else if (_isAudio) {
-      _audioPlayer = AudioPlayer();
-      _audioPlayer!.setSourceDeviceFile(widget.path);
-      _audioPlayer!.onDurationChanged.listen((d) {
-        if (mounted) setState(() => _duration = d);
-      });
-      _audioPlayer!.onPositionChanged.listen((p) {
-        if (mounted) setState(() => _position = p);
-      });
-      _audioPlayer!.onPlayerStateChanged.listen((state) {
-        if (mounted) setState(() => _isPlaying = state == PlayerState.playing);
-      });
-      _audioPlayer!.play(DeviceFileSource(widget.path));
+    if (widget.reverseOrder) {
+      // Reverse the lists so that chronological order is Oldest -> Newest.
+      // This way, swiping left goes to Newer items, and swiping right goes to Older.
+      _paths = widget.paths.reversed.toList();
+      _heroTags = widget.heroTags.reversed.toList();
+      
+      // Convert initialIndex from the descending array to the ascending array
+      _currentIndex = (widget.paths.length - 1) - widget.initialIndex;
+    } else {
+      _paths = widget.paths;
+      _heroTags = widget.heroTags;
+      _currentIndex = widget.initialIndex;
     }
-  }
-
-  String _formatDuration(Duration d) {
-    String twoDigits(int n) => n.toString().padLeft(2, '0');
-    final minutes = twoDigits(d.inMinutes.remainder(60));
-    final seconds = twoDigits(d.inSeconds.remainder(60));
-    return '$minutes:$seconds';
+    
+    _pageController = PageController(initialPage: _currentIndex);
   }
 
   @override
   void dispose() {
-    _transformController.dispose();
-    _videoController?.dispose();
-    _audioPlayer?.dispose();
+    _pageController.dispose();
     super.dispose();
   }
 
-  Future<void> _saveMedia() async {
+  Future<void> _saveMedia(String path) async {
     setState(() => _isSaving = true);
     try {
-      final ext = widget.path.toLowerCase().split('.').last;
+      final ext = path.toLowerCase().split('.').last;
       bool isVideo = ['mp4', 'mov', 'avi', 'mkv'].contains(ext) || widget.type == 'video';
       bool isAudio = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext) || widget.type == 'audio';
 
@@ -102,7 +71,7 @@ class _FullScreenMediaViewerState extends State<FullScreenMediaViewer> {
       }
 
       if (isVideo) {
-        await Gal.putVideo(widget.path);
+        await Gal.putVideo(path);
         _showSnack('Video saved to Gallery');
       } else if (isAudio) {
         // Fallback for audio: copy to public downloads folder
@@ -110,12 +79,12 @@ class _FullScreenMediaViewerState extends State<FullScreenMediaViewer> {
         if (!await downloads.exists()) {
           await downloads.create(recursive: true);
         }
-        final fileName = widget.path.split(Platform.pathSeparator).last;
-        await File(widget.path).copy('${downloads.path}/$fileName');
+        final fileName = path.split(Platform.pathSeparator).last;
+        await File(path).copy('${downloads.path}/$fileName');
         _showSnack('Audio saved to Downloads/SilentSave');
       } else {
         // Default treat as image
-        await Gal.putImage(widget.path);
+        await Gal.putImage(path);
         _showSnack('Image saved to Gallery');
       }
     } catch (e) {
@@ -141,10 +110,6 @@ class _FullScreenMediaViewerState extends State<FullScreenMediaViewer> {
 
   @override
   Widget build(BuildContext context) {
-    final ext = widget.path.toLowerCase().split('.').last;
-    final isAudio = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext) || widget.type == 'audio';
-    final isVideo = ['mp4', 'mov', 'avi', 'mkv'].contains(ext) || widget.type == 'video';
-    
     return Scaffold(
       backgroundColor: Colors.black.withValues(alpha: 0.92),
       extendBodyBehindAppBar: true,
@@ -155,90 +120,224 @@ class _FullScreenMediaViewerState extends State<FullScreenMediaViewer> {
           icon: const Icon(Icons.close, color: Colors.white),
           onPressed: () => Navigator.of(context).pop(),
         ),
+        title: _paths.length > 1
+            ? Text(
+                widget.reverseOrder 
+                  ? '${_currentIndex + 1} of ${_paths.length}'
+                  : '${_paths.length - _currentIndex} of ${_paths.length}',
+                style: const TextStyle(color: Colors.white, fontSize: 16),
+              )
+            : null,
+        centerTitle: true,
         actions: [
-          if (!isAudio && !isVideo)
-            IconButton(
-              icon: const Icon(Icons.zoom_out_map, color: Colors.white),
-              tooltip: 'Reset zoom',
-              onPressed: () {
-                _transformController.value = Matrix4.identity();
-              },
-            ),
           IconButton(
             icon: _isSaving 
               ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
               : const Icon(Icons.download, color: Colors.white),
             tooltip: 'Download',
-            onPressed: _isSaving ? null : _saveMedia,
+            onPressed: _isSaving ? null : () => _saveMedia(_paths[_currentIndex]),
           ),
           const SizedBox(width: 8),
         ],
       ),
-      body: GestureDetector(
-        onTap: () => Navigator.of(context).pop(),
-        child: Center(
-          child: Hero(
-            tag: widget.heroTag,
-            child: InteractiveViewer(
-              transformationController: _transformController,
-              minScale: 0.5,
-              maxScale: 6.0,
-              panEnabled: !isAudio && !isVideo,
-              child: _isVideo && _videoController != null && _videoController!.value.isInitialized
-                ? Stack(
-                    alignment: Alignment.center,
-                    children: [
-                      AspectRatio(
-                        aspectRatio: _videoController!.value.aspectRatio,
-                        child: VideoPlayer(_videoController!),
-                      ),
-                      Positioned.fill(
-                        child: GestureDetector(
-                          onTap: () {
-                            if (_isPlaying) {
-                              _videoController!.pause();
-                            } else {
-                              _videoController!.play();
-                            }
-                          },
-                          child: Container(
-                            color: Colors.transparent,
-                            child: !_isPlaying
-                              ? Center(
-                                  child: Container(
-                                    padding: const EdgeInsets.all(16),
-                                    decoration: const BoxDecoration(color: Colors.black54, shape: BoxShape.circle),
-                                    child: const Icon(Icons.play_arrow, size: 60, color: Colors.white),
-                                  ),
-                                )
-                              : null,
-                          ),
+      body: PageView.builder(
+        controller: _pageController,
+        itemCount: _paths.length,
+        onPageChanged: (index) {
+          setState(() {
+            _currentIndex = index;
+          });
+        },
+        itemBuilder: (context, index) {
+          return _SingleMediaViewer(
+            path: _paths[index],
+            heroTag: _heroTags[index],
+            type: widget.type,
+            isActive: _currentIndex == index,
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _SingleMediaViewer extends StatefulWidget {
+  final String path;
+  final String heroTag;
+  final String? type;
+  final bool isActive;
+
+  const _SingleMediaViewer({
+    required this.path,
+    required this.heroTag,
+    required this.isActive,
+    this.type,
+  });
+
+  @override
+  State<_SingleMediaViewer> createState() => _SingleMediaViewerState();
+}
+
+class _SingleMediaViewerState extends State<_SingleMediaViewer> {
+  final TransformationController _transformController = TransformationController();
+  
+  VideoPlayerController? _videoController;
+  AudioPlayer? _audioPlayer;
+  bool _isPlaying = false;
+  Duration _position = Duration.zero;
+  Duration _duration = Duration.zero;
+  bool _isAudio = false;
+  bool _isVideo = false;
+  bool _initialized = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final ext = widget.path.toLowerCase().split('.').last;
+    _isAudio = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext) || widget.type == 'audio';
+    _isVideo = ['mp4', 'mov', 'avi', 'mkv'].contains(ext) || widget.type == 'video';
+
+    if (widget.isActive) {
+      _initMedia();
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant _SingleMediaViewer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isActive && !oldWidget.isActive) {
+      if (!_initialized) {
+        _initMedia();
+      } else {
+        _videoController?.play();
+      }
+    } else if (!widget.isActive && oldWidget.isActive) {
+      _videoController?.pause();
+      _audioPlayer?.pause();
+    }
+  }
+
+  void _initMedia() {
+    _initialized = true;
+    if (_isVideo) {
+      _videoController = VideoPlayerController.file(File(widget.path))
+        ..initialize().then((_) {
+          if (mounted) {
+            setState(() {
+              _duration = _videoController!.value.duration;
+            });
+            if (widget.isActive) {
+              _videoController!.play();
+            }
+          }
+        });
+      _videoController!.addListener(() {
+        if (mounted) {
+          setState(() {
+            _position = _videoController!.value.position;
+            _isPlaying = _videoController!.value.isPlaying;
+          });
+        }
+      });
+    } else if (_isAudio) {
+      _audioPlayer = AudioPlayer();
+      _audioPlayer!.setSourceDeviceFile(widget.path);
+      _audioPlayer!.onDurationChanged.listen((d) {
+        if (mounted) setState(() => _duration = d);
+      });
+      _audioPlayer!.onPositionChanged.listen((p) {
+        if (mounted) setState(() => _position = p);
+      });
+      _audioPlayer!.onPlayerStateChanged.listen((state) {
+        if (mounted) setState(() => _isPlaying = state == PlayerState.playing);
+      });
+      if (widget.isActive) {
+        // don't auto play audio
+      }
+    }
+  }
+
+  String _formatDuration(Duration d) {
+    String twoDigits(int n) => n.toString().padLeft(2, '0');
+    final minutes = twoDigits(d.inMinutes.remainder(60));
+    final seconds = twoDigits(d.inSeconds.remainder(60));
+    return '$minutes:$seconds';
+  }
+
+  @override
+  void dispose() {
+    _transformController.dispose();
+    _videoController?.dispose();
+    _audioPlayer?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: () => Navigator.of(context).pop(),
+      child: Center(
+        child: Hero(
+          tag: widget.heroTag,
+          child: InteractiveViewer(
+            transformationController: _transformController,
+            minScale: 0.5,
+            maxScale: 6.0,
+            panEnabled: !_isAudio && !_isVideo,
+            child: _isVideo && _videoController != null && _videoController!.value.isInitialized
+              ? Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    AspectRatio(
+                      aspectRatio: _videoController!.value.aspectRatio,
+                      child: VideoPlayer(_videoController!),
+                    ),
+                    Positioned.fill(
+                      child: GestureDetector(
+                        onTap: () {
+                          if (_isPlaying) {
+                            _videoController!.pause();
+                          } else {
+                            _videoController!.play();
+                          }
+                        },
+                        child: Container(
+                          color: Colors.transparent,
+                          child: !_isPlaying
+                            ? Center(
+                                child: Container(
+                                  padding: const EdgeInsets.all(16),
+                                  decoration: const BoxDecoration(color: Colors.black54, shape: BoxShape.circle),
+                                  child: const Icon(Icons.play_arrow, size: 60, color: Colors.white),
+                                ),
+                              )
+                            : null,
                         ),
                       ),
-                      Positioned(
-                        bottom: 20,
-                        left: 20,
-                        right: 20,
-                        child: _buildScrubberBar(
-                          onSeek: (v) => _videoController!.seekTo(Duration(milliseconds: v.toInt())),
-                        ),
+                    ),
+                    Positioned(
+                      bottom: 20,
+                      left: 20,
+                      right: 20,
+                      child: _buildScrubberBar(
+                        onSeek: (v) => _videoController!.seekTo(Duration(milliseconds: v.toInt())),
                       ),
-                    ],
-                  )
-                : _isAudio
-                    ? _buildAudioPlayer()
-                    : _isVideo
-                        ? const Center(child: CircularProgressIndicator(color: Colors.white))
-                        : Image.file(
-                            File(widget.path),
-                            fit: BoxFit.contain,
-                            errorBuilder: (context, error, stackTrace) => const Icon(
-                              Icons.broken_image,
-                              color: Colors.white54,
-                              size: 64,
-                            ),
+                    ),
+                  ],
+                )
+              : _isAudio
+                  ? _buildAudioPlayer()
+                  : _isVideo
+                      ? const Center(child: CircularProgressIndicator(color: Colors.white))
+                      : Image.file(
+                          File(widget.path),
+                          fit: BoxFit.contain,
+                          errorBuilder: (context, error, stackTrace) => const Icon(
+                            Icons.broken_image,
+                            color: Colors.white54,
+                            size: 64,
                           ),
-            ),
+                        ),
           ),
         ),
       ),
@@ -281,11 +380,11 @@ class _FullScreenMediaViewerState extends State<FullScreenMediaViewer> {
             iconSize: 64,
             color: Colors.white,
             icon: Icon(_isPlaying ? Icons.pause_circle_filled : Icons.play_circle_filled),
-            onPressed: () {
+            onPressed: () async {
               if (_isPlaying) {
-                _audioPlayer?.pause();
+                await _audioPlayer?.pause();
               } else {
-                _audioPlayer?.resume();
+                await _audioPlayer?.resume();
               }
             },
           ),
@@ -301,3 +400,4 @@ class _FullScreenMediaViewerState extends State<FullScreenMediaViewer> {
     );
   }
 }
+

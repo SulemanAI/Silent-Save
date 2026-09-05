@@ -9,7 +9,10 @@ import '../services/encryption_service.dart';
 import '../models/message_model.dart';
 import '../widgets/full_screen_media_viewer.dart';
 import 'conversation_screen.dart';
+import 'capture_screen.dart';
+import 'settings_screen.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
+import 'package:local_auth/local_auth.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -38,11 +41,16 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   double _horizontalDragTotal = 0;
   bool _isDraggingVertically = false;
 
+  final LocalAuthentication _localAuth = LocalAuthentication();
+  bool _isCapturesAuthenticated = false;
+  int _previousTabIndex = 0;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _tabController = TabController(length: 2, vsync: this);
+    _tabController = TabController(length: 3, vsync: this);
+    _tabController.addListener(_handleTabSelection);
     _checkPermission();
     _checkSafPermission();
     _loadConversations();
@@ -59,8 +67,47 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     WidgetsBinding.instance.removeObserver(this);
     _searchController.dispose();
     _searchFocusNode.dispose();
+    _tabController.removeListener(_handleTabSelection);
     _tabController.dispose();
     super.dispose();
+  }
+
+  void _handleTabSelection() async {
+    if (_tabController.indexIsChanging) return; // Wait for animation to finish or only trigger on definitive changes
+    
+    if (_tabController.index == 2) {
+      if (!_isCapturesAuthenticated) {
+        bool authenticated = false;
+        try {
+          final isAvailable = await _localAuth.canCheckBiometrics || await _localAuth.isDeviceSupported();
+          if (isAvailable) {
+            authenticated = await _localAuth.authenticate(
+              localizedReason: 'Please authenticate to view your captures',
+              persistAcrossBackgrounding: true,
+              biometricOnly: false,
+            );
+          } else {
+            // If device doesn't support biometrics, allow access (or show a password prompt)
+            authenticated = true; 
+          }
+        } catch (e) {
+          debugPrint('Authentication error: \$e');
+        }
+
+        if (authenticated) {
+          setState(() {
+            _isCapturesAuthenticated = true;
+          });
+        } else {
+          // Revert back to the previous tab
+          _tabController.animateTo(_previousTabIndex);
+        }
+      }
+    } else {
+      _previousTabIndex = _tabController.index;
+      // Optional: reset authentication when navigating away from Captures tab
+      // _isCapturesAuthenticated = false; 
+    }
   }
 
   /// Called by the newMessageNotifier whenever a message is saved.
@@ -502,6 +549,15 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           style: TextStyle(fontWeight: FontWeight.bold),
         ),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => const SettingsScreen()),
+              );
+            },
+          ),
           // Mark all read menu
           PopupMenuButton<String>(
             icon: const Icon(Icons.more_vert),
@@ -558,6 +614,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
               icon: FaIcon(FontAwesomeIcons.instagram, size: 24, color: Colors.pinkAccent),
               text: 'Instagram',
             ),
+            Tab(
+              icon: Icon(Icons.camera_alt, size: 24, color: Colors.deepPurpleAccent),
+              text: 'Captures',
+            ),
           ],
         ),
       ),
@@ -601,6 +661,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                           children: [
                             _buildConversationList('com.whatsapp'),
                             _buildConversationList('com.instagram.android'),
+                            const CaptureScreen(),
                           ],
                         ),
                       ),
@@ -1237,9 +1298,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                             return FadeTransition(
                               opacity: animation,
                               child: FullScreenMediaViewer(
-                                path: avatarPath,
-                                heroTag: 'avatar_${sender}_$appPackage',
+                                paths: [avatarPath],
+                                heroTags: ['avatar_${sender}_$appPackage'],
                                 type: 'image',
+                                reverseOrder: true,
                               ),
                             );
                           },

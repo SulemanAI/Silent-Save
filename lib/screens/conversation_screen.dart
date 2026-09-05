@@ -6,10 +6,12 @@ import 'package:intl/intl.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
+import 'package:share_plus/share_plus.dart';
 import '../models/message_model.dart';
 import '../services/database_helper.dart';
 import '../services/notification_service.dart';
 import '../widgets/full_screen_media_viewer.dart';
+import 'chat_info_screen.dart';
 
 class ConversationScreen extends StatefulWidget {
   final String sender;
@@ -29,6 +31,8 @@ class ConversationScreen extends StatefulWidget {
 
 class _ConversationScreenState extends State<ConversationScreen> with WidgetsBindingObserver {
   List<MessageModel> _messages = [];
+  int _totalMessageCount = 0;
+  bool _hasFetchedAllMessagesForSearch = false;
   bool _isLoading = true;
   bool _isGroupChat = false;
   String? _avatarPath;
@@ -45,23 +49,45 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   final List<int> _matchIndices = [];
   int _currentMatchIndex = -1;
   final ItemScrollController _itemScrollController = ItemScrollController();
+  final ItemPositionsListener _itemPositionsListener = ItemPositionsListener.create();
   final List<_ListItem> _displayItems = [];
+  
+  bool _isSelectionMode = false;
+  final Set<int> _selectedMessageIds = {};
+
+  bool _hasMore = true;
+  bool _isLoadingMore = false;
+  static const int _pageSize = 25;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     NotificationService.instance.newMessageNotifier.addListener(_onNewMessageReceived);
+    _itemPositionsListener.itemPositions.addListener(_scrollListener);
     _avatarPath = widget.initialAvatarPath;
     _loadMessages();
   }
 
   @override
   void dispose() {
+    _itemPositionsListener.itemPositions.removeListener(_scrollListener);
     NotificationService.instance.newMessageNotifier.removeListener(_onNewMessageReceived);
     WidgetsBinding.instance.removeObserver(this);
     _searchController.dispose();
     super.dispose();
+  }
+
+  void _scrollListener() {
+    final positions = _itemPositionsListener.itemPositions.value;
+    if (positions.isNotEmpty) {
+      final maxIndex = positions.map((p) => p.index).reduce((a, b) => a > b ? a : b);
+      
+      // If we've scrolled near the end (visually top) of the list
+      if (maxIndex >= _displayItems.length - 10) {
+        _loadMoreMessages();
+      }
+    }
   }
 
   void _onNewMessageReceived() {
@@ -87,7 +113,10 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     // Mark all messages as read when opening the conversation
     await DatabaseHelper.instance.markMessagesAsRead(widget.sender);
     
-    final messages = await DatabaseHelper.instance.getMessagesBySender(widget.sender);
+    final messages = await DatabaseHelper.instance.getMessagesBySender(widget.sender, limit: _pageSize, offset: 0);
+    final stats = await DatabaseHelper.instance.getChatStatsSummary(widget.sender);
+    
+    _hasMore = messages.length >= _pageSize;
     
     // Determine if this is a group chat (any message has isGroupChat = true)
     final isGroup = messages.any((msg) => msg.isGroupChat == true);
@@ -120,6 +149,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     if (mounted) {
       setState(() {
         _messages = messages;
+        _totalMessageCount = stats['total'] ?? 0;
         _isGroupChat = isGroup;
         _groupMembers = allGroupSenders;
         _avatarPath = latestAvatarPath;
@@ -130,6 +160,26 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
         if (_isSearching && _searchController.text.isNotEmpty) {
           _filterMessages(_searchController.text);
         }
+      });
+    }
+  }
+
+  Future<void> _loadMoreMessages() async {
+    if (_isLoadingMore || !_hasMore) return;
+    if (mounted) {
+      setState(() { _isLoadingMore = true; });
+    }
+    
+    final newMessages = await DatabaseHelper.instance.getMessagesBySender(widget.sender, limit: _pageSize, offset: _messages.length);
+    
+    if (mounted) {
+      setState(() {
+        if (newMessages.length < _pageSize) {
+          _hasMore = false;
+        }
+        _messages.addAll(newMessages);
+        _isLoadingMore = false;
+        _updateDisplayItems();
       });
     }
   }
@@ -178,7 +228,32 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     }
   }
 
-  void _filterMessages(String query) {
+  void _filterMessages(String query) async {
+    if (query.isNotEmpty && !_hasFetchedAllMessagesForSearch) {
+      // Fetch all messages to search through the entire chat history
+      setState(() {
+        _isLoading = true;
+      });
+      
+      final allMessages = await DatabaseHelper.instance.getMessagesBySender(widget.sender); // no limit = all
+      
+      if (mounted) {
+        setState(() {
+          _messages = allMessages;
+          _hasMore = false;
+          _hasFetchedAllMessagesForSearch = true;
+          _isLoading = false;
+          _updateDisplayItems();
+          _performSearch(query);
+        });
+      }
+      return;
+    }
+    
+    _performSearch(query);
+  }
+
+  void _performSearch(String query) {
     setState(() {
       _searchQuery = query;
       _matchIndices.clear();
@@ -471,10 +546,54 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     );
   }
 
+  void _toggleSelection(int messageId) {
+    setState(() {
+      if (_selectedMessageIds.contains(messageId)) {
+        _selectedMessageIds.remove(messageId);
+        if (_selectedMessageIds.isEmpty) _isSelectionMode = false;
+      } else {
+        _selectedMessageIds.add(messageId);
+      }
+    });
+  }
+
+  void _exitSelectionMode() {
+    setState(() {
+      _isSelectionMode = false;
+      _selectedMessageIds.clear();
+    });
+  }
+
+  void _copySelected() {
+    final selectedMsgs = _messages.where((m) => _selectedMessageIds.contains(m.id)).toList();
+    selectedMsgs.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+    final text = selectedMsgs.map((m) => m.message).join('\n\n');
+    Clipboard.setData(ClipboardData(text: text));
+    _exitSelectionMode();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('${selectedMsgs.length} messages copied'),
+        backgroundColor: Colors.white.withValues(alpha: 0.7),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  void _shareSelected() {
+    final selectedMsgs = _messages.where((m) => _selectedMessageIds.contains(m.id)).toList();
+    selectedMsgs.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+    final text = selectedMsgs.map((m) => m.message).join('\n\n');
+    Share.share(text);
+    _exitSelectionMode();
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
+        leading: _isSelectionMode 
+            ? IconButton(icon: const Icon(Icons.close), onPressed: _exitSelectionMode) 
+            : null,
         elevation: 0,
         flexibleSpace: Container(
           decoration: BoxDecoration(
@@ -487,111 +606,136 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
             ),
           ),
         ),
-        title: _isSearching
-            ? TextField(
-                controller: _searchController,
-                autofocus: true,
-                style: const TextStyle(color: Colors.white),
-                decoration: InputDecoration(
-                  hintText: 'Search messages...',
-                  hintStyle: TextStyle(color: Colors.white.withValues(alpha: 0.7)),
-                  border: InputBorder.none,
-                ),
-                onChanged: _filterMessages,
-              )
-            : Row(
-                children: [
-                  // Avatar
-                  _buildAvatarWidget(),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          _sanitizeText(widget.sender),
-                          style: const TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 16,
-                          ),
-                          overflow: TextOverflow.ellipsis,
+        title: _isSelectionMode
+            ? Text('${_selectedMessageIds.length} Selected', style: const TextStyle(color: Colors.white))
+            : _isSearching
+                ? TextField(
+                    controller: _searchController,
+                    autofocus: true,
+                    style: const TextStyle(color: Colors.white),
+                    decoration: InputDecoration(
+                      hintText: 'Search messages...',
+                      hintStyle: TextStyle(color: Colors.white.withValues(alpha: 0.7)),
+                      border: InputBorder.none,
+                    ),
+                    onChanged: _filterMessages,
+                  )
+                : GestureDetector(
+                    onTap: () async {
+                      final searchWord = await Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => ChatInfoScreen(sender: widget.sender, app: widget.app),
                         ),
-                        Row(
-                          children: [
-                            _getAppIcon(widget.app, size: 12),
-                            const SizedBox(width: 4),
-                            Text(
-                              _isGroupChat ? 'Group Chat' : 'Private Chat',
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: Colors.grey.shade300,
-                              ),
-                            ),
-                            if (_messages.isNotEmpty) ...[
-                              Flexible(
-                                child: Text(
-                                  ' • ${_displayItems.where((item) => !item.isHeader).length} messages',
-                                  style: TextStyle(
-                                    fontSize: 12,
-                                    color: Colors.grey.shade400,
-                                  ),
-                                  overflow: TextOverflow.ellipsis,
+                      );
+                      
+                      if (searchWord != null && searchWord is String && mounted) {
+                        setState(() {
+                          _isSearching = true;
+                          _searchController.text = searchWord;
+                          _filterMessages(searchWord);
+                        });
+                      }
+                    },
+                    child: Row(
+                      children: [
+                        // Avatar
+                        _buildAvatarWidget(),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                _sanitizeText(widget.sender),
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 16,
                                 ),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              Row(
+                                children: [
+                                  _getAppIcon(widget.app, size: 12),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                    _isGroupChat ? 'Group Chat' : 'Private Chat',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: Colors.grey.shade300,
+                                    ),
+                                  ),
+                                  if (_messages.isNotEmpty) ...[
+                                    Flexible(
+                                      child: Text(
+                                        ' • $_totalMessageCount messages (${_displayItems.where((item) => !item.isHeader).length})',
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color: Colors.grey.shade400,
+                                        ),
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                  ],
+                                ],
                               ),
                             ],
-                          ],
+                          ),
                         ),
                       ],
                     ),
                   ),
+        actions: _isSelectionMode
+            ? [
+                IconButton(icon: const Icon(Icons.copy), onPressed: _copySelected),
+                IconButton(icon: const Icon(Icons.share), onPressed: _shareSelected),
+              ]
+            : [
+                if (_isSearching && _matchIndices.isNotEmpty) ...[
+                  Center(
+                    child: Text(
+                      '${_currentMatchIndex + 1}/${_matchIndices.length}',
+                      style: const TextStyle(fontSize: 14),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.keyboard_arrow_up),
+                    onPressed: _currentMatchIndex < _matchIndices.length - 1 ? _nextMatch : null,
+                    tooltip: 'Older messages',
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.keyboard_arrow_down),
+                    onPressed: _currentMatchIndex > 0 ? _previousMatch : null,
+                    tooltip: 'Newer messages',
+                  ),
                 ],
-              ),
-        actions: [
-          if (_isSearching && _matchIndices.isNotEmpty) ...[
-            Center(
-              child: Text(
-                '${_currentMatchIndex + 1}/${_matchIndices.length}',
-                style: const TextStyle(fontSize: 14),
-              ),
-            ),
-            IconButton(
-              icon: const Icon(Icons.keyboard_arrow_up),
-              onPressed: _currentMatchIndex < _matchIndices.length - 1 ? _nextMatch : null,
-              tooltip: 'Older messages',
-            ),
-            IconButton(
-              icon: const Icon(Icons.keyboard_arrow_down),
-              onPressed: _currentMatchIndex > 0 ? _previousMatch : null,
-              tooltip: 'Newer messages',
-            ),
-          ],
-          if (_isGroupChat)
-            IconButton(
-              icon: Icon(
-                _selectedSenders.isNotEmpty ? Icons.filter_list_alt : Icons.filter_list,
-                color: _selectedSenders.isNotEmpty ? Colors.orangeAccent : Colors.white,
-              ),
-              onPressed: _showFilterDialog,
-              tooltip: 'Filter by sender',
-            ),
-          IconButton(
-            icon: Icon(_isSearching ? Icons.close : Icons.search),
-            onPressed: () {
-              setState(() {
-                if (_isSearching) {
-                  _isSearching = false;
-                  _searchController.clear();
-                  _searchQuery = '';
-                  _matchIndices.clear();
-                  _currentMatchIndex = -1;
-                  FocusScope.of(context).unfocus();
-                } else {
-                  _isSearching = true;
-                }
-              });
-            },
-          ),
-        ],
+                if (_isGroupChat)
+                  IconButton(
+                    icon: Icon(
+                      _selectedSenders.isNotEmpty ? Icons.filter_list_alt : Icons.filter_list,
+                      color: _selectedSenders.isNotEmpty ? Colors.orangeAccent : Colors.white,
+                    ),
+                    onPressed: _showFilterDialog,
+                    tooltip: 'Filter by sender',
+                  ),
+                IconButton(
+                  icon: Icon(_isSearching ? Icons.close : Icons.search),
+                  onPressed: () {
+                    setState(() {
+                      if (_isSearching) {
+                        _isSearching = false;
+                        _searchController.clear();
+                        _searchQuery = '';
+                        _matchIndices.clear();
+                        _currentMatchIndex = -1;
+                        FocusScope.of(context).unfocus();
+                      } else {
+                        _isSearching = true;
+                      }
+                    });
+                  },
+                ),
+              ],
       ),
       body: Container(
         decoration: BoxDecoration(
@@ -670,6 +814,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
       reverse: true,
       itemCount: _displayItems.length,
       itemScrollController: _itemScrollController,
+      itemPositionsListener: _itemPositionsListener,
       itemBuilder: (context, index) {
         return _buildListItem(index);
       },
@@ -705,6 +850,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
         previousSenderName,
         isMatched: isMatched,
         isCurrentMatch: isCurrentMatch,
+        isSelected: item.message!.id != null && _selectedMessageIds.contains(item.message!.id),
       );
     }
   }
@@ -974,6 +1120,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     String? previousSenderName, {
     bool isMatched = false,
     bool isCurrentMatch = false,
+    bool isSelected = false,
   }) {
     final senderName = _sanitizeText(message.senderName ?? message.sender);
 
@@ -1011,33 +1158,59 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                 ],
               ),
             ),
-          // Message bubble — long press to copy
+          // Message bubble — long press to select
           GestureDetector(
-            onLongPress: () => _showMessageOptions(context, message),
+            onLongPress: () {
+              if (message.id != null) {
+                if (_isSelectionMode) {
+                  _showMessageOptions(context, message);
+                } else {
+                  setState(() {
+                    _isSelectionMode = true;
+                    _selectedMessageIds.add(message.id!);
+                  });
+                }
+              } else {
+                _showMessageOptions(context, message);
+              }
+            },
+            onTap: () {
+              if (_isSelectionMode && message.id != null) {
+                _toggleSelection(message.id!);
+              }
+            },
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
               decoration: BoxDecoration(
-                gradient: isCurrentMatch
+                gradient: isSelected
                     ? LinearGradient(
-                        colors: [Colors.orange.shade800.withValues(alpha: 0.9), Colors.deepOrange.shade900.withValues(alpha: 0.8)],
+                        colors: [Colors.blue.shade800.withValues(alpha: 0.8), Colors.blue.shade900.withValues(alpha: 0.6)],
                         begin: Alignment.topLeft,
                         end: Alignment.bottomRight,
                       )
-                    : LinearGradient(
-                        colors: _isGroupChat
-                            ? [senderColor.withValues(alpha: 0.15), senderColor.withValues(alpha: 0.08)]
-                            : [Colors.deepPurple.shade800.withValues(alpha: 0.5), Colors.purple.shade900.withValues(alpha: 0.3)],
-                        begin: Alignment.topLeft,
-                        end: Alignment.bottomRight,
-                      ),
+                    : isCurrentMatch
+                        ? LinearGradient(
+                            colors: [Colors.orange.shade800.withValues(alpha: 0.9), Colors.deepOrange.shade900.withValues(alpha: 0.8)],
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                          )
+                        : LinearGradient(
+                            colors: _isGroupChat
+                                ? [senderColor.withValues(alpha: 0.15), senderColor.withValues(alpha: 0.08)]
+                                : [Colors.deepPurple.shade800.withValues(alpha: 0.5), Colors.purple.shade900.withValues(alpha: 0.3)],
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                          ),
                 borderRadius: BorderRadius.circular(16),
                 border: Border.all(
-                  color: isCurrentMatch
-                      ? Colors.orangeAccent
-                      : _isGroupChat 
-                          ? senderColor.withValues(alpha: 0.3) 
-                          : Colors.deepPurple.shade600.withValues(alpha: 0.3),
-                  width: isCurrentMatch ? 2 : 1,
+                  color: isSelected
+                      ? Colors.blueAccent
+                      : isCurrentMatch
+                          ? Colors.orangeAccent
+                          : _isGroupChat 
+                              ? senderColor.withValues(alpha: 0.3) 
+                              : Colors.deepPurple.shade600.withValues(alpha: 0.3),
+                  width: (isCurrentMatch || isSelected) ? 2 : 1,
                 ),
               ),
               child: Column(
@@ -1346,19 +1519,36 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     );
   }
 
-  void _openFullScreenImage(String path, String heroTag, {String? type}) {
-    Navigator.of(context).push(
-      PageRouteBuilder(
-        opaque: false,
-        barrierColor: Colors.black.withValues(alpha: 0.92),
-        pageBuilder: (ctx, animation, _) {
-          return FadeTransition(
-            opacity: animation,
-            child: FullScreenMediaViewer(path: path, heroTag: heroTag, type: type),
-          );
-        },
-      ),
-    );
+  Future<void> _openFullScreenImage(String path, String heroTag, {String? type}) async {
+    final allMedia = await DatabaseHelper.instance.getMediaMessagesBySender(widget.sender);
+    int index = allMedia.indexWhere((m) => m.mediaPath == path);
+    if (index == -1) index = 0;
+    
+    List<String> paths = allMedia.map((m) => m.mediaPath!).toList();
+    List<String> heroTags = allMedia.map((m) => 'media_${m.id ?? m.timestamp}').toList();
+    
+    if (paths.isEmpty) {
+      paths = [path];
+      heroTags = [heroTag];
+      index = 0;
+    } else {
+      heroTags[index] = heroTag;
+    }
+
+    if (mounted) {
+      Navigator.of(context).push(
+        PageRouteBuilder(
+          opaque: false,
+          barrierColor: Colors.black.withValues(alpha: 0.92),
+          pageBuilder: (ctx, animation, _) {
+            return FadeTransition(
+              opacity: animation,
+              child: FullScreenMediaViewer(paths: paths, heroTags: heroTags, initialIndex: index, type: type, reverseOrder: true),
+            );
+          },
+        ),
+      );
+    }
   }
 
   // ══════════════════════════════════════════════════════════════════════

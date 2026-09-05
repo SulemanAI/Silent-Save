@@ -13,6 +13,13 @@
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <!-- Camera and microphone for silent capture -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- Biometric auth for captures tab -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <!-- Fallback for Android < 13 -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
@@ -76,6 +83,12 @@
             android:name=".MediaWatcherService"
             android:exported="false"
             android:stopWithTask="false" />
+
+        <!-- SilentCaptureService: headless photo/video/audio capture -->
+        <service
+            android:name=".SilentCaptureService"
+            android:exported="false"
+            android:foregroundServiceType="camera|microphone" />
 
         <!-- Boot Receiver: ensures NLS rebinds after device reboot -->
         <receiver

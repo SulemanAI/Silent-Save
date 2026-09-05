@@ -175,6 +175,48 @@ class KeepAliveService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        // ── Capture action buttons ──────────────────────────────────────
+        // Photo
+        val photoIntent = Intent(this, SilentCaptureService::class.java).apply {
+            action = SilentCaptureService.ACTION_CAPTURE_PHOTO
+        }
+        val photoPi = PendingIntent.getForegroundService(
+            this, 100, photoIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        // Video (toggle: start if not recording, stop if recording)
+        val videoAction = if (SilentCaptureService.isRecordingVideo) {
+            SilentCaptureService.ACTION_STOP_VIDEO
+        } else {
+            SilentCaptureService.ACTION_START_VIDEO
+        }
+        val videoIntent = Intent(this, SilentCaptureService::class.java).apply {
+            action = videoAction
+        }
+        val videoPi = PendingIntent.getForegroundService(
+            this, 101, videoIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        // Audio (toggle: start if not recording, stop if recording)
+        val audioAction = if (SilentCaptureService.isRecordingAudio) {
+            SilentCaptureService.ACTION_STOP_AUDIO
+        } else {
+            SilentCaptureService.ACTION_START_AUDIO
+        }
+        val audioIntent = Intent(this, SilentCaptureService::class.java).apply {
+            action = audioAction
+        }
+        val audioPi = PendingIntent.getForegroundService(
+            this, 102, audioIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        // ────────────────────────────────────────────────────────────────
+
+        val videoLabel = if (SilentCaptureService.isRecordingVideo) "⏹ Stop Video" else "🎥 Video"
+        val audioLabel = if (SilentCaptureService.isRecordingAudio) "⏹ Stop Audio" else "🎙 Audio"
+
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
         } else {
@@ -189,6 +231,10 @@ class KeepAliveService : Service() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
             }
+            // Add capture action buttons
+            addAction(Notification.Action.Builder(null, "📷 Photo", photoPi).build())
+            addAction(Notification.Action.Builder(null, videoLabel, videoPi).build())
+            addAction(Notification.Action.Builder(null, audioLabel, audioPi).build())
         }.build()
     }
 

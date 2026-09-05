@@ -50,5 +50,7 @@ dependencies {
     // security-crypto: EncryptedFile for future at-rest encryption path.
     // NOTE: intentionally on alpha — no stable release exists. Documented at call site.
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    // Core library: ContextCompat for runtime permission checks
+    implementation("androidx.core:core-ktx:1.12.0")
 }
 

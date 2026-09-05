@@ -9,7 +9,10 @@ class CleanupWorker(context: Context, params: WorkerParameters) : Worker(context
     
     override fun doWork(): Result {
         return try {
-            // Trigger Flutter cleanup via broadcast
+            // Clean up 24-hour trash files from captures
+            SilentCaptureService.cleanupTrash(applicationContext)
+            
+            // Trigger Flutter cleanup via broadcast (for SQLite messages)
             val intent = Intent("com.silentsave.CLEANUP_EVENT")
             applicationContext.sendBroadcast(intent)
             

