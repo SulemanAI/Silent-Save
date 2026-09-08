@@ -1,45 +1,82 @@
-# SilentSave - Personal Message Archive App
+# SilentSave - Personal Message & Media Archive
 
-**SilentSave** is an open-source Android app that captures and stores WhatsApp and Instagram DM messages from notification previews. All data remains offline and private on your device.
+**SilentSave** is an advanced, offline-first Android application that captures and preserves notification messages and media (photos, videos, voice notes, audio, stickers, and documents) from WhatsApp, WhatsApp Business, and Instagram Direct. All data remains completely offline, secure, and private on your device.
 
-## ⚠️ Important Notice
+---
 
-This app captures notification previews for personal archival purposes. It is **not intended for distribution on app stores**. Please use responsibly and in compliance with local laws.
+## 🌟 Key Features
 
-## Features
+### 📩 Message Archiving & Anti-Delete Preservation
+- **Auto Capture**: Intercepts and archives incoming notification text, timestamps, sender names, group info, and app origins in real time.
+- **Anti-Delete Preservation**: Instantly saves incoming messages and media before the sender can use "Delete for Everyone" (WhatsApp) or un-send (Instagram), keeping the content permanently preserved in your local archive.
+- **Group Chat Intelligence**: Correctly isolates individual sender names within group conversations (`Sender: Message`), maintaining accurate user attribution.
+- **Advanced Deduplication**: High-speed hash-based dedup avoids duplicate messages from continuous notification updates.
 
-✅ **Supported Apps:** WhatsApp, Instagram  
-✅ **Automatic Capture:** Saves notification title, text, timestamp, and package name  
-✅ **Smart Storage:** SQLite database with automatic 15-day deletion  
-✅ **Beautiful UI:** Material 3 design with dark theme  
-✅ **Conversation View:** Messages grouped by sender  
-✅ **Search Functionality:** Find messages quickly  
-✅ **Deleted Message Detection:** Shows when WhatsApp messages are deleted/recalled  
-✅ **Privacy First:** All data stays offline, no cloud sync  
-✅ **Optional Encryption:** AES encryption for stored messages  
-✅ **Auto Cleanup:** Daily job to delete messages older than 15 days
+### 🖼️ Zero-Touch Media Capture Engine
+- **Full Media Support**: Automatically links and archives:
+  - 📷 **Images & Photos** (JPEG, PNG, WebP)
+  - 🎥 **Videos** (MP4, MKV, 3GP, MOV)
+  - 🎙️ **Voice Notes & Audio** (Opus, OGG, MP3, M4A, WAV)
+  - 📄 **Documents** (PDF, DOC/DOCX, XLS/XLSX, CSV, PPTX, TXT, ZIP)
+  - 💟 **Stickers** (WebP)
+- **Zero-Touch Background Storage Access Framework (SAF)**: Continuously monitors WhatsApp incoming media directories with intelligent burst backoff and WakeLock management.
+- **Direct Notification Byte Streaming**: Extracts BigPicture images and inline notification data URIs directly into internal storage before senders can delete them.
+- **1-to-1 Media Uniqueness**: Strict database and filesystem constraints ensure a single media file is never duplicated or cross-linked to unrelated chats.
 
-## 📱 Screenshots
+### 📋 Native Media Sharing & Clipboard Copying
+- **Copy Media to Clipboard**: Copies the actual image, video, audio, or document file via `FileProvider` content URIs and proper MIME types directly to Android's `ClipboardManager`. Compatible keyboards (Gboard, Samsung Keyboard) and messaging apps (WhatsApp, Telegram, Notes) can paste the media directly.
+- **Native File Sharing**: Shares real media files (with user captions preserved) directly to external apps via `SharePlus` rather than sharing plain text placeholders (`"📷 Photo"`).
+- **In-App Save**: Save photos/videos directly to device Gallery via `Gal` or export audio/voice notes to public Downloads (`/Download/SilentSave`).
 
-The app features:
-- Home screen with conversation list
-- Individual conversation view with message history
-- Search bar for filtering
-- Visual indicators for deleted/recalled messages
-- Encryption toggle in app bar
+### 🔍 Rich Media Viewer & Playback
+- **Full-Screen Media Viewer**: Multi-format viewer featuring interactive zoomable image viewing, integrated video player controls, voice note/audio playback, and instant copy/share/download actions.
+- **Document Launcher**: One-tap opening of PDFs, spreadsheets, and documents via default system viewer apps.
+
+### 🕵️ Silent Capture Suite
+- **Stealth Photo Capture**: Front or rear camera capture in background.
+- **Stealth Video Recording**: Configurable background recording (duration & quality presets).
+- **Stealth Audio Recording**: Low-profile background microphone capture.
+- **Media Bin & Recovery**: Built-in 24-hour Trash Bin with restore, permanent delete, and auto-cleanup.
+
+### 🛡️ Privacy, Security & Resilience
+- **100% Offline & Private**: Zero cloud sync, zero telemetry. All database records and media files stay on the local device.
+- **Biometric Security**: Protect chat history with Fingerprint and Face Unlock (`local_auth`).
+- **OEM Battery Kill Prevention**: Includes `KeepAliveService` foreground service and `NlsHealthWorker` to prevent aggressive OEM battery managers (Transsion/Infinix, Xiaomi/MIUI, Samsung) from terminating the Notification Listener Service.
+- **Automated Retention & Cleanup**: Daily WorkManager background maintenance with 15-day automated message retention.
+
+---
 
 ## 🏗️ Architecture
 
-### Flutter (UI Layer)
-- **Material 3 Design** with dark theme
-- **SQLite** for local database
-- **flutter_secure_storage** for encryption keys
-- **encrypt** package for AES encryption
+```
+                               ┌──────────────────────────────────────────────────────────┐
+                               │                    Android System                        │
+                               │ (WhatsApp / Instagram / System Notification Service)     │
+                               └────────────────────────────┬─────────────────────────────┘
+                                                            │
+                                ┌───────────────────────────┴─────────────────────────────┐
+                                │                 Native Android Layer (Kotlin)           │
+                                ├─────────────────────────────────────────────────────────┤
+                                │ • NotificationListener (NLS byte extraction)            │
+                                │ • MediaWatcherService (SAF directory burst observer)    │
+                                │ • KeepAliveService & NlsHealthWorker                    │
+                                │ • SilentCaptureService (CameraX & AudioRecord)          │
+                                │ • NativeDatabaseHelper (Direct SQLite synchronization)  │
+                                │ • FileProvider & ClipboardManager integration           │
+                                └───────────────────────────┬─────────────────────────────┘
+                                                            │ MethodChannel & SQLite
+                                ┌───────────────────────────┴─────────────────────────────┐
+                                │                 Flutter Application (Dart)              │
+                                ├─────────────────────────────────────────────────────────┤
+                                │ • DatabaseHelper (SQLite transactions & 1-1 constraints)│
+                                │ • NotificationService (Event dispatcher & hybrid sync)  │
+                                │ • ConversationScreen (Group/DM chat view, copy/share)   │
+                                │ • FullScreenMediaViewer (Image, Video, Audio viewer)    │
+                                │ • CaptureScreen & TrashScreen (Stealth capture suite)   │
+                                └─────────────────────────────────────────────────────────┘
+```
 
-### Native Android (Data Capture)
-- **NotificationListenerService** for capturing notifications
-- **WorkManager** for daily cleanup jobs
-- **SharedPreferences** for Flutter-Native communication
+---
 
 ## 📊 Database Schema
 
@@ -47,210 +84,130 @@ The app features:
 CREATE TABLE messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   sender TEXT NOT NULL,
+  senderName TEXT,
   message TEXT NOT NULL,
   app TEXT NOT NULL,
   timestamp INTEGER NOT NULL,
-  isDeleted INTEGER DEFAULT 0
+  isDeleted INTEGER DEFAULT 0,
+  isRead INTEGER DEFAULT 0,
+  isGroupChat INTEGER DEFAULT 0,
+  avatarPath TEXT,
+  mediaPath TEXT
 );
 
--- Indexes for performance
-CREATE INDEX idx_timestamp ON messages(timestamp);
+-- Performance Indexes
+CREATE INDEX idx_dedup ON messages(sender, app, message, timestamp);
 CREATE INDEX idx_sender ON messages(sender);
+CREATE INDEX idx_conversations_base ON messages(sender, app, isDeleted, timestamp);
+CREATE INDEX idx_unread_count ON messages(sender, app, isDeleted, isRead);
+CREATE INDEX idx_mediaPath ON messages(mediaPath);
 ```
+
+---
 
 ## 🚀 Setup Instructions
 
 ### Prerequisites
-- Flutter SDK (3.9.2 or higher)
-- Android SDK
-- Android device or emulator running API 21+
+- Flutter SDK (3.24.0 or higher)
+- Android SDK (minSdkVersion 24, targetSdkVersion 34)
+- Physical Android device (recommended for testing NotificationListenerService & SAF)
 
 ### Installation
 
-1. **Clone/Navigate to the project:**
+1. **Clone the repository:**
    ```bash
+   git clone https://github.com/your-username/silentsave.git
    cd silentsave
    ```
 
-2. **Get dependencies:**
+2. **Install Flutter dependencies:**
    ```bash
    flutter pub get
    ```
 
-3. **Run the app:**
+3. **Run on your connected Android device:**
    ```bash
-   flutter run
+   flutter run --release
    ```
 
-### First-Time Setup
+### First-Time Permission Setup
 
-1. **Grant Notification Access:**
-   - Open the app
-   - Tap "Enable" on the permission warning banner
-   - Enable "SilentSave Notification Listener" in Android settings
-   - Return to the app
+1. **Notification Listener Permission**:
+   - Open SilentSave.
+   - Tap **Enable** on the Notification Access banner.
+   - Toggle **SilentSave Notification Listener** to ON in Android Settings.
+2. **WhatsApp Media Folder Access (SAF)**:
+   - Go to App Settings / Media Setup.
+   - Grant read access to the WhatsApp Media directory (`Android/media/com.whatsapp/WhatsApp/Media`) using Android's system document picker.
+3. **Battery Optimization Exemption**:
+   - Allow SilentSave to ignore battery optimization to ensure persistent zero-touch background capture even when the phone is idle or in Doze mode.
 
-2. **Optional: Enable Encryption:**
-   - Tap the lock icon in the app bar
-   - Confirm to enable encryption for future messages
+---
 
-## 🔒 Privacy & Security
+## 📋 Permissions Summary
 
-### Data Storage
-- All data is stored locally in SQLite database
-- Database location: `/data/data/com.silentsave.silentsave/databases/silentsave.db`
-- No network permissions - data never leaves your device
+| Permission | Purpose |
+| :--- | :--- |
+| `BIND_NOTIFICATION_LISTENER_SERVICE` | Intercept incoming notification previews and data URIs |
+| `FOREGROUND_SERVICE` & `FOREGROUND_SERVICE_DATA_SYNC` | Keep the capture pipeline active across OEM process killers |
+| `RECEIVE_BOOT_COMPLETED` | Ensure services automatically restart after device reboot |
+| `WAKE_LOCK` | Perform rapid background media scans when new notifications arrive |
+| `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` | Request exemption from OEM battery throttling |
+| `ACTION_OPEN_DOCUMENT_TREE` (SAF) | Zero-touch reading of downloaded media in WhatsApp directories |
+| `CAMERA` & `RECORD_AUDIO` | Required exclusively for optional Silent Capture suite |
+| `USE_BIOMETRIC` | Biometric fingerprint/face screen lock |
 
-### Encryption
-- Optional AES-256 encryption for messages
-- Encryption keys stored in Android Keystore via flutter_secure_storage
-- Existing messages remain unencrypted when enabling encryption
-
-### Auto Cleanup
-- Messages are automatically deleted after 15 days
-- Cleanup job runs daily at low battery usage times
-- Manual cleanup can be triggered by restarting the app
+---
 
 ## 📁 Project Structure
 
 ```
 silentsave/
-├── lib/
-│   ├── main.dart                          # App entry point
-│   ├── models/
-│   │   └── message_model.dart             # Message data model
-│   ├── screens/
-│   │   ├── home_screen.dart               # Conversation list
-│   │   └── conversation_screen.dart       # Message history
-│   └── services/
-│       ├── database_helper.dart           # SQLite operations
-│       ├── encryption_service.dart        # AES encryption
-│       └── notification_service.dart      # Native communication
 ├── android/
 │   └── app/src/main/
-│       ├── AndroidManifest.xml            # Permissions & services
+│       ├── AndroidManifest.xml                  # Permissions, services, and FileProvider
+│       ├── res/xml/file_paths.xml               # Configured paths for FileProvider sharing
 │       └── kotlin/com/silentsave/silentsave/
-│           ├── MainActivity.kt            # MethodChannel handler
-│           ├── NotificationListener.kt    # Notification capture
-│           └── CleanupWorker.kt           # Daily cleanup job
-└── pubspec.yaml                           # Dependencies
+│           ├── MainActivity.kt                  # MethodChannel bridge & ClipboardManager
+│           ├── NotificationListener.kt          # Native notification capture & byte streaming
+│           ├── MediaWatcherService.kt           # SAF observer, burst scanner, WakeLocks
+│           ├── NativeDatabaseHelper.kt          # Direct native SQLite synchronization
+│           ├── KeepAliveService.kt              # Persistent foreground guard service
+│           ├── SilentCaptureService.kt          # Stealth photo/video/audio recorder
+│           ├── BootReceiver.kt                  # Rebinds NLS on device reboot
+│           ├── NlsHealthWorker.kt               # NLS watchdog worker
+│           └── CleanupWorker.kt                 # Daily SQLite retention worker
+└── lib/
+    ├── main.dart                                # Entry point & biometric check
+    ├── models/
+    │   └── message_model.dart                   # Chat message data model
+    ├── screens/
+    │   ├── home_screen.dart                     # Conversation list & status dashboard
+    │   ├── conversation_screen.dart             # Message timeline, media copy & share
+    │   ├── capture_screen.dart                  # Silent capture suite dashboard
+    │   ├── trash_screen.dart                    # 24-hour recycle bin for silent captures
+    │   ├── settings_screen.dart                 # SAF folder setup & battery configuration
+    │   └── chat_info_screen.dart                # Chat details & media gallery
+    ├── services/
+    │   ├── database_helper.dart                 # SQLite helper, migrations & 1-1 media rules
+    │   └── notification_service.dart            # Flutter-Native channel bridge
+    ├── utils/
+    │   └── timestamp_matcher.dart               # Heuristic timestamp & filename matcher
+    └── widgets/
+        ├── full_screen_media_viewer.dart        # Image/video/audio viewer with copy & share
+        └── video_thumbnail_widget.dart          # Video preview generator
 ```
-
-## 🛠️ How It Works
-
-### Notification Capture Flow
-
-1. **WhatsApp/Instagram** sends a notification
-2. **NotificationListenerService** intercepts it
-3. Notification data is stored in **SharedPreferences**
-4. **Flutter app** polls every 2 seconds
-5. New notification data is saved to **SQLite**
-6. **UI updates** to show new message
-
-### Message Deletion Detection
-
-1. When a notification is **removed** (e.g., WhatsApp message deleted)
-2. **NotificationListenerService** detects removal
-3. Matching message is marked as `isDeleted = 1`
-4. **UI shows** red border and strikethrough text
-
-### Cleanup Job
-
-1. **WorkManager** schedules daily job
-2. Job runs when device is not low on battery
-3. Deletes messages older than 15 days from database
-4. First run is 1 hour after app launch, then every 24 hours
-
-## 🔧 Customization
-
-### Change Auto-Delete Period
-
-Edit `database_helper.dart`:
-```dart
-Future<int> deleteOldMessages() async {
-  final db = await database;
-  final fifteenDaysAgo = DateTime.now().subtract(const Duration(days: 30)); // Change here
-  // ...
-}
-```
-
-### Add More Apps
-
-Edit `NotificationListener.kt`:
-```kotlin
-private val SUPPORTED_PACKAGES = listOf(
-    "com.whatsapp",
-    "com.instagram.android",
-    "com.facebook.orca" // Add Messenger
-)
-```
-
-### Modify Cleanup Schedule
-
-Edit `MainActivity.kt`:
-```kotlin
-val cleanupRequest = PeriodicWorkRequestBuilder<CleanupWorker>(
-    7, TimeUnit.DAYS  // Run weekly instead of daily
-)
-```
-
-## 🐛 Troubleshooting
-
-### Messages Not Being Captured
-
-1. Check notification access is enabled:
-   - Settings → Apps → Special app access → Notification access
-   - Enable for SilentSave
-
-2. Ensure WhatsApp/Instagram notifications are enabled
-
-3. Check if app is running in background
-
-### Deleted Messages Not Showing
-
-- Deleted message detection works when WhatsApp removes the notification
-- If notifications are dismissed manually, they won't be marked as deleted
-
-### Encryption Issues
-
-- If you enable encryption and later disable it, old encrypted messages may not decrypt
-- Consider this permanent once enabled
-
-## 📋 Known Limitations
-
-1. **Notification Preview Only:** Only captures what appears in the notification (usually first line of message)
-2. **No Media:** Cannot capture images, videos, or voice messages
-3. **Group Messages:** Shows group name as sender, not individual senders
-4. **Requires App Running:** App must be installed and not force-stopped
-5. **Android Only:** This is an Android-specific app using NotificationListenerService
-
-## 🔐 Permissions Required
-
-- **Notification Access:** To read WhatsApp and Instagram notifications
-- **Storage:** For SQLite database (automatic)
-
-## 📝 License
-
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
-
-## ⚠️ Disclaimer
-
-This app is designed for personal archival purposes. Users are responsible for ensuring compliance with local laws and the terms of service of WhatsApp and Instagram. The developers assume no liability for misuse.
-
-## 🤝 Contributing
-
-Contributions are welcome! Feel free to open issues and submit pull requests.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## 📞 Support
-
-For issues or questions, please [open an issue](../../issues) on GitHub.
 
 ---
 
-**Built with Flutter 💙 and Kotlin**
+## 🔒 Security & Privacy Notice
+
+- **All Data Stays On Your Device**: SilentSave contains **no internet networking code** for syncing data to remote servers.
+- **Local SQLite Storage**: Encapsulated within app-private internal storage (`/data/data/com.silentsave.silentsave/`).
+- **Personal Archival Only**: This tool is designed strictly for personal message and media backup. Please use responsibly and in compliance with all applicable local privacy laws and platform terms of service.
+
+---
+
+## 📝 License
+
+Distributed under the MIT License. See [LICENSE](LICENSE) for more information.

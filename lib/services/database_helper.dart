@@ -31,6 +31,7 @@ class DatabaseHelper {
     // Safety net: ensure avatarPath column exists regardless of migration state.
     // This handles edge cases where the DB version was bumped but the ALTER failed.
     await _ensureColumns(db);
+    await cleanupCorruptedMediaLinks(db);
 
     return db;
   }
@@ -671,15 +672,15 @@ class DatabaseHelper {
 
   /// Finds WhatsApp messages within [windowMs] of [fileTimestampMs] that have
   /// no media assigned yet. Only NULL mediaPath rows are returned — any message
-  /// that already has a photo (BigPicture, per-message URI, or SAF) is excluded,
-  /// preventing the same message from being matched twice.
+  /// Finds WhatsApp messages within [windowMs] of [fileTimestampMs] that have
+  /// no media assigned yet. Excludes emoji reaction messages.
   Future<List<Map<String, dynamic>>> getRecentWhatsAppMessages(int windowMs, int fileTimestampMs) async {
     final db = await database;
     final minTs = fileTimestampMs - windowMs;
     final maxTs = fileTimestampMs + windowMs;
     return await db.query(
       'messages',
-      where: 'app LIKE ? AND timestamp BETWEEN ? AND ? AND mediaPath IS NULL',
+      where: 'app LIKE ? AND timestamp BETWEEN ? AND ? AND (mediaPath IS NULL OR mediaPath = \'\') AND (message NOT LIKE \'Reacted %\' AND message NOT LIKE \'Reacted to %\')',
       whereArgs: ['%whatsapp%', minTs, maxTs],
       orderBy: 'timestamp DESC',
     );
@@ -710,9 +711,19 @@ class DatabaseHelper {
   }
 
   /// Updates the mediaPath of a message when a SAF file is successfully matched.
-  /// This allows ConversationScreen to render the image directly.
+  /// Enforces 1-to-1 uniqueness: a mediaPath can never be assigned to more than one message.
   Future<int> updateMessageMediaPath(int messageId, String mediaPath) async {
     final db = await database;
+    // Check if another message already has this mediaPath
+    final existing = await db.query(
+      'messages',
+      where: 'mediaPath = ? AND id != ?',
+      whereArgs: [mediaPath, messageId],
+    );
+    if (existing.isNotEmpty) {
+      debugPrint('[DatabaseHelper] mediaPath $mediaPath already used by msg #${existing.first['id']}, skipping duplicate link');
+      return 0;
+    }
     return await db.update(
       'messages',
       {'mediaPath': mediaPath},
@@ -728,6 +739,93 @@ class DatabaseHelper {
       DELETE FROM media_attachments 
       WHERE matched = 1 AND notification_id NOT IN (SELECT id FROM messages)
     ''');
+  }
+
+  /// One-time cleanup for any historically corrupted or cross-linked media
+  Future<void> cleanupCorruptedMediaLinks([Database? existingDb]) async {
+    try {
+      final db = existingDb ?? await database;
+      // 1. Clear mediaPath on emoji reaction messages
+      await db.execute('''
+        UPDATE messages 
+        SET mediaPath = NULL 
+        WHERE (message LIKE 'Reacted %' OR message LIKE 'Reacted to %') 
+          AND mediaPath IS NOT NULL 
+          AND mediaPath != ''
+      ''');
+
+      // 2. Find any mediaPath that is assigned to more than 1 message
+      final duplicates = await db.rawQuery('''
+        SELECT mediaPath, COUNT(*) as cnt 
+        FROM messages 
+        WHERE mediaPath IS NOT NULL AND mediaPath != '' 
+        GROUP BY mediaPath 
+        HAVING cnt > 1
+      ''');
+
+      const mediaKeywords = [
+        'photo', 'video', 'voice', 'audio', 'document', 'file',
+        'sticker', 'gif', '📷', '📹', '🎥', '🎞', '🎤', '🎙', '🎵', '📄', '📎',
+        '.pdf', '.doc', '.docx', '.csv', '.xls', '.xlsx', '.txt', '.ppt', '.zip'
+      ];
+
+      for (final dup in duplicates) {
+        final path = dup['mediaPath'] as String?;
+        if (path == null || path.isEmpty) continue;
+
+        final rows = await db.query(
+          'messages',
+          columns: ['id', 'message', 'timestamp'],
+          where: 'mediaPath = ?',
+          whereArgs: [path],
+          orderBy: 'timestamp ASC',
+        );
+
+        if (rows.length <= 1) continue;
+
+        int? winnerId;
+        final otherIds = <int>[];
+
+        for (final row in rows) {
+          final id = row['id'] as int;
+          final msg = (row['message'] as String? ?? '').toLowerCase().trim();
+          final isPlaceholder = msg.isEmpty || (!msg.startsWith('reacted ') && mediaKeywords.any((k) => msg.contains(k)));
+
+          if (winnerId == null && isPlaceholder) {
+            winnerId = id;
+          } else {
+            otherIds.add(id);
+          }
+        }
+
+        if (winnerId == null && rows.isNotEmpty) {
+          winnerId = rows.first['id'] as int;
+          otherIds.clear();
+          for (int i = 1; i < rows.length; i++) {
+            otherIds.add(rows[i]['id'] as int);
+          }
+        }
+
+        for (final id in otherIds) {
+          await db.update('messages', {'mediaPath': null}, where: 'id = ?', whereArgs: [id]);
+        }
+      }
+
+      // 3. Unlink media_attachments that point to cleared messages
+      await db.execute('''
+        UPDATE media_attachments 
+        SET matched = 0, notification_id = NULL 
+        WHERE matched = 1 
+          AND notification_id IS NOT NULL 
+          AND notification_id NOT IN (
+            SELECT id FROM messages WHERE mediaPath IS NOT NULL AND mediaPath != ''
+          )
+      ''');
+
+      debugPrint('[DatabaseHelper] Completed cleanupCorruptedMediaLinks');
+    } catch (e) {
+      debugPrint('[DatabaseHelper] cleanupCorruptedMediaLinks error: $e');
+    }
   }
 
   Future<void> close() async {

@@ -1,8 +1,11 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:gal/gal.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:video_player/video_player.dart';
 import 'package:audioplayers/audioplayers.dart';
+import '../services/notification_service.dart';
+
 
 class FullScreenMediaViewer extends StatefulWidget {
   final List<String> paths;
@@ -130,6 +133,23 @@ class _FullScreenMediaViewerState extends State<FullScreenMediaViewer> {
             : null,
         centerTitle: true,
         actions: [
+          IconButton(
+            icon: const Icon(Icons.copy, color: Colors.white),
+            tooltip: 'Copy to clipboard',
+            onPressed: () async {
+              final ok = await NotificationService.instance.copyMediaToClipboard(
+                filePath: _paths[_currentIndex],
+              );
+              _showSnack(ok ? 'Media copied to clipboard' : 'Failed to copy to clipboard');
+            },
+          ),
+          IconButton(
+            icon: const Icon(Icons.share, color: Colors.white),
+            tooltip: 'Share',
+            onPressed: () {
+              SharePlus.instance.share(ShareParams(files: [XFile(_paths[_currentIndex])]));
+            },
+          ),
           IconButton(
             icon: _isSaving 
               ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))

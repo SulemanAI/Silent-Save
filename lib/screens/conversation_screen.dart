@@ -2,6 +2,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../widgets/video_thumbnail_widget.dart';
+import 'package:gal/gal.dart';
 import 'package:intl/intl.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:path_provider/path_provider.dart';
@@ -564,26 +565,93 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     });
   }
 
-  void _copySelected() {
+  Future<void> _copySelected() async {
     final selectedMsgs = _messages.where((m) => _selectedMessageIds.contains(m.id)).toList();
     selectedMsgs.sort((a, b) => a.timestamp.compareTo(b.timestamp));
-    final text = selectedMsgs.map((m) => m.message).join('\n\n');
-    Clipboard.setData(ClipboardData(text: text));
-    _exitSelectionMode();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('${selectedMsgs.length} messages copied'),
-        backgroundColor: Colors.white.withValues(alpha: 0.7),
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
+
+    final mediaMsgs = selectedMsgs.where((m) =>
+      m.mediaPath != null &&
+      m.mediaPath!.isNotEmpty &&
+      File(m.mediaPath!).existsSync()
+    ).toList();
+
+    if (mediaMsgs.isNotEmpty) {
+      final textParts = <String>[];
+      for (final m in selectedMsgs) {
+        if (m.mediaPath != null && File(m.mediaPath!).existsSync()) {
+          if (!_isGenericMediaLabel(m.message) && m.message.trim().isNotEmpty) {
+            textParts.add(m.message.trim());
+          }
+        } else if (m.message.trim().isNotEmpty) {
+          textParts.add(m.message.trim());
+        }
+      }
+      final text = textParts.isNotEmpty ? textParts.join('\n\n') : null;
+      final paths = mediaMsgs.map((m) => m.mediaPath!).toList();
+
+      final success = await NotificationService.instance.copyMediaToClipboard(
+        filePaths: paths,
+        text: text,
+      );
+
+      _exitSelectionMode();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              success
+                ? (mediaMsgs.length == 1 ? 'Media copied to clipboard' : '${mediaMsgs.length} media copied to clipboard')
+                : 'Failed to copy media to clipboard',
+            ),
+            backgroundColor: Colors.grey.shade800,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    } else {
+      final text = selectedMsgs.map((m) => m.message).join('\n\n');
+      Clipboard.setData(ClipboardData(text: text));
+      _exitSelectionMode();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('${selectedMsgs.length} messages copied'),
+            backgroundColor: Colors.grey.shade800,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    }
   }
 
   void _shareSelected() {
     final selectedMsgs = _messages.where((m) => _selectedMessageIds.contains(m.id)).toList();
     selectedMsgs.sort((a, b) => a.timestamp.compareTo(b.timestamp));
-    final text = selectedMsgs.map((m) => m.message).join('\n\n');
-    Share.share(text);
+
+    final mediaMsgs = selectedMsgs.where((m) =>
+      m.mediaPath != null &&
+      m.mediaPath!.isNotEmpty &&
+      File(m.mediaPath!).existsSync()
+    ).toList();
+
+    if (mediaMsgs.isNotEmpty) {
+      final xFiles = mediaMsgs.map((m) => XFile(m.mediaPath!)).toList();
+      final textParts = <String>[];
+      for (final m in selectedMsgs) {
+        if (m.mediaPath != null && File(m.mediaPath!).existsSync()) {
+          if (!_isGenericMediaLabel(m.message) && m.message.trim().isNotEmpty) {
+            textParts.add(m.message.trim());
+          }
+        } else if (m.message.trim().isNotEmpty) {
+          textParts.add(m.message.trim());
+        }
+      }
+      final text = textParts.isNotEmpty ? textParts.join('\n\n') : null;
+      SharePlus.instance.share(ShareParams(files: xFiles, text: text));
+    } else {
+      final text = selectedMsgs.map((m) => m.message).join('\n\n');
+      SharePlus.instance.share(ShareParams(text: text));
+    }
     _exitSelectionMode();
   }
 
@@ -949,6 +1017,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
         message.mediaPath!.isNotEmpty &&
         File(message.mediaPath!).existsSync();
     final isMedia = _isGenericMediaLabel(message.message);
+    final scaffoldMessenger = ScaffoldMessenger.of(context);
 
     showModalBottomSheet(
       context: context,
@@ -1006,60 +1075,34 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
               ),
               const Divider(height: 1, color: Colors.grey),
 
-              // ── View full image (only when file exists) ────────────────
-              if (hasImage)
+              // ── Document or Media options ──────────────────────────────
+              if (hasImage && ['pdf', 'doc', 'docx', 'csv', 'xls', 'xlsx', 'txt', 'ppt', 'pptx', 'zip', 'rar'].contains(message.mediaPath!.toLowerCase().split('.').last)) ...[
                 ListTile(
-                  leading: const Icon(Icons.fullscreen, color: Colors.white70),
-                  title: const Text('View full image',
-                      style: TextStyle(color: Colors.white)),
+                  leading: const Icon(Icons.open_in_new, color: Colors.white70),
+                  title: const Text('Open document', style: TextStyle(color: Colors.white)),
                   onTap: () {
                     Navigator.pop(ctx);
-                    final heroTag =
-                        'media_${message.id ?? message.mediaPath.hashCode}';
-                    _openFullScreenImage(message.mediaPath!, heroTag);
+                    _openDocument(message.mediaPath!);
                   },
                 ),
-
-              // ── Copy message text ─────────────────────────────────────
-              if (!isMedia || !hasImage)
+                ListTile(
+                  leading: const Icon(Icons.share, color: Colors.white70),
+                  title: const Text('Share document', style: TextStyle(color: Colors.white)),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    SharePlus.instance.share(ShareParams(files: [XFile(message.mediaPath!)]));
+                  },
+                ),
                 ListTile(
                   leading: const Icon(Icons.copy, color: Colors.white70),
-                  title: const Text('Copy message',
-                      style: TextStyle(color: Colors.white)),
-                  onTap: () {
-                    Clipboard.setData(
-                        ClipboardData(text: message.message));
+                  title: const Text('Copy document to clipboard', style: TextStyle(color: Colors.white)),
+                  onTap: () async {
                     Navigator.pop(ctx);
-                    ScaffoldMessenger.of(context).showSnackBar(
+                    final ok = await NotificationService.instance.copyMediaToClipboard(filePath: message.mediaPath!);
+                    if (!mounted) return;
+                    scaffoldMessenger.showSnackBar(
                       SnackBar(
-                        content: const Text('Message copied to clipboard'),
-                        backgroundColor:
-                            Colors.white.withValues(alpha: 0.7),
-                        behavior: SnackBarBehavior.floating,
-                        duration: const Duration(seconds: 2),
-                      ),
-                    );
-                  },
-                ),
-
-              // ── Copy with sender info (group chats) ───────────────────
-              if (_isGroupChat && (!isMedia || !hasImage))
-                ListTile(
-                  leading:
-                      const Icon(Icons.content_copy, color: Colors.white70),
-                  title: const Text('Copy with sender info',
-                      style: TextStyle(color: Colors.white)),
-                  onTap: () {
-                    final formattedTime =
-                        _formatMessageTime(message.timestamp);
-                    final textToCopy =
-                        '[$formattedTime] $senderName: ${message.message}';
-                    Clipboard.setData(ClipboardData(text: textToCopy));
-                    Navigator.pop(ctx);
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(
-                        content:
-                            const Text('Message with sender info copied'),
+                        content: Text(ok ? 'Document copied to clipboard' : 'Failed to copy document'),
                         backgroundColor: Colors.grey.shade800,
                         behavior: SnackBarBehavior.floating,
                         duration: const Duration(seconds: 2),
@@ -1067,6 +1110,118 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                     );
                   },
                 ),
+              ] else if (hasImage) ...[
+                () {
+                  final ext = message.mediaPath!.toLowerCase().split('.').last;
+                  final isVideo = ['mp4', 'mov', 'avi', 'mkv', '3gp'].contains(ext);
+                  final isAudio = ['opus', 'ogg', 'mp3', 'm4a', 'wav', 'aac'].contains(ext);
+                  final mediaName = isVideo ? 'video' : (isAudio ? 'voice message' : 'image');
+                  final heroTag = 'media_${message.id ?? message.mediaPath.hashCode}';
+
+                  return Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (!isAudio)
+                        ListTile(
+                          leading: const Icon(Icons.fullscreen, color: Colors.white70),
+                          title: Text(isVideo ? 'Play video' : 'View full image',
+                              style: const TextStyle(color: Colors.white)),
+                          onTap: () {
+                            Navigator.pop(ctx);
+                            _openFullScreenImage(message.mediaPath!, heroTag);
+                          },
+                        ),
+                      ListTile(
+                        leading: const Icon(Icons.share, color: Colors.white70),
+                        title: Text('Share $mediaName',
+                            style: const TextStyle(color: Colors.white)),
+                        onTap: () {
+                          Navigator.pop(ctx);
+                          final caption = (!isMedia && message.message.trim().isNotEmpty) ? message.message.trim() : null;
+                          SharePlus.instance.share(ShareParams(files: [XFile(message.mediaPath!)], text: caption));
+                        },
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.copy, color: Colors.white70),
+                        title: Text('Copy $mediaName to clipboard',
+                            style: const TextStyle(color: Colors.white)),
+                        onTap: () async {
+                          Navigator.pop(ctx);
+                          final caption = (!isMedia && message.message.trim().isNotEmpty) ? message.message.trim() : null;
+                          final ok = await NotificationService.instance.copyMediaToClipboard(
+                            filePath: message.mediaPath!,
+                            text: caption,
+                          );
+                          if (!mounted) return;
+                          scaffoldMessenger.showSnackBar(
+                            SnackBar(
+                              content: Text(ok ? '${mediaName[0].toUpperCase()}${mediaName.substring(1)} copied to clipboard' : 'Failed to copy'),
+                              backgroundColor: Colors.grey.shade800,
+                              behavior: SnackBarBehavior.floating,
+                              duration: const Duration(seconds: 2),
+                            ),
+                          );
+                        },
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.download, color: Colors.white70),
+                        title: Text(isAudio ? 'Save to Downloads' : 'Save to Gallery',
+                            style: const TextStyle(color: Colors.white)),
+                        onTap: () {
+                          Navigator.pop(ctx);
+                          _saveMediaFile(message.mediaPath!);
+                        },
+                      ),
+                    ],
+                  );
+                }(),
+              ],
+
+              // ── Copy message text (when non-placeholder text exists) ────
+              if (!isMedia && message.message.trim().isNotEmpty) ...[
+                ListTile(
+                  leading: const Icon(Icons.text_fields, color: Colors.white70),
+                  title: const Text('Copy message text',
+                      style: TextStyle(color: Colors.white)),
+                  onTap: () {
+                    Clipboard.setData(
+                        ClipboardData(text: message.message));
+                    Navigator.pop(ctx);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: const Text('Message text copied to clipboard'),
+                        backgroundColor: Colors.grey.shade800,
+                        behavior: SnackBarBehavior.floating,
+                        duration: const Duration(seconds: 2),
+                      ),
+                    );
+                  },
+                ),
+                if (_isGroupChat)
+                  ListTile(
+                    leading:
+                        const Icon(Icons.content_copy, color: Colors.white70),
+                    title: const Text('Copy with sender info',
+                        style: TextStyle(color: Colors.white)),
+                    onTap: () {
+                      final formattedTime =
+                          _formatMessageTime(message.timestamp);
+                      final textToCopy =
+                          '[$formattedTime] $senderName: ${message.message}';
+                      Clipboard.setData(ClipboardData(text: textToCopy));
+                      Navigator.pop(ctx);
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content:
+                              const Text('Message with sender info copied'),
+                          backgroundColor: Colors.grey.shade800,
+                          behavior: SnackBarBehavior.floating,
+                          duration: const Duration(seconds: 2),
+                        ),
+                      );
+                    },
+                  ),
+              ],
 
               const SizedBox(height: 8),
             ],
@@ -1308,13 +1463,18 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     );
   }
 
-  /// Renders the captured image or a video/audio placeholder with a tap-to-fullscreen hero.
+  /// Renders the captured image, video/audio placeholder, or document card.
   Widget _buildRealImage(MessageModel message, String path) {
     final heroTag = 'media_${message.id ?? path.hashCode}';
     final ext = path.toLowerCase().split('.').last;
     final isVideo = ['mp4', 'mov', 'avi', 'mkv'].contains(ext);
     final isAudio = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext);
-    final mediaType = isVideo ? 'video' : (isAudio ? 'audio' : 'image');
+    final isDoc = ['pdf', 'doc', 'docx', 'csv', 'xls', 'xlsx', 'txt', 'ppt', 'pptx', 'zip', 'rar'].contains(ext);
+    final mediaType = isVideo ? 'video' : (isAudio ? 'audio' : (isDoc ? 'document' : 'image'));
+
+    if (isDoc) {
+      return _buildDocumentCard(message, path, ext);
+    }
 
     return GestureDetector(
       onTap: () => _openFullScreenImage(path, heroTag, type: mediaType),
@@ -1409,6 +1569,198 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
         ),
       ),
     );
+  }
+
+  /// Interactive document card for PDF, Word, Excel/CSV, Text, and other files.
+  Widget _buildDocumentCard(MessageModel message, String path, String ext) {
+    final file = File(path);
+    final fileName = path.split(Platform.pathSeparator).last;
+    String fileSizeStr = '';
+    try {
+      if (file.existsSync()) {
+        final bytes = file.lengthSync();
+        if (bytes < 1024) {
+          fileSizeStr = '$bytes B';
+        } else if (bytes < 1024 * 1024) {
+          fileSizeStr = '${(bytes / 1024).toStringAsFixed(1)} KB';
+        } else {
+          fileSizeStr = '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+        }
+      }
+    } catch (_) {}
+
+    final (docIcon, docColor, docLabel) = switch (ext) {
+      'pdf' => (Icons.picture_as_pdf_rounded, Colors.red.shade400, 'PDF Document'),
+      'doc' || 'docx' => (Icons.description_rounded, Colors.blue.shade400, 'Word Document'),
+      'csv' || 'xls' || 'xlsx' => (Icons.table_chart_rounded, Colors.green.shade400, 'Spreadsheet / CSV'),
+      'ppt' || 'pptx' => (Icons.slideshow_rounded, Colors.orange.shade400, 'Presentation'),
+      'zip' || 'rar' => (Icons.folder_zip_rounded, Colors.amber.shade400, 'Archive'),
+      _ => (Icons.insert_drive_file_rounded, Colors.teal.shade300, 'Document'),
+    };
+
+    return GestureDetector(
+      onTap: () => _openDocument(path),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: docColor.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: docColor.withValues(alpha: 0.35)),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 44,
+              height: 44,
+              decoration: BoxDecoration(
+                color: docColor.withValues(alpha: 0.2),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(docIcon, color: docColor, size: 24),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    fileName,
+                    style: const TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.white,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 3),
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: docColor.withValues(alpha: 0.25),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          ext.toUpperCase(),
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                            color: docColor,
+                          ),
+                        ),
+                      ),
+                      if (fileSizeStr.isNotEmpty) ...[
+                        const SizedBox(width: 6),
+                        Text(
+                          fileSizeStr,
+                          style: TextStyle(fontSize: 11, color: Colors.grey.shade400),
+                        ),
+                      ],
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            Container(
+              padding: const EdgeInsets.all(6),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.1),
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(Icons.open_in_new_rounded, color: Colors.white70, size: 18),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Opens any document (PDF, Word, CSV, etc.) using default viewer app via Android FileProvider.
+  Future<void> _openDocument(String path) async {
+    try {
+      final success = await NotificationService.instance.openFile(path);
+      if (!success && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Could not open file'),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not open file: $e'),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    }
+  }
+
+  /// Save media file (image/video to gallery, audio to downloads)
+  Future<void> _saveMediaFile(String path) async {
+    try {
+      final ext = path.toLowerCase().split('.').last;
+      final isVideo = ['mp4', 'mov', 'avi', 'mkv', '3gp'].contains(ext);
+      final isAudio = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext);
+
+      final hasAccess = await Gal.hasAccess();
+      if (!hasAccess) {
+        await Gal.requestAccess();
+      }
+
+      if (isVideo) {
+        await Gal.putVideo(path);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Video saved to Gallery'),
+              behavior: SnackBarBehavior.floating,
+            ),
+          );
+        }
+      } else if (isAudio) {
+        final downloads = Directory('/storage/emulated/0/Download/SilentSave');
+        if (!await downloads.exists()) {
+          await downloads.create(recursive: true);
+        }
+        final fileName = path.split(Platform.pathSeparator).last;
+        await File(path).copy('${downloads.path}/$fileName');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Audio saved to Downloads/SilentSave'),
+              behavior: SnackBarBehavior.floating,
+            ),
+          );
+        }
+      } else {
+        await Gal.putImage(path);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Image saved to Gallery'),
+              behavior: SnackBarBehavior.floating,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error saving media: $e'),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    }
   }
 
   /// Styled placeholder for media messages where the file wasn't captured

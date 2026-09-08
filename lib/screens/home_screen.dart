@@ -1179,7 +1179,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     bool isAudio = false;
     bool isVideo = false;
     if (hasMediaFile) {
-      final ext = lastMediaPath!.toLowerCase().split('.').last;
+      final ext = lastMediaPath.toLowerCase().split('.').last;
       isAudio = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext);
       isVideo = ['mp4', 'mov', 'avi', 'mkv'].contains(ext);
     }
@@ -1287,7 +1287,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                 // Avatar with group indicator
                 GestureDetector(
                   onTap: () {
-                    if (hasAvatar && avatarPath != null) {
+                    if (hasAvatar) {
                       _searchFocusNode.unfocus();
                       Navigator.push(
                         context,
@@ -1326,7 +1326,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                             ),
                             shape: BoxShape.circle,
                             image: hasAvatar ? DecorationImage(
-                              image: FileImage(File(avatarPath!)),
+                              image: FileImage(File(avatarPath)),
                               fit: BoxFit.cover,
                             ) : null,
                             boxShadow: [
@@ -1443,7 +1443,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                                     decoration: isAudio || isVideo ? null : BoxDecoration(
                                       borderRadius: BorderRadius.circular(4),
                                       image: DecorationImage(
-                                        image: FileImage(File(lastMediaPath!)),
+                                        image: FileImage(File(lastMediaPath)),
                                         fit: BoxFit.cover,
                                       ),
                                     ),

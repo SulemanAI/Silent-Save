@@ -9,7 +9,9 @@ import android.net.Uri
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.PowerManager
 import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.util.Log
 import androidx.documentfile.provider.DocumentFile
 import org.json.JSONArray
@@ -47,13 +49,66 @@ class MediaWatcherService : Service() {
         private const val WHATSAPP_PACKAGE = "com.whatsapp"
         private const val WHATSAPP_BUSINESS_PACKAGE = "com.whatsapp.w4b"
 
+        @Volatile
+        private var instance: MediaWatcherService? = null
+        private var scanWakeLock: PowerManager.WakeLock? = null
+        @Volatile
+        private var pendingBurstScan: Triple<Uri, String?, String?>? = null
+
+        /**
+         * Triggers an immediate zero-touch scan with burst retries.
+         * Acquires a 45-second WakeLock so the CPU remains active while scanning
+         * and copying media even if the screen is off or the app is backgrounded.
+         * Automatically released early as soon as the media matches.
+         */
+        fun triggerImmediateScan(
+            context: Context, 
+            hintSubdir: String? = null, 
+            reason: String = "unknown",
+            targetSender: String? = null
+        ) {
+            Log.i(TAG, "triggerImmediateScan: hint=$hintSubdir reason=$reason targetSender=$targetSender")
+            val treeUri = getPersistedUri(context) ?: run {
+                Log.w(TAG, "triggerImmediateScan: No SAF URI persisted")
+                return
+            }
+
+            try {
+                if (scanWakeLock == null) {
+                    val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+                    scanWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SilentSave::MediaScanWakeLock").apply {
+                        setReferenceCounted(false)
+                    }
+                }
+                scanWakeLock?.acquire(45_000L)
+            } catch (e: Exception) {
+                Log.w(TAG, "WakeLock acquire error: ${e.message}")
+            }
+
+            val currentInstance = instance
+            if (currentInstance != null) {
+                currentInstance.scheduleBurstScans(treeUri, hintSubdir, targetSender)
+            } else {
+                pendingBurstScan = Triple(treeUri, hintSubdir, targetSender)
+                start(context)
+            }
+        }
+
         private val WA_MEDIA_SUBDIRS = setOf(
             "WhatsApp Images",
             "WhatsApp Video",
             "WhatsApp Voice Notes",
+            "WhatsApp Audio",
+            "WhatsApp Animated Gifs",
+            "WhatsApp Documents",
+            "WhatsApp Stickers",
             "WhatsApp Business Images",
             "WhatsApp Business Video",
-            "WhatsApp Business Voice Notes"
+            "WhatsApp Business Voice Notes",
+            "WhatsApp Business Audio",
+            "WhatsApp Business Animated Gifs",
+            "WhatsApp Business Documents",
+            "WhatsApp Business Stickers"
         )
 
         private val MIME_TO_TYPE = mapOf(
@@ -117,8 +172,21 @@ class MediaWatcherService : Service() {
     private val ioHandler = Handler(ioThread.looper)
     private val contentObservers = mutableListOf<Pair<Uri, ContentObserver>>()
     private val prefs by lazy { getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
+    private var nativeDb: NativeDatabaseHelper? = null
+    private var periodicScanRunnable: Runnable? = null
+    private var cachedTreeUri: Uri? = null
 
-    override fun onCreate() { super.onCreate(); Log.i(TAG, "CREATED") }
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
+        Log.i(TAG, "CREATED")
+        try {
+            nativeDb = NativeDatabaseHelper.getInstance(applicationContext)
+            Log.i(TAG, "NativeDatabaseHelper initialized in MediaWatcher")
+        } catch (e: Exception) {
+            Log.e(TAG, "NativeDatabaseHelper init failed: ${e.message}")
+        }
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(TAG, "onStartCommand")
@@ -130,19 +198,78 @@ class MediaWatcherService : Service() {
         if (treeUri == null) {
             Log.i(TAG, "No SAF URI — waiting for user grant"); return START_STICKY
         }
+        cachedTreeUri = treeUri
         registerObservers(treeUri)
         ioHandler.post { scanAllSubdirs(treeUri) }
+        startPeriodicScan()
+
+        pendingBurstScan?.let { (uri, hint, sender) ->
+            pendingBurstScan = null
+            scheduleBurstScans(uri, hint, sender)
+        }
+
         return START_STICKY
     }
 
     override fun onDestroy() {
+        if (instance == this) instance = null
         Log.w(TAG, "onDestroy — unregistering observers")
+        burstScanRunnables.forEach { ioHandler.removeCallbacks(it) }
+        burstScanRunnables.clear()
+        stopPeriodicScan()
         unregisterObservers()
         ioThread.quitSafely()
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    // ── Burst scans ────────────────────────────────────────────────────────
+
+    private val burstScanRunnables = mutableListOf<Runnable>()
+    private val subdirUriMap = java.util.concurrent.ConcurrentHashMap<String, Uri>()
+
+    fun cancelBurstScans() {
+        burstScanRunnables.forEach { ioHandler.removeCallbacks(it) }
+        burstScanRunnables.clear()
+        try {
+            if (scanWakeLock?.isHeld == true) {
+                scanWakeLock?.release()
+                Log.d(TAG, "Burst scans cancelled & WakeLock released early")
+            }
+        } catch (_: Exception) {}
+    }
+
+    fun scheduleBurstScans(treeUri: Uri, hintSubdir: String? = null, targetSender: String? = null) {
+        burstScanRunnables.forEach { ioHandler.removeCallbacks(it) }
+        burstScanRunnables.clear()
+
+        // 7-step exponential backoff (0s to 40s): covers real-world download latency
+        // while cutting scan frequency by nearly 50% compared to tight polling.
+        val delays = listOf(0L, 1200L, 3000L, 7000L, 14000L, 25000L, 40000L)
+        for (delay in delays) {
+            val runnable = Runnable {
+                Log.d(TAG, "Executing burst scan (delay=${delay}ms, hint=$hintSubdir, sender=$targetSender)")
+                if (hintSubdir != null) {
+                    scanSubdirByName(treeUri, hintSubdir, targetSender)
+                }
+                scanAllSubdirs(treeUri, targetSender)
+            }
+            burstScanRunnables.add(runnable)
+            if (delay == 0L) {
+                ioHandler.post(runnable)
+            } else {
+                ioHandler.postDelayed(runnable, delay)
+            }
+        }
+    }
+
+    private fun scanSubdirByName(treeUri: Uri, subdirName: String, targetSender: String? = null) {
+        val uri = subdirUriMap[subdirName]
+        if (uri != null) {
+            scanSubdir(treeUri, uri, subdirName, targetSender)
+        }
+    }
 
     // ── ContentObserver registration ──────────────────────────────────────
 
@@ -155,14 +282,30 @@ class MediaWatcherService : Service() {
             }
             var registered = 0
             try {
-                rootDoc.listFiles().forEach { subdir ->
-                    val name = subdir.name ?: return@forEach
-                    if (name !in WA_MEDIA_SUBDIRS) return@forEach
-                    val obs = makeObserver(treeUri, subdir.uri, name)
-                    contentResolver.registerContentObserver(subdir.uri, true, obs)
-                    contentObservers.add(Pair(subdir.uri, obs))
+                fun registerMatching(parent: DocumentFile) {
+                    parent.listFiles().forEach { subdir ->
+                        val name = subdir.name ?: return@forEach
+                        if (name !in WA_MEDIA_SUBDIRS) return@forEach
+                        subdirUriMap[name] = subdir.uri
+                        val obs = makeObserver(treeUri, subdir.uri, name)
+                        contentResolver.registerContentObserver(subdir.uri, true, obs)
+                        contentObservers.add(Pair(subdir.uri, obs))
+                        registered++
+                        Log.i(TAG, "Observer registered: $name")
+                    }
+                }
+                registerMatching(rootDoc)
+                if (registered == 0) {
+                    // Check if user selected WhatsApp parent folder containing "Media"
+                    rootDoc.findFile("Media")?.takeIf { it.isDirectory }?.let { mediaDoc ->
+                        registerMatching(mediaDoc)
+                    }
+                }
+                if (registered == 0 && (rootDoc.name ?: "") in WA_MEDIA_SUBDIRS) {
+                    val obs = makeObserver(treeUri, rootDoc.uri, rootDoc.name ?: "root")
+                    contentResolver.registerContentObserver(rootDoc.uri, true, obs)
+                    contentObservers.add(Pair(rootDoc.uri, obs))
                     registered++
-                    Log.i(TAG, "Observer registered: $name")
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "listFiles error: ${e.message}")
@@ -173,12 +316,43 @@ class MediaWatcherService : Service() {
                 contentResolver.registerContentObserver(treeUri, true, obs)
                 contentObservers.add(Pair(treeUri, obs))
             }
+            // Also observe system MediaStore for instant change notifications
+            registerMediaStoreObservers()
         } catch (e: SecurityException) {
             Log.e(TAG, "SecurityException — permission revoked: ${e.message}")
             getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .edit().remove(PREF_SAF_URI).apply()
         } catch (e: Exception) {
             Log.e(TAG, "registerObservers error: ${e.message}")
+        }
+    }
+
+    private fun registerMediaStoreObservers() {
+        try {
+            val mediaStoreUris = listOf(
+                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                MediaStore.Files.getContentUri("external")
+            )
+            val msObserver = object : ContentObserver(ioHandler) {
+                override fun onChange(selfChange: Boolean, uri: Uri?) {
+                    Log.d(TAG, "MediaStore onChange fired: uri=$uri")
+                    val treeUri = cachedTreeUri ?: getPersistedUri(applicationContext) ?: return
+                    scheduleBurstScans(treeUri, null)
+                }
+            }
+            for (msUri in mediaStoreUris) {
+                try {
+                    contentResolver.registerContentObserver(msUri, true, msObserver)
+                    contentObservers.add(Pair(msUri, msObserver))
+                    Log.i(TAG, "MediaStore observer registered: $msUri")
+                } catch (e: Exception) {
+                    Log.w(TAG, "MediaStore observer failed for $msUri: ${e.message}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "registerMediaStoreObservers error: ${e.message}")
         }
     }
 
@@ -189,42 +363,86 @@ class MediaWatcherService : Service() {
             override fun onChange(selfChange: Boolean, uri: Uri?) {
                 Log.d(TAG, "onChange fired: '$name' (selfChange=$selfChange)")
                 val key = subdirUri.toString()
+                
+                // 1. INSTANT CAPTURE: Run immediately without debounce to beat "Delete for Everyone"
+                ioHandler.post { scanSubdir(treeUri, subdirUri, name) }
+                
+                // 2. DELAYED CAPTURE: Run again 1500ms later to catch large videos that take time to finish downloading
                 scanRunnables[key]?.let { ioHandler.removeCallbacks(it) }
                 val runnable = Runnable { scanSubdir(treeUri, subdirUri, name) }
                 scanRunnables[key] = runnable
-                // Debounce for 500ms to consolidate rapid chunk writes
-                ioHandler.postDelayed(runnable, 500)
+                ioHandler.postDelayed(runnable, 1500)
             }
         }
 
     private fun unregisterObservers() {
-        scanRunnables.values.forEach { ioHandler.removeCallbacks(it) }
-        scanRunnables.clear()
-        contentObservers.forEach { (_, obs) ->
+        contentObservers.forEach { (uri, obs) ->
             try { contentResolver.unregisterContentObserver(obs) } catch (_: Exception) {}
         }
         contentObservers.clear()
     }
 
+    // ── Periodic fallback scan (every 60 s) ───────────────────────────────
+
+    private fun startPeriodicScan() {
+        stopPeriodicScan()
+        periodicScanRunnable = object : Runnable {
+            override fun run() {
+                val uri = cachedTreeUri ?: getPersistedUri(applicationContext)
+                if (uri != null) {
+                    cachedTreeUri = uri
+                    ioHandler.post { scanAllSubdirs(uri) }
+                }
+                ioHandler.postDelayed(this, 60_000L)
+            }
+        }.also { ioHandler.postDelayed(it, 60_000L) }
+    }
+
+    private fun stopPeriodicScan() {
+        periodicScanRunnable?.let { ioHandler.removeCallbacks(it) }
+        periodicScanRunnable = null
+    }
+
     // ── File scanning ─────────────────────────────────────────────────────
 
-    private fun scanAllSubdirs(treeUri: Uri) {
+    private fun scanAllSubdirs(treeUri: Uri, targetSender: String? = null) {
         try {
             val root = DocumentFile.fromTreeUri(applicationContext, treeUri) ?: return
             if (!root.exists()) return
+            var scanned = 0
             root.listFiles().forEach { sub ->
                 val n = sub.name ?: return@forEach
-                if (n in WA_MEDIA_SUBDIRS) scanSubdir(treeUri, sub.uri, n)
+                if (n in WA_MEDIA_SUBDIRS) {
+                    subdirUriMap[n] = sub.uri
+                    scanSubdir(treeUri, sub.uri, n, targetSender)
+                    scanned++
+                }
+            }
+            // Fallback: If no subdirs matched directly, check for a "Media" directory
+            if (scanned == 0) {
+                root.findFile("Media")?.takeIf { it.isDirectory }?.listFiles()?.forEach { sub ->
+                    val n = sub.name ?: return@forEach
+                    if (n in WA_MEDIA_SUBDIRS) {
+                        subdirUriMap[n] = sub.uri
+                        scanSubdir(treeUri, sub.uri, n, targetSender)
+                        scanned++
+                    }
+                }
+            }
+            // Fallback: If root itself is a WhatsApp media directory
+            if (scanned == 0 && (root.name ?: "") in WA_MEDIA_SUBDIRS) {
+                val rName = root.name ?: "root"
+                subdirUriMap[rName] = root.uri
+                scanSubdir(treeUri, root.uri, rName, targetSender)
             }
         } catch (e: Exception) { Log.e(TAG, "scanAllSubdirs: ${e.message}") }
     }
 
-    private fun scanSubdir(treeUri: Uri, subdirUri: Uri, subdirName: String) {
+    private fun scanSubdir(treeUri: Uri, subdirUri: Uri, subdirName: String, targetSender: String? = null) {
         try {
             val lastScanKey = "$PREF_LAST_SCAN_TS_PREFIX$subdirName"
-            // Look back 24 hours on the first run so we don't miss files that arrived just before SAF was granted
-            val lastScanTs = prefs.getLong(lastScanKey, System.currentTimeMillis() - 86400_000L)
             val scanStart  = System.currentTimeMillis()
+            val cutoffTime = scanStart - 24 * 60 * 60 * 1000L // 24-hour window for active captures
 
             val initialDocId: String = try {
                 DocumentsContract.getDocumentId(subdirUri)
@@ -250,6 +468,8 @@ class MediaWatcherService : Service() {
                     ), null, null, null)
                 } catch (e: Exception) { Log.e(TAG, "query($subdirName): ${e.message}"); continue }
 
+                val pendingDirs = mutableListOf<Pair<String, String>>() // (docId, name)
+
                 cursor?.use { c ->
                     while (c.moveToNext()) {
                         try {
@@ -257,20 +477,37 @@ class MediaWatcherService : Service() {
                             val name     = c.getString(1) ?: continue
                             val mime     = c.getString(2) ?: "application/octet-stream"
                             val size     = c.getLong(3)
-                            val modified = c.getLong(4)
+                            val rawModified = c.getLong(4)
 
                             if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
-                                // Skip Sent and .Shared folders, but recurse into Private and Voice Note folders
-                                if (name != "Sent" && name != ".Shared") {
-                                    queue.add(docId)
+                                // Skip Sent, .Shared, .Links, .Statuses, and cache folders
+                                if (name != "Sent" && name != ".Shared" && !name.startsWith(".")) {
+                                    pendingDirs.add(Pair(docId, name))
                                 }
                                 continue
                             }
 
                             if (name.startsWith(".") || name == ".nomedia" || name.endsWith(".thumb")) continue
-                            
-                            // Look back 1 hour from lastScanTs to catch slow downloads & renames
-                            if (modified <= lastScanTs - 3600_000L) continue
+
+                            // Skip empty or incomplete downloads
+                            if (size <= 0L) {
+                                Log.d(TAG, "Skipping empty/incomplete file: $name (size=$size)")
+                                continue
+                            }
+
+                            // Prune historical files: ONLY skip if rawModified is a valid millisecond timestamp (> year 2001)
+                            // AND strictly older than cutoffTime. If 0, -1, or unpopulated by OEM, keep it!
+                            if (rawModified > 1_000_000_000_000L && rawModified < cutoffTime) {
+                                continue
+                            }
+
+                            // Skip files that have already been copied and successfully linked
+                            val safeName = name.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+                            val destDir  = getMediaAttachmentsDir(applicationContext)
+                            val destFile = File(destDir, safeName)
+                            if (destFile.exists() && destFile.length() == size && (linkedPaths.contains(destFile.absolutePath) || nativeDb?.isMediaAlreadyLinked(destFile.absolutePath) == true)) {
+                                continue
+                            }
 
                             val fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
                             val type    = mimeToMediaType(mime, name)
@@ -278,9 +515,33 @@ class MediaWatcherService : Service() {
 
                             val path = copyToPrivateStorage(fileUri, name, size)
                             if (path != null) {
-                                enqueueMediaEvent(fileUri.toString(), type, path, modified, size, name)
+                                // Use actual file modified time if valid, else current time
+                                val captureTime = if (rawModified > 1_000_000_000_000L) rawModified else System.currentTimeMillis()
+                                processMediaEvent(fileUri.toString(), type, path, captureTime, size, name, 0, targetSender)
                             }
                         } catch (e: Exception) { Log.e(TAG, "file processing: ${e.message}") }
+                    }
+                }
+
+                // Prioritize subdirectories intelligently
+                if (pendingDirs.isNotEmpty()) {
+                    if (subdirName.contains("Voice Notes")) {
+                        // WhatsApp Voice Notes has weekly folders (e.g. 202637, 202636).
+                        // Separate numeric folders from non-numeric so stray directories don't disrupt chronological sort.
+                        val (numericFolders, otherFolders) = pendingDirs.partition {
+                            it.second.matches(Regex("^\\d{4,8}$"))
+                        }
+                        val sortedWeekly = numericFolders.sortedByDescending { it.second }.take(3)
+                        for (dir in sortedWeekly) queue.add(dir.first)
+                        // If any non-numeric folders exist (e.g. backup or custom), inspect up to 2
+                        for (dir in otherFolders.take(2)) queue.add(dir.first)
+                    } else if (subdirName.contains("Video")) {
+                        // In WhatsApp Video, prioritize "Private" folder first because incoming videos arrive there
+                        val (privateDirs, otherDirs) = pendingDirs.partition { it.second.equals("Private", ignoreCase = true) }
+                        for (dir in privateDirs) queue.add(dir.first)
+                        for (dir in otherDirs) queue.add(dir.first)
+                    } else {
+                        for (dir in pendingDirs) queue.add(dir.first)
                     }
                 }
             }
@@ -295,13 +556,15 @@ class MediaWatcherService : Service() {
         return try {
             val destDir  = getMediaAttachmentsDir(applicationContext)
             val safeName = displayName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
-            val destFile = File(destDir, "${sizeBytes}_$safeName")
+            val destFile = File(destDir, safeName)
             
-            // If we already copied this exact file with this exact size, skip it entirely!
-            if (destFile.exists() && destFile.length() > 0) return null
-
-            // Delete any older partial copies of this exact file to prevent storage bloat
-            destDir.listFiles { _, n -> n.endsWith("_$safeName") }?.forEach { it.delete() }
+            // Fix 1: If already copied with matching size, return the EXISTING path
+            // instead of null. Returning null caused the caller to skip processMediaEvent,
+            // which meant re-scans could never attempt DB matching for already-copied files.
+            if (destFile.exists() && destFile.length() == sizeBytes) {
+                Log.d(TAG, "Already copied (same size): ${destFile.name}")
+                return destFile.absolutePath
+            }
 
             contentResolver.openInputStream(sourceUri)?.use { input ->
                 FileOutputStream(destFile).use { out ->
@@ -321,9 +584,79 @@ class MediaWatcherService : Service() {
 
     // ── Queue writer ──────────────────────────────────────────────────────
 
-    private fun enqueueMediaEvent(
+    // Tracks files that have been successfully linked or are currently being retried,
+    // so periodic scans don't redundantly schedule retries.
+    private val linkedPaths = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    private val pendingRetries = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
+    private fun processMediaEvent(
+        originalUri: String, mediaType: String, privatePath: String,
+        fileTimestampMs: Long, sizeBytes: Long, displayName: String,
+        retryCount: Int = 0, targetSender: String? = null
+    ) {
+        // Skip if this file was already successfully linked
+        if (linkedPaths.contains(privatePath)) return
+
+        // Also check if already linked in SQLite database!
+        if (nativeDb?.isMediaAlreadyLinked(privatePath) == true) {
+            linkedPaths.add(privatePath)
+            return
+        }
+
+        // On initial call (not a retry), skip if we're already retrying this file
+        if (retryCount == 0 && pendingRetries.contains(privatePath)) return
+
+        // Attempt native zero-touch matching immediately
+        val matched = nativeDb?.matchAndLinkMedia(
+            fileName = displayName,
+            mediaPath = privatePath,
+            mediaType = mediaType,
+            fileTimestamp = fileTimestampMs,
+            originalUri = originalUri,
+            fileSizeBytes = sizeBytes,
+            targetSender = targetSender
+        ) == true
+
+        if (matched) {
+            Log.i(TAG, "Zero-touch matched media: $displayName ($targetSender)")
+            linkedPaths.add(privatePath)
+            pendingRetries.remove(privatePath)
+            cancelBurstScans() // Early exit on match: stops remaining burst scans & releases WakeLock
+            // Cap linkedPaths to prevent memory leak
+            if (linkedPaths.size > 500) {
+                val iter = linkedPaths.iterator()
+                if (iter.hasNext()) { iter.next(); iter.remove() }
+            }
+            return
+        }
+
+        // Handle Case B race condition: SAF file copied before notification arrives
+        when (retryCount) {
+            0 -> {
+                Log.d(TAG, "Match failed for $displayName. Retrying in 3s...")
+                pendingRetries.add(privatePath)
+                ioHandler.postDelayed({
+                    processMediaEvent(originalUri, mediaType, privatePath, fileTimestampMs, sizeBytes, displayName, 1, targetSender)
+                }, 3000)
+            }
+            1 -> {
+                Log.d(TAG, "Match failed (retry 1) for $displayName. Retrying in 7s...")
+                ioHandler.postDelayed({
+                    processMediaEvent(originalUri, mediaType, privatePath, fileTimestampMs, sizeBytes, displayName, 2, targetSender)
+                }, 7000)
+            }
+            else -> {
+                Log.w(TAG, "All retries failed for $displayName. Queueing to JSON fallback.")
+                pendingRetries.remove(privatePath)
+                enqueueToJSON(originalUri, mediaType, privatePath, fileTimestampMs, sizeBytes, displayName, targetSender)
+            }
+        }
+    }
+
+    private fun enqueueToJSON(
         originalUri: String, mediaType: String, privatePath: String?,
-        fileTimestampMs: Long, sizeBytes: Long, displayName: String
+        fileTimestampMs: Long, sizeBytes: Long, displayName: String,
+        targetSender: String? = null
     ) {
         try {
             val event = JSONObject().apply {
@@ -354,7 +687,7 @@ class MediaWatcherService : Service() {
                         file.delete()
                         if (!tmpFile.renameTo(file)) { file.writeText(arr.toString()); tmpFile.delete() }
                     }
-                    Log.i(TAG, "Enqueued: $displayName (q=${arr.length()})")
+                    Log.i(TAG, "Enqueued to fallback: $displayName (q=${arr.length()})")
                 }
             }
         } catch (e: Exception) { Log.e(TAG, "enqueue error: ${e.message}") }
@@ -377,6 +710,8 @@ class MediaWatcherService : Service() {
         if (ext in listOf("jpg", "jpeg", "png", "webp", "gif")) return "image"
         if (ext in listOf("mp4", "mkv", "avi", "mov", "3gp")) return "video"
         if (ext in listOf("mp3", "opus", "m4a", "wav", "aac", "ogg")) return "audio"
+        if (ext in listOf("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "zip", "rar", "apk")) return "document"
+        if (mime.startsWith("application/") || mime.startsWith("text/")) return "document"
         return "unknown"
     }
 }

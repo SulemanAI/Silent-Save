@@ -73,9 +73,15 @@ class SilentCaptureService : Service() {
             private set
         @Volatile var isRecordingAudio = false
             private set
+        @Volatile var isCapturingPhoto = false
+            private set
 
         /** Convenience: start a photo capture */
         fun capturePhoto(context: Context, useFrontCamera: Boolean = false) {
+            if (isCapturingPhoto || isRecordingVideo) {
+                Log.w(TAG, "Skipping photo capture: already capturing (photo=$isCapturingPhoto, video=$isRecordingVideo)")
+                return
+            }
             val intent = Intent(context, SilentCaptureService::class.java).apply {
                 action = ACTION_CAPTURE_PHOTO
                 putExtra(EXTRA_USE_FRONT_CAMERA, useFrontCamera)
@@ -87,6 +93,10 @@ class SilentCaptureService : Service() {
         fun startVideo(context: Context, useFrontCamera: Boolean = false,
                        durationSec: Int = DEFAULT_VIDEO_DURATION_SEC,
                        quality: String = "720p") {
+            if (isCapturingPhoto) {
+                Log.w(TAG, "Skipping video start: photo capture in progress")
+                return
+            }
             val intent = Intent(context, SilentCaptureService::class.java).apply {
                 action = ACTION_START_VIDEO
                 putExtra(EXTRA_USE_FRONT_CAMERA, useFrontCamera)
@@ -249,15 +259,28 @@ class SilentCaptureService : Service() {
 
         when (action) {
             ACTION_CAPTURE_PHOTO -> {
+                if (isCapturingPhoto) {
+                    Log.w(TAG, "Already capturing photo, ignoring")
+                    return START_NOT_STICKY
+                }
                 startForegroundWithNotification("Capturing photo...")
                 acquireWakeLock()
+                isCapturingPhoto = true
                 useFrontCamera = intent.getBooleanExtra(EXTRA_USE_FRONT_CAMERA, flutterUseFront)
                 startBackgroundThread()
                 capturePhotoInternal()
+                // Safety timeout: release camera if capture hasn't completed in 10 seconds
+                mainHandler.postDelayed({
+                    if (isCapturingPhoto) {
+                        Log.w(TAG, "Photo capture timeout (10s) — forcing cleanup")
+                        isCapturingPhoto = false
+                        finishCapture()
+                    }
+                }, 10_000L)
             }
             ACTION_START_VIDEO -> {
-                if (isRecordingVideo) {
-                    Log.w(TAG, "Already recording video, ignoring")
+                if (isRecordingVideo || isCapturingPhoto) {
+                    Log.w(TAG, "Already recording video or capturing photo, ignoring")
                     return START_NOT_STICKY
                 }
                 startForegroundWithNotification("Recording video...")
@@ -309,6 +332,7 @@ class SilentCaptureService : Service() {
             val cameraId = findCameraId(manager, useFrontCamera)
             if (cameraId == null) {
                 Log.e(TAG, "No suitable camera found")
+                isCapturingPhoto = false
                 finishCapture()
                 return
             }
@@ -337,6 +361,7 @@ class SilentCaptureService : Service() {
                     Log.e(TAG, "Error saving photo: ${e.message}")
                 } finally {
                     image.close()
+                    isCapturingPhoto = false
                     finishCapture()
                 }
             }, backgroundHandler)
@@ -344,6 +369,7 @@ class SilentCaptureService : Service() {
             // Open camera
             if (!cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
                 Log.e(TAG, "Camera lock timeout")
+                isCapturingPhoto = false
                 finishCapture()
                 return
             }
@@ -398,6 +424,7 @@ class SilentCaptureService : Service() {
                                                             failure: CaptureFailure
                                                         ) {
                                                             Log.e(TAG, "Photo capture failed: ${failure.reason}")
+                                                            isCapturingPhoto = false
                                                             finishCapture()
                                                         }
                                                     },
@@ -410,12 +437,14 @@ class SilentCaptureService : Service() {
                                         }, 500) // 500ms delay for AE to settle
                                     } catch (e: Exception) {
                                         Log.e(TAG, "Session configure error: ${e.message}")
+                                        isCapturingPhoto = false
                                         finishCapture()
                                     }
                                 }
 
                                 override fun onConfigureFailed(session: CameraCaptureSession) {
                                     Log.e(TAG, "Camera session configuration failed")
+                                    isCapturingPhoto = false
                                     finishCapture()
                                 }
                             },
@@ -439,15 +468,18 @@ class SilentCaptureService : Service() {
                     camera.close()
                     cameraDevice = null
                     Log.e(TAG, "Camera error: $error")
+                    isCapturingPhoto = false
                     finishCapture()
                 }
             }, backgroundHandler)
 
         } catch (e: SecurityException) {
             Log.e(TAG, "Camera permission denied: ${e.message}")
+            isCapturingPhoto = false
             finishCapture()
         } catch (e: Exception) {
             Log.e(TAG, "Photo capture error: ${e.message}")
+            isCapturingPhoto = false
             finishCapture()
         }
     }
@@ -800,6 +832,7 @@ class SilentCaptureService : Service() {
             } catch (_: Exception) {}
             isRecordingAudio = false
         }
+        isCapturingPhoto = false
         try {
             mediaRecorder?.release()
         } catch (_: Exception) {}

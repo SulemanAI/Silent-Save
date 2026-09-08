@@ -13,29 +13,48 @@ class TimestampMatcher {
       return MatchResult.unmatched();
     }
 
-    // FIRST FILTER: Only consider messages that are actually of this media type!
+    // Filter by targetSender if specified
+    final targetSender = mediaEvent['targetSender'] as String?;
+    var effectiveCandidates = candidates;
+    if (targetSender != null && targetSender.isNotEmpty) {
+      final senderFiltered = candidates.where((c) {
+        final s = (c['sender'] as String? ?? '').toLowerCase();
+        final sn = (c['senderName'] as String? ?? '').toLowerCase();
+        final ts = targetSender.toLowerCase();
+        return s == ts || sn == ts;
+      }).toList();
+      if (senderFiltered.isNotEmpty) {
+        effectiveCandidates = senderFiltered;
+      }
+    }
+
+    // FIRST FILTER: Only consider messages that are actually of this media type or blank placeholders!
     final mediaType = mediaEvent['mediaType'] as String? ?? 'unknown';
-    var targetCandidates = candidates.where((candidate) {
-      final msgText = (candidate['message'] as String? ?? '').toLowerCase();
+    final displayName = (mediaEvent['displayName'] as String? ?? '').toLowerCase();
+    final cleanBase = displayName.contains('.') ? displayName.substring(0, displayName.lastIndexOf('.')) : displayName;
+
+    var targetCandidates = effectiveCandidates.where((candidate) {
+      final msgText = (candidate['message'] as String? ?? '').toLowerCase().trim();
+      if (msgText.startsWith('reacted ') || msgText.startsWith('reacted to ')) return false;
       
-      if (mediaType == 'image' && (msgText.contains('photo') || msgText.contains('image') || msgText.contains('📷') || msgText.contains('🖼'))) {
+      if (mediaType == 'image' && (msgText.contains('photo') || msgText.contains('image') || msgText.contains('📷') || msgText.contains('🖼') || msgText.contains('sticker') || msgText.contains('gif') || msgText.contains('👾') || msgText.contains('💟') || displayName.startsWith('stk-') || msgText.isEmpty)) {
         return true;
-      } else if (mediaType == 'video' && (msgText.contains('video') || msgText.contains('📹') || msgText.contains('🎥') || msgText.contains('🎞'))) {
+      } else if (mediaType == 'video' && (msgText.contains('video') || msgText.contains('📹') || msgText.contains('🎥') || msgText.contains('🎞') || msgText.contains('gif') || msgText.isEmpty)) {
         return true;
-      } else if (mediaType == 'audio' && (msgText.contains('audio') || msgText.contains('voice') || msgText.contains('🎤') || msgText.contains('🎵') || msgText.contains('🎙'))) {
+      } else if (mediaType == 'audio' && (msgText.contains('audio') || msgText.contains('voice') || msgText.contains('🎤') || msgText.contains('🎵') || msgText.contains('🎙') || msgText.isEmpty)) {
         return true;
+      } else if (mediaType == 'document') {
+        if (msgText.contains('document') || msgText.contains('📄') || msgText.contains('📎') || msgText.contains('file') ||
+            msgText.contains('.pdf') || msgText.contains('.doc') || msgText.contains('.csv') || msgText.contains('.xls') ||
+            msgText.contains('.txt') || msgText.contains('.ppt') || msgText.contains('.zip') ||
+            (cleanBase.length >= 3 && msgText.contains(cleanBase)) || msgText.isEmpty) {
+          return true;
+        }
       }
       return false;
     }).toList();
 
-    // Secondary fallback: If no explicit keyword matches, accept candidates within 60s
-    if (targetCandidates.isEmpty) {
-      targetCandidates = candidates.where((candidate) {
-        final int ts = candidate['timestamp'] as int? ?? 0;
-        return (ts - fileTimestampMs).abs() <= 60000;
-      }).toList();
-    }
-
+    // Plain text messages like "Tu bata" or "Sett" must NEVER be matched to media
     if (targetCandidates.isEmpty) {
       return MatchResult.unmatched();
     }

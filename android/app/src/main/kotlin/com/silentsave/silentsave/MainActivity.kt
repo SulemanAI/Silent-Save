@@ -1,6 +1,9 @@
 package com.silentsave.silentsave
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipDescription
+import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -27,6 +30,23 @@ class MainActivity : FlutterFragmentActivity() {
         private const val CHANNEL = "com.silentsave/notifications"
         private const val PREFS_NAME = "notification_data"
         private const val SAF_REQUEST_CODE = 2001
+
+        @Volatile
+        private var activeMethodChannel: MethodChannel? = null
+
+        /**
+         * Notify Flutter UI that new messages or media attachments have been linked
+         * natively into SQLite so the UI updates immediately without manual reload.
+         */
+        fun notifyFlutterMessageOrMediaUpdated() {
+            try {
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    try {
+                        activeMethodChannel?.invokeMethod("onNotificationReceived", mapOf("event" to "db_updated"))
+                    } catch (_: Exception) {}
+                }
+            } catch (_: Exception) {}
+        }
     }
 
     // Holds the pending Flutter result for the SAF permission request.
@@ -35,6 +55,9 @@ class MainActivity : FlutterFragmentActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+        activeMethodChannel = channel
 
         Log.d(TAG, "Configuring Flutter engine")
 
@@ -49,7 +72,7 @@ class MainActivity : FlutterFragmentActivity() {
         // Schedule NLS health check worker to keep NLS alive on aggressive OEM phones
         NlsHealthWorker.schedule(applicationContext)
         
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
+        channel.setMethodCallHandler { call, result ->
             Log.d(TAG, "Method call: ${call.method}")
             when (call.method) {
                 "isNotificationPermissionGranted" -> {
@@ -159,6 +182,75 @@ class MainActivity : FlutterFragmentActivity() {
                     result.success(data)
                 }
 
+                // ── Open document/file via FileProvider in default viewer app ────────
+                "openFile" -> {
+                    val filePath = call.argument<String>("filePath")
+                    if (filePath != null) {
+                        try {
+                            val file = File(filePath)
+                            if (file.exists()) {
+                                val uri = androidx.core.content.FileProvider.getUriForFile(
+                                    applicationContext,
+                                    "${applicationContext.packageName}.fileprovider",
+                                    file
+                                )
+                                val ext = file.extension.lowercase(java.util.Locale.US)
+                                val mime = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+                                    ?: when (ext) {
+                                        "pdf" -> "application/pdf"
+                                        "doc" -> "application/msword"
+                                        "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                                        "csv" -> "text/csv"
+                                        "xls" -> "application/vnd.ms-excel"
+                                        "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                        "txt" -> "text/plain"
+                                        "ppt" -> "application/vnd.ms-powerpoint"
+                                        "pptx" -> "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                                        "zip" -> "application/zip"
+                                        else -> "*/*"
+                                    }
+                                val intent = Intent(Intent.ACTION_VIEW).apply {
+                                    setDataAndType(uri, mime)
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                }
+                                val chooser = Intent.createChooser(intent, "Open with...").apply {
+                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                }
+                                startActivity(chooser)
+                                result.success(true)
+                            } else {
+                                result.error("FILE_NOT_FOUND", "File not found: $filePath", null)
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "openFile error: ${e.message}")
+                            result.error("OPEN_FAILED", e.message, null)
+                        }
+                    } else {
+                        result.error("INVALID_ARGS", "filePath is null", null)
+                    }
+                }
+
+                // ── Copy media (image, audio, video, document) to clipboard ─────────
+                "copyMediaToClipboard" -> {
+                    val filePath = call.argument<String>("filePath")
+                    val filePaths = call.argument<List<String>>("filePaths")
+                    val text = call.argument<String>("text")
+
+                    val paths = when {
+                        !filePaths.isNullOrEmpty() -> filePaths
+                        !filePath.isNullOrEmpty() -> listOf(filePath)
+                        else -> emptyList()
+                    }
+
+                    if (paths.isNotEmpty()) {
+                        val success = copyMediaToClipboard(paths, text)
+                        result.success(success)
+                    } else {
+                        result.error("INVALID_ARGS", "No file paths provided", null)
+                    }
+                }
+
                 // ── Silent Capture methods ──────────────────────────────────────────
                 "capturePhoto" -> {
                     val useFront = call.argument<Boolean>("useFrontCamera") ?: false
@@ -262,6 +354,98 @@ class MainActivity : FlutterFragmentActivity() {
 
                 else -> { result.notImplemented() }
             }
+        }
+    }
+
+    /**
+     * Copies one or more media files to the Android system clipboard with proper MIME types
+     * and FileProvider content URIs, enabling direct pasting in apps (WhatsApp, Telegram, Notes, etc.).
+     */
+    private fun copyMediaToClipboard(paths: List<String>, text: String?): Boolean {
+        return try {
+            val validFiles = paths.map { File(it) }.filter { it.exists() }
+            if (validFiles.isEmpty()) return false
+
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val items = mutableListOf<ClipData.Item>()
+            val mimeTypes = mutableSetOf<String>()
+
+            val commonPackages = listOf(
+                "com.whatsapp",
+                "com.whatsapp.w4b",
+                "org.telegram.messenger",
+                "com.google.android.talk",
+                "com.google.android.apps.messaging",
+                "com.facebook.orca",
+                "com.instagram.android",
+                "com.google.android.inputmethod.latin",
+                "com.samsung.android.honeyboard"
+            )
+
+            for ((index, file) in validFiles.withIndex()) {
+                val uri = androidx.core.content.FileProvider.getUriForFile(
+                    applicationContext,
+                    "${applicationContext.packageName}.fileprovider",
+                    file
+                )
+
+                // Proactively grant temporary read permission to common messaging apps and keyboards
+                for (pkg in commonPackages) {
+                    try {
+                        grantUriPermission(pkg, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    } catch (_: Exception) {}
+                }
+
+                val ext = file.extension.lowercase(java.util.Locale.US)
+                val mime = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+                    ?: when (ext) {
+                        "jpg", "jpeg" -> "image/jpeg"
+                        "png" -> "image/png"
+                        "webp" -> "image/webp"
+                        "gif" -> "image/gif"
+                        "mp4" -> "video/mp4"
+                        "opus" -> "audio/opus"
+                        "ogg" -> "audio/ogg"
+                        "mp3" -> "audio/mpeg"
+                        "m4a" -> "audio/mp4"
+                        "pdf" -> "application/pdf"
+                        "doc" -> "application/msword"
+                        "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        "csv" -> "text/csv"
+                        "xls" -> "application/vnd.ms-excel"
+                        "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        "txt" -> "text/plain"
+                        "zip" -> "application/zip"
+                        else -> "*/*"
+                    }
+                mimeTypes.add(mime)
+
+                if (index == 0 && !text.isNullOrBlank()) {
+                    items.add(ClipData.Item(text, null, null, uri))
+                } else {
+                    items.add(ClipData.Item(uri))
+                }
+            }
+
+            if (!text.isNullOrBlank()) {
+                mimeTypes.add(ClipDescription.MIMETYPE_TEXT_PLAIN)
+            }
+            mimeTypes.add(ClipDescription.MIMETYPE_TEXT_URILIST)
+
+            val clipData = ClipData(
+                ClipDescription(validFiles.first().name, mimeTypes.toTypedArray()),
+                items[0]
+            )
+            for (i in 1 until items.size) {
+                clipData.addItem(items[i])
+            }
+
+            clipboard.setPrimaryClip(clipData)
+            Log.i(TAG, "Successfully copied ${validFiles.size} media file(s) to clipboard")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "copyMediaToClipboard error: ${e.message}", e)
+            false
         }
     }
 
@@ -547,5 +731,10 @@ class MainActivity : FlutterFragmentActivity() {
             }
         }
         return list
+    }
+
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        activeMethodChannel = null
+        super.cleanUpFlutterEngine(flutterEngine)
     }
 }
