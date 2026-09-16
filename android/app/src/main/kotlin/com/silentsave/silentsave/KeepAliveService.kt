@@ -40,8 +40,8 @@ class KeepAliveService : Service() {
         private const val CHANNEL_ID = "silentsave_keepalive"
         private const val NOTIFICATION_ID = 9001
         private const val ALARM_REQUEST_CODE = 9002
-        // Re-acquire WakeLock every 20 minutes (well before the 30-min safety-net timeout)
-        private const val WAKELOCK_RENEW_INTERVAL_MS = 20L * 60 * 1000
+        // Re-acquire WakeLock every 4 minutes (well before the 5-min safety-net timeout)
+        private const val WAKELOCK_RENEW_INTERVAL_MS = 4L * 60 * 1000
         // Self-ping alarm every 10 minutes
         private const val SELF_PING_INTERVAL_MS = 10L * 60 * 1000
 
@@ -249,9 +249,12 @@ class KeepAliveService : Service() {
                     setReferenceCounted(false)
                 }
             }
-            // 25-minute timeout — the renewal handler fires at 20 min,
-            // giving a 5-minute overlap so the lock is never released.
-            wakeLock?.acquire(25 * 60 * 1000L)
+            // 5-minute timeout — the renewal handler fires at 4 min,
+            // giving a 1-minute overlap so the lock is never released unexpectedly.
+            // A 5-minute timeout (vs the old 25-minute) ensures stale locks from
+            // a crashed process auto-release quickly, preventing the OEM battery
+            // manager from detecting and force-killing the whole app process.
+            wakeLock?.acquire(5 * 60 * 1000L)
             Log.d(TAG, "WakeLock acquired/renewed")
         } catch (e: Exception) {
             Log.w(TAG, "WakeLock acquire failed: ${e.message}")

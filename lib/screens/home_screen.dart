@@ -1178,10 +1178,12 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     
     bool isAudio = false;
     bool isVideo = false;
+    bool isImage = false;
     if (hasMediaFile) {
       final ext = lastMediaPath.toLowerCase().split('.').last;
       isAudio = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext);
       isVideo = ['mp4', 'mov', 'avi', 'mkv'].contains(ext);
+      isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].contains(ext);
     }
     
     final String appPackage = conversation['app']?.toString() ?? '';
@@ -1440,7 +1442,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                                     margin: const EdgeInsets.only(right: 6),
                                     width: 20,
                                     height: 20,
-                                    decoration: isAudio || isVideo ? null : BoxDecoration(
+                                    decoration: !isImage ? null : BoxDecoration(
                                       borderRadius: BorderRadius.circular(4),
                                       image: DecorationImage(
                                         image: FileImage(File(lastMediaPath)),
@@ -1451,12 +1453,14 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                                       ? Icon(Icons.videocam, size: 18, color: Colors.grey.shade400)
                                       : isAudio
                                         ? Icon(Icons.mic, size: 18, color: Colors.grey.shade400)
-                                        : null,
+                                        : !isImage
+                                          ? Icon(Icons.insert_drive_file, size: 18, color: Colors.grey.shade400)
+                                          : null,
                                   ),
                                 Expanded(
                                   child: Text(
                                     previewText.isEmpty && hasMediaFile 
-                                      ? (isVideo ? 'Video' : isAudio ? 'Voice Note' : 'Photo') 
+                                      ? (isVideo ? 'Video' : isAudio ? 'Voice Note' : isImage ? 'Photo' : 'Document') 
                                       : (previewText.isEmpty ? 'No messages' : previewText),
                                     style: TextStyle(
                                       color: unreadCount > 0 

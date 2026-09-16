@@ -16,15 +16,18 @@ class TimestampMatcher {
     // Filter by targetSender if specified
     final targetSender = mediaEvent['targetSender'] as String?;
     var effectiveCandidates = candidates;
-    if (targetSender != null && targetSender.isNotEmpty) {
+    if (targetSender != null && targetSender.trim().isNotEmpty) {
+      final ts = targetSender.toLowerCase().trim();
       final senderFiltered = candidates.where((c) {
-        final s = (c['sender'] as String? ?? '').toLowerCase();
-        final sn = (c['senderName'] as String? ?? '').toLowerCase();
-        final ts = targetSender.toLowerCase();
+        final s = (c['sender'] as String? ?? '').toLowerCase().trim();
+        final sn = (c['senderName'] as String? ?? '').toLowerCase().trim();
         return s == ts || sn == ts;
       }).toList();
-      if (senderFiltered.isNotEmpty) {
-        effectiveCandidates = senderFiltered;
+      // Strict sender enforcement: Never fall back to other users' messages
+      // when targetSender is specified. This eliminates cross-chat misattribution.
+      effectiveCandidates = senderFiltered;
+      if (effectiveCandidates.isEmpty) {
+        return MatchResult.unmatched();
       }
     }
 
@@ -32,22 +35,43 @@ class TimestampMatcher {
     final mediaType = mediaEvent['mediaType'] as String? ?? 'unknown';
     final displayName = (mediaEvent['displayName'] as String? ?? '').toLowerCase();
     final cleanBase = displayName.contains('.') ? displayName.substring(0, displayName.lastIndexOf('.')) : displayName;
+    final cleanBaseNorm = cleanBase.replaceAll('_', ' ');
+    final cleanBaseUnderscore = cleanBase.replaceAll(' ', '_');
 
     var targetCandidates = effectiveCandidates.where((candidate) {
       final msgText = (candidate['message'] as String? ?? '').toLowerCase().trim();
       if (msgText.startsWith('reacted ') || msgText.startsWith('reacted to ')) return false;
+
+      // ── CALL NOTIFICATION EXCLUSION ─────────────────────────────────────
+      // "Missed voice call" contains "voice", which previously matched
+      // the audio media check below. Call notifications are NOT messages
+      // and must NEVER have media attached to them.
+      if (msgText.contains('call') && (msgText.contains('missed') || msgText.contains('incoming') ||
+          msgText.contains('ongoing') || msgText.contains('ringing') || msgText.contains('ended'))) {
+        return false;
+      }
+      if (msgText == 'voice call' || msgText == 'video call' || msgText == 'group call') {
+        return false;
+      }
+
+      final matchesBase = cleanBase.length >= 3 && (
+        msgText.contains(cleanBase) ||
+        msgText.contains(cleanBaseNorm) ||
+        msgText.contains(cleanBaseUnderscore) ||
+        (displayName.isNotEmpty && msgText.contains(displayName))
+      );
       
-      if (mediaType == 'image' && (msgText.contains('photo') || msgText.contains('image') || msgText.contains('📷') || msgText.contains('🖼') || msgText.contains('sticker') || msgText.contains('gif') || msgText.contains('👾') || msgText.contains('💟') || displayName.startsWith('stk-') || msgText.isEmpty)) {
+      if (mediaType == 'image' && (msgText.contains('photo') || msgText.contains('image') || msgText.contains('📷') || msgText.contains('🖼') || msgText.contains('sticker') || msgText.contains('gif') || msgText.contains('👾') || msgText.contains('💟') || displayName.startsWith('stk-') || matchesBase || msgText.isEmpty)) {
         return true;
-      } else if (mediaType == 'video' && (msgText.contains('video') || msgText.contains('📹') || msgText.contains('🎥') || msgText.contains('🎞') || msgText.contains('gif') || msgText.isEmpty)) {
+      } else if (mediaType == 'video' && (msgText.contains('video') || msgText.contains('📹') || msgText.contains('🎥') || msgText.contains('🎞') || msgText.contains('gif') || matchesBase || msgText.isEmpty)) {
         return true;
-      } else if (mediaType == 'audio' && (msgText.contains('audio') || msgText.contains('voice') || msgText.contains('🎤') || msgText.contains('🎵') || msgText.contains('🎙') || msgText.isEmpty)) {
+      } else if (mediaType == 'audio' && (msgText.contains('audio') || msgText.contains('voice') || msgText.contains('🎤') || msgText.contains('🎵') || msgText.contains('🎙') || matchesBase || msgText.isEmpty)) {
         return true;
       } else if (mediaType == 'document') {
         if (msgText.contains('document') || msgText.contains('📄') || msgText.contains('📎') || msgText.contains('file') ||
             msgText.contains('.pdf') || msgText.contains('.doc') || msgText.contains('.csv') || msgText.contains('.xls') ||
             msgText.contains('.txt') || msgText.contains('.ppt') || msgText.contains('.zip') ||
-            (cleanBase.length >= 3 && msgText.contains(cleanBase)) || msgText.isEmpty) {
+            matchesBase || msgText.isEmpty) {
           return true;
         }
       }
@@ -63,21 +87,38 @@ class TimestampMatcher {
       return MatchResult.matched(targetCandidates.first);
     }
 
-    // Multiple candidates found, calculate absolute deltas
+    // Multiple candidates found:
+    // Tier 1: Candidate message contains the specific filename/cleanBase
+    // Tier 2: Absolute timestamp delta proximity
     final sortedCandidates = List<Map<String, dynamic>>.from(targetCandidates);
     sortedCandidates.sort((a, b) {
+      final msgA = (a['message'] as String? ?? '').toLowerCase();
+      final msgB = (b['message'] as String? ?? '').toLowerCase();
+
+      final aHasName = cleanBase.length >= 3 && (
+        msgA.contains(cleanBase) ||
+        msgA.contains(cleanBaseNorm) ||
+        msgA.contains(cleanBaseUnderscore) ||
+        (displayName.isNotEmpty && msgA.contains(displayName))
+      );
+      final bHasName = cleanBase.length >= 3 && (
+        msgB.contains(cleanBase) ||
+        msgB.contains(cleanBaseNorm) ||
+        msgB.contains(cleanBaseUnderscore) ||
+        (displayName.isNotEmpty && msgB.contains(displayName))
+      );
+
+      if (aHasName && !bHasName) return -1;
+      if (!aHasName && bHasName) return 1;
+
       final int tsA = a['timestamp'] as int;
       final int tsB = b['timestamp'] as int;
       
-      // We expect file timestamp to be AFTER message timestamp (due to download time)
-      // but absolute delta is safest for handling clock skew.
       final deltaA = (tsA - fileTimestampMs).abs();
       final deltaB = (tsB - fileTimestampMs).abs();
       return deltaA.compareTo(deltaB);
     });
 
-    // Since fulfilled candidates are now filtered out by getRecentWhatsAppMessages,
-    // we can safely take the best remaining match even if multiple messages arrived at the exact same time (e.g. photo albums).
     return MatchResult.matched(sortedCandidates[0]);
   }
 }

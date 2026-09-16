@@ -376,7 +376,7 @@ class DatabaseHelper {
     final db = await database;
     final result = await db.query(
       'messages',
-      where: 'sender = ? AND mediaPath IS NOT NULL AND mediaPath != ""',
+      where: 'sender = ? AND mediaPath IS NOT NULL AND mediaPath != \'\'',
       whereArgs: [sender],
       orderBy: 'timestamp DESC',
     );
@@ -401,7 +401,7 @@ class DatabaseHelper {
   Future<Map<String, int>> getChatStatsSummary(String sender) async {
     final db = await database;
     final totalResult = await db.rawQuery('SELECT COUNT(*) as count FROM messages WHERE sender = ? AND isDeleted = 0', [sender]);
-    final mediaResult = await db.rawQuery('SELECT COUNT(*) as count FROM messages WHERE sender = ? AND isDeleted = 0 AND mediaPath IS NOT NULL AND mediaPath != ""', [sender]);
+    final mediaResult = await db.rawQuery('SELECT COUNT(*) as count FROM messages WHERE sender = ? AND isDeleted = 0 AND mediaPath IS NOT NULL AND mediaPath != \'\'', [sender]);
     
     int totalCount = totalResult.isNotEmpty ? totalResult.first['count'] as int : 0;
     int mediaCount = mediaResult.isNotEmpty ? mediaResult.first['count'] as int : 0;
@@ -412,12 +412,47 @@ class DatabaseHelper {
     };
   }
 
+  /// Get message counts per member for a group conversation.
+  /// Returns a Map of memberName -> messageCount.
+  Future<Map<String, int>> getGroupMemberMessageCounts(String sender) async {
+    final db = await database;
+    final result = await db.rawQuery('''
+      SELECT 
+        COALESCE(NULLIF(TRIM(senderName), ''), sender) as memberName, 
+        COUNT(*) as count 
+      FROM messages 
+      WHERE sender = ? AND isDeleted = 0 
+      GROUP BY COALESCE(NULLIF(TRIM(senderName), ''), sender)
+      ORDER BY count DESC, memberName COLLATE NOCASE ASC
+    ''', [sender]);
+
+    final Map<String, int> counts = {};
+    for (final row in result) {
+      final member = row['memberName'] as String?;
+      final count = row['count'] as int? ?? 0;
+      if (member != null && member.trim().isNotEmpty) {
+        counts[member.trim()] = count;
+      }
+    }
+    return counts;
+  }
+
+  /// Check whether a conversation has any group chat messages.
+  Future<bool> isGroupChat(String sender) async {
+    final db = await database;
+    final result = await db.rawQuery(
+      'SELECT 1 FROM messages WHERE sender = ? AND isGroupChat = 1 LIMIT 1',
+      [sender],
+    );
+    return result.isNotEmpty;
+  }
+
   Future<List<String>> getAllTextMessages(String sender) async {
     final db = await database;
     final result = await db.query(
       'messages',
       columns: ['message'],
-      where: 'sender = ? AND isDeleted = 0 AND (mediaPath IS NULL OR mediaPath = "")',
+      where: 'sender = ? AND isDeleted = 0 AND (mediaPath IS NULL OR mediaPath = \'\')',
       whereArgs: [sender],
     );
     
@@ -663,6 +698,26 @@ class DatabaseHelper {
 
   Future<int> insertMediaAttachment(Map<String, dynamic> data) async {
     final db = await database;
+    final filePath = data['file_path'] as String?;
+    if (filePath != null && filePath.isNotEmpty) {
+      final existing = await db.query(
+        'media_attachments',
+        columns: ['id', 'matched'],
+        where: 'file_path = ?',
+        whereArgs: [filePath],
+        limit: 1,
+      );
+      if (existing.isNotEmpty) {
+        final existingId = existing.first['id'] as int;
+        await db.update(
+          'media_attachments',
+          data,
+          where: 'id = ?',
+          whereArgs: [existingId],
+        );
+        return existingId;
+      }
+    }
     return await db.insert(
       'media_attachments',
       data,
@@ -671,21 +726,80 @@ class DatabaseHelper {
   }
 
   /// Finds WhatsApp messages within [windowMs] of [fileTimestampMs] that have
-  /// no media assigned yet. Only NULL mediaPath rows are returned — any message
-  /// Finds WhatsApp messages within [windowMs] of [fileTimestampMs] that have
   /// no media assigned yet. Excludes emoji reaction messages.
+  /// Automatically decrypts message text if database encryption is enabled
+  /// so TimestampMatcher can evaluate actual content keywords.
   Future<List<Map<String, dynamic>>> getRecentWhatsAppMessages(int windowMs, int fileTimestampMs) async {
     final db = await database;
     final minTs = fileTimestampMs - windowMs;
     final maxTs = fileTimestampMs + windowMs;
-    return await db.query(
+    final rows = await db.query(
       'messages',
       where: 'app LIKE ? AND timestamp BETWEEN ? AND ? AND (mediaPath IS NULL OR mediaPath = \'\') AND (message NOT LIKE \'Reacted %\' AND message NOT LIKE \'Reacted to %\')',
       whereArgs: ['%whatsapp%', minTs, maxTs],
       orderBy: 'timestamp DESC',
     );
+    if (await _encryptionService.isEncryptionEnabled()) {
+      final decrypted = <Map<String, dynamic>>[];
+      for (final row in rows) {
+        final mutable = Map<String, dynamic>.from(row);
+        final rawMsg = mutable['message'] as String? ?? '';
+        mutable['message'] = await _encryptionService.decrypt(rawMsg);
+        decrypted.add(mutable);
+      }
+      return decrypted;
+    }
+    return rows;
   }
   
+  /// Gets distinct unmatched media attachments for reconciliation.
+  /// Automatically filters out any files that are already linked in the messages table
+  /// to prevent queue clogging.
+  Future<List<Map<String, dynamic>>> getUnmatchedMediaAttachments([String? targetSender]) async {
+    final db = await database;
+    if (targetSender != null && targetSender.trim().isNotEmpty) {
+      return await db.rawQuery('''
+        SELECT id, notification_id, media_type, file_path, original_uri, sender_name, captured_at, matched
+        FROM media_attachments
+        WHERE matched = 0
+          AND sender_name IS NOT NULL
+          AND sender_name != ''
+          AND (LOWER(sender_name) = LOWER(?) OR LOWER(sender_name) LIKE LOWER(?))
+          AND file_path NOT IN (SELECT mediaPath FROM messages WHERE mediaPath IS NOT NULL AND mediaPath != '')
+        GROUP BY file_path
+        ORDER BY captured_at DESC
+        LIMIT 100
+      ''', [targetSender.trim(), '%${targetSender.trim()}%']);
+    }
+
+    return await db.rawQuery('''
+      SELECT id, notification_id, media_type, file_path, original_uri, sender_name, captured_at, matched
+      FROM media_attachments
+      WHERE matched = 0
+        AND sender_name IS NOT NULL
+        AND sender_name != ''
+        AND file_path NOT IN (SELECT mediaPath FROM messages WHERE mediaPath IS NOT NULL AND mediaPath != '')
+      GROUP BY file_path
+      ORDER BY captured_at DESC
+      LIMIT 100
+    ''');
+  }
+
+  /// Marks all media_attachments rows with [filePath] as matched.
+  Future<int> markMediaAttachmentMatchedByPath(String filePath, [int? messageId]) async {
+    final db = await database;
+    final data = <String, dynamic>{'matched': 1};
+    if (messageId != null) {
+      data['notification_id'] = messageId;
+    }
+    return await db.update(
+      'media_attachments',
+      data,
+      where: 'file_path = ?',
+      whereArgs: [filePath],
+    );
+  }
+
   /// Gets all media attachments for a specific notification ID
   Future<List<Map<String, dynamic>>> getMediaAttachmentsForMessage(int messageId) async {
     final db = await database;
@@ -732,6 +846,24 @@ class DatabaseHelper {
     );
   }
 
+  /// Fast check: returns true if this filePath is already set as mediaPath on ANY
+  /// message in the DB. Used as an O(1) dedup guard in _checkForNewMedia() to skip
+  /// TimestampMatcher queries for files already linked natively by matchAndLinkMedia().
+  Future<bool> isMediaPathLinked(String filePath) async {
+    if (filePath.isEmpty) return false;
+    try {
+      final db = await database;
+      final result = await db.rawQuery(
+        'SELECT 1 FROM messages WHERE mediaPath = ? LIMIT 1',
+        [filePath],
+      );
+      return result.isNotEmpty;
+    } catch (e) {
+      debugPrint('[DatabaseHelper] isMediaPathLinked error: $e');
+      return false;
+    }
+  }
+
   /// Removes matched attachments that no longer have a valid message
   Future<int> cleanOrphanedMediaAttachments() async {
     final db = await database;
@@ -750,6 +882,24 @@ class DatabaseHelper {
         UPDATE messages 
         SET mediaPath = NULL 
         WHERE (message LIKE 'Reacted %' OR message LIKE 'Reacted to %') 
+          AND mediaPath IS NOT NULL 
+          AND mediaPath != ''
+      ''');
+
+      // 1b. Clear mediaPath on call notification messages (e.g. "Missed voice call")
+      // WhatsApp call notifications are NOT messages and must NEVER have media attached.
+      await db.execute('''
+        UPDATE messages 
+        SET mediaPath = NULL 
+        WHERE ((LOWER(message) LIKE '%call%' 
+                AND (LOWER(message) LIKE '%missed%' 
+                     OR LOWER(message) LIKE '%incoming%' 
+                     OR LOWER(message) LIKE '%ongoing%' 
+                     OR LOWER(message) LIKE '%ringing%' 
+                     OR LOWER(message) LIKE '%ended%'))
+               OR LOWER(message) = 'voice call'
+               OR LOWER(message) = 'video call'
+               OR LOWER(message) = 'group call')
           AND mediaPath IS NOT NULL 
           AND mediaPath != ''
       ''');
@@ -820,6 +970,25 @@ class DatabaseHelper {
           AND notification_id NOT IN (
             SELECT id FROM messages WHERE mediaPath IS NOT NULL AND mediaPath != ''
           )
+      ''');
+
+      // 4. Deduplicate redundant media_attachments entries pointing to the same file_path
+      await db.execute('''
+        DELETE FROM media_attachments 
+        WHERE id NOT IN (
+          SELECT MIN(id) 
+          FROM media_attachments 
+          GROUP BY file_path
+        )
+      ''');
+
+      // 5. Auto-sync: Mark media_attachments as matched = 1 if their file_path is already assigned in messages
+      await db.execute('''
+        UPDATE media_attachments
+        SET matched = 1,
+            notification_id = (SELECT id FROM messages WHERE mediaPath = media_attachments.file_path LIMIT 1)
+        WHERE file_path IN (SELECT mediaPath FROM messages WHERE mediaPath IS NOT NULL AND mediaPath != '')
+          AND matched = 0
       ''');
 
       debugPrint('[DatabaseHelper] Completed cleanupCorruptedMediaLinks');

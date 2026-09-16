@@ -35,6 +35,11 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   int _totalMessageCount = 0;
   bool _hasFetchedAllMessagesForSearch = false;
   bool _isLoading = true;
+  // Prevents concurrent _loadMessages() calls from piling up.
+  // Without this guard, rapid newMessageNotifier events (e.g. receiving several
+  // WhatsApp messages at once) could trigger multiple simultaneous full DB reads,
+  // causing SQLite lock errors and Dart heap spikes on large group chats.
+  bool _isLoadingMessages = false;
   bool _isGroupChat = false;
   String? _avatarPath;
   String? _avatarsDir; // For looking up sender-specific avatars in groups
@@ -44,6 +49,43 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   
   List<String> _groupMembers = [];
   final Set<String> _selectedSenders = {};
+  Map<String, int> _groupMemberCounts = {};
+
+  int _getMemberCount(String name) {
+    if (_groupMemberCounts.containsKey(name)) {
+      return _groupMemberCounts[name]!;
+    }
+    final cleanName = name.toLowerCase().trim();
+    if (cleanName.isEmpty) return 0;
+    
+    // 1. Case-insensitive exact match
+    for (final entry in _groupMemberCounts.entries) {
+      if (entry.key.toLowerCase().trim() == cleanName) {
+        return entry.value;
+      }
+    }
+    
+    // 2. Prefix/first name match (e.g. "Hammad" matches "Hammad Tahir")
+    for (final entry in _groupMemberCounts.entries) {
+      final entryKey = entry.key.toLowerCase().trim();
+      if (entryKey.startsWith('$cleanName ') || cleanName.startsWith('$entryKey ')) {
+        return entry.value;
+      }
+    }
+    
+    return 0;
+  }
+
+  int get _selectedSendersSum {
+    if (_selectedSenders.isEmpty) {
+      return _totalMessageCount;
+    }
+    int sum = 0;
+    for (final sender in _selectedSenders) {
+      sum += _getMemberCount(sender);
+    }
+    return sum;
+  }
   
   // Highlighting and scrolling
   String _searchQuery = '';
@@ -105,6 +147,11 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   }
 
   Future<void> _loadMessages({bool isSilent = false}) async {
+    // Prevent concurrent loads — critical for large group chats where a single
+    // load can take hundreds of milliseconds and new message events arrive rapidly.
+    if (_isLoadingMessages) return;
+    _isLoadingMessages = true;
+    try {
     if (!isSilent) {
       setState(() {
         _isLoading = true;
@@ -113,14 +160,57 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
 
     // Mark all messages as read when opening the conversation
     await DatabaseHelper.instance.markMessagesAsRead(widget.sender);
+
+    // Auto-reconcile any pending media files captured for this sender
+    NotificationService.instance.reconcileUnmatchedMedia(widget.sender).then((linked) {
+      if (linked > 0 && mounted) {
+        _loadMessages(isSilent: true);
+      }
+    });
     
-    final messages = await DatabaseHelper.instance.getMessagesBySender(widget.sender, limit: _pageSize, offset: 0);
+    bool isGroup = await DatabaseHelper.instance.isGroupChat(widget.sender);
+    
+    List<MessageModel> messages;
+    Map<String, int> memberCounts = {};
+    List<String> allGroupSenders = [];
+
+    if (isGroup) {
+      // For group chats, load all messages at once efficiently following professional practice
+      messages = await DatabaseHelper.instance.getMessagesBySender(widget.sender);
+      _hasMore = false;
+      _hasFetchedAllMessagesForSearch = true;
+
+      memberCounts = await DatabaseHelper.instance.getGroupMemberMessageCounts(widget.sender);
+      allGroupSenders = memberCounts.keys.toList();
+      allGroupSenders.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    } else {
+      messages = await DatabaseHelper.instance.getMessagesBySender(widget.sender, limit: _pageSize, offset: 0);
+      isGroup = messages.any((msg) => msg.isGroupChat == true);
+      if (isGroup) {
+        // If detected as group chat from loaded messages, load all at once
+        messages = await DatabaseHelper.instance.getMessagesBySender(widget.sender);
+        _hasMore = false;
+        _hasFetchedAllMessagesForSearch = true;
+
+        memberCounts = await DatabaseHelper.instance.getGroupMemberMessageCounts(widget.sender);
+        allGroupSenders = memberCounts.keys.toList();
+        allGroupSenders.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+      } else {
+        _hasMore = messages.length >= _pageSize;
+        allGroupSenders = messages.map((m) => m.senderName ?? m.sender).toSet().toList();
+        allGroupSenders.sort();
+      }
+    }
+
+    // Ensure any senders present in loaded messages are included in member list
+    for (final m in messages) {
+      final name = m.senderName ?? m.sender;
+      if (name.isNotEmpty && !allGroupSenders.contains(name)) {
+        allGroupSenders.add(name);
+      }
+    }
+
     final stats = await DatabaseHelper.instance.getChatStatsSummary(widget.sender);
-    
-    _hasMore = messages.length >= _pageSize;
-    
-    // Determine if this is a group chat (any message has isGroupChat = true)
-    final isGroup = messages.any((msg) => msg.isGroupChat == true);
     
     // Get the most recent avatarPath (from any message that has one)
     String? latestAvatarPath;
@@ -143,16 +233,14 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
         }
       }
     }
-    
-    final allGroupSenders = messages.map((m) => m.senderName ?? m.sender).toSet().toList();
-    allGroupSenders.sort();
 
     if (mounted) {
       setState(() {
         _messages = messages;
-        _totalMessageCount = stats['total'] ?? 0;
+        _totalMessageCount = stats['total'] ?? messages.length;
         _isGroupChat = isGroup;
         _groupMembers = allGroupSenders;
+        _groupMemberCounts = memberCounts;
         _avatarPath = latestAvatarPath;
         _isLoading = false;
         
@@ -163,10 +251,14 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
         }
       });
     }
+    } finally {
+      // Always release the load guard so subsequent events can trigger a reload
+      _isLoadingMessages = false;
+    }
   }
 
   Future<void> _loadMoreMessages() async {
-    if (_isLoadingMore || !_hasMore) return;
+    if (_isGroupChat || _isLoadingMore || !_hasMore) return;
     if (mounted) {
       setState(() { _isLoadingMore = true; });
     }
@@ -190,7 +282,17 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     var activeMessages = _messages.where((msg) => msg.isDeleted != true).toList();
     
     if (_selectedSenders.isNotEmpty) {
-      activeMessages = activeMessages.where((msg) => _selectedSenders.contains(msg.senderName ?? msg.sender)).toList();
+      activeMessages = activeMessages.where((msg) {
+        final rawSender = msg.senderName ?? msg.sender;
+        final cleanRaw = rawSender.toLowerCase().trim();
+        return _selectedSenders.contains(rawSender) ||
+               _selectedSenders.any((s) {
+                 final cleanS = s.toLowerCase().trim();
+                 return cleanS == cleanRaw ||
+                        cleanRaw.startsWith('$cleanS ') ||
+                        cleanS.startsWith('$cleanRaw ');
+               });
+      }).toList();
     }
     
     // Deduplicate — include mediaPath in key so a "📷 Photo" message with a
@@ -405,10 +507,28 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                               itemBuilder: (context, index) {
                                 final member = filteredMembers[index];
                                 final isSelected = _selectedSenders.contains(member);
+                                final memberCount = _getMemberCount(member);
                                 return CheckboxListTile(
                                   contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
                                   secondary: _buildSenderAvatar(member, _getSenderColor(member)),
-                                  title: Text(member, style: const TextStyle(color: Colors.white, fontSize: 16)),
+                                  title: Text.rich(
+                                    TextSpan(
+                                      text: member,
+                                      style: const TextStyle(color: Colors.white, fontSize: 16),
+                                      children: [
+                                        if (_isGroupChat)
+                                          TextSpan(
+                                            text: ' ($memberCount)',
+                                            style: TextStyle(
+                                              color: Colors.grey.shade400,
+                                              fontSize: 14,
+                                              fontWeight: FontWeight.normal,
+                                            ),
+                                          ),
+                                      ],
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
                                   value: isSelected,
                                   activeColor: Colors.orangeAccent,
                                   checkColor: Colors.black,
@@ -736,7 +856,9 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                                   if (_messages.isNotEmpty) ...[
                                     Flexible(
                                       child: Text(
-                                        ' • $_totalMessageCount messages (${_displayItems.where((item) => !item.isHeader).length})',
+                                        _selectedSenders.isNotEmpty
+                                            ? ' • $_selectedSendersSum ${_selectedSendersSum == 1 ? 'message' : 'messages'}'
+                                            : ' • $_totalMessageCount ${_totalMessageCount == 1 ? 'message' : 'messages'}',
                                         style: TextStyle(
                                           fontSize: 12,
                                           color: Colors.grey.shade400,
@@ -1295,7 +1417,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           // Sender name header for group chats
-          if (showSenderHeader)
+          if (showSenderHeader) ...[
             Padding(
               padding: const EdgeInsets.only(left: 4, bottom: 6),
               child: Row(
@@ -1313,6 +1435,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                 ],
               ),
             ),
+          ],
           // Message bubble — long press to select
           GestureDetector(
             onLongPress: () {
@@ -1417,14 +1540,25 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   Widget _buildMediaContent(MessageModel message, bool isCurrentMatch) {
     final isWhatsApp = message.app.toLowerCase().contains('whatsapp');
     final mediaPath = message.mediaPath;
-    final hasFile = mediaPath != null &&
+    final lowerMsg = message.message.trim().toLowerCase();
+    final isCallNotif = (lowerMsg.contains('call') && (
+      lowerMsg.contains('missed') || lowerMsg.contains('incoming') ||
+      lowerMsg.contains('ongoing') || lowerMsg.contains('ringing') || lowerMsg.contains('ended')
+    )) || lowerMsg == 'voice call' || lowerMsg == 'video call' || lowerMsg == 'group call';
+
+    final hasFile = !isCallNotif &&
+        mediaPath != null &&
         mediaPath.isNotEmpty &&
         File(mediaPath).existsSync();
-    final isMedia = isWhatsApp && _isGenericMediaLabel(message.message);
+    final isMedia = !isCallNotif && isWhatsApp && (
+      _isGenericMediaLabel(message.message) ||
+      message.message.startsWith('📄') ||
+      message.message.startsWith('📎')
+    );
 
     if (hasFile) {
       // ── Case 1: We have the actual captured image ─────────────────────
-      final isGeneric = _isGenericMediaLabel(message.message);
+      final isGeneric = _isGenericMediaLabel(message.message, mediaPath);
       final hasCaption = !isGeneric && message.message.trim().isNotEmpty;
 
       return Column(
@@ -1433,7 +1567,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
           _buildRealImage(message, mediaPath),
           if (hasCaption) ...[
             const SizedBox(height: 6),
-            _buildHighlightText(_sanitizeText(message.message), isCurrentMatch),
+            _buildHighlightText(_sanitizeText(_cleanDocumentCaption(message.message)), isCurrentMatch),
           ],
           const SizedBox(height: 8),
         ],
@@ -1908,16 +2042,24 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   // ══════════════════════════════════════════════════════════════════════
 
   /// Returns true if [text] is a generic notification label that adds no
-  /// meaningful information when a media image is already shown, OR when we
+  /// meaningful information when a media image/document is already shown, OR when we
   /// want to show a media placeholder instead of raw text.
-  bool _isGenericMediaLabel(String text) {
+  bool _isGenericMediaLabel(String text, [String? mediaPath]) {
     final lower = text.trim().toLowerCase();
+    // Call notifications are NOT media labels
+    if (lower.contains('call') && (lower.contains('missed') || lower.contains('incoming') ||
+        lower.contains('ongoing') || lower.contains('ringing') || lower.contains('ended'))) {
+      return false;
+    }
+    if (lower == 'voice call' || lower == 'video call' || lower == 'group call') return false;
+
     // Exact label matches (WhatsApp notification text)
     const labels = {
       'photo', 'image', 'video', 'sticker', 'gif',
       'image omitted', 'video omitted', 'audio omitted', 'sticker omitted',
       'voice message', 'voice message omitted', 'audio',
       'contact card', 'location', 'live location',
+      'document', 'document omitted', 'file',
     };
     if (labels.contains(lower)) return true;
 
@@ -1926,6 +2068,21 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                            '🗺', '📍', '👤', '🎥', '🖼', '🎙'];
     for (final p in emojiPrefixes) {
       if (lower.startsWith(p)) return true;
+    }
+
+    // Document file summary patterns like "📄 filename.pdf (1 page)" or "📄 Document"
+    if (lower.startsWith('📄') || lower.startsWith('📎')) {
+      final withoutEmoji = lower.replaceFirst(RegExp(r'^[📄📎]\s*'), '').trim();
+      if (withoutEmoji.isEmpty || withoutEmoji == 'document' || withoutEmoji == 'file') return true;
+      // Ends with (N page) or (N pages)
+      if (RegExp(r'\([^)]*page[s]?\)$').hasMatch(withoutEmoji)) return true;
+      // If a media file is attached, check if withoutEmoji is just the file's name
+      if (mediaPath != null) {
+        final fName = mediaPath.split(Platform.pathSeparator).last.toLowerCase();
+        final fBase = fName.contains('.') ? fName.substring(0, fName.lastIndexOf('.')) : fName;
+        final fBaseNorm = fBase.replaceAll('_', ' ');
+        if (withoutEmoji == fName || withoutEmoji == fBase || withoutEmoji == fBaseNorm) return true;
+      }
     }
 
     // WhatsApp business/group media patterns: "Name: 📷 Photo" or "Name: image"
@@ -1941,8 +2098,25 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     return false;
   }
 
+  /// Cleans redundant WhatsApp document prefixes from user captions
+  String _cleanDocumentCaption(String caption) {
+    if (caption.startsWith('📄') || caption.startsWith('📎')) {
+      final cleaned = caption.replaceFirst(RegExp(r'^[📄📎]\s*'), '').trim();
+      if (cleaned.isNotEmpty) return cleaned;
+    }
+    return caption;
+  }
+
   _MediaTypeInfo _mediaTypeInfo(String rawLabel) {
     final lower = rawLabel.trim().toLowerCase();
+    if (lower.contains('call')) {
+      final isVideo = lower.contains('video');
+      return _MediaTypeInfo(
+        icon: isVideo ? Icons.videocam_off_rounded : Icons.phone_missed_rounded,
+        color: Colors.red.shade400,
+        label: isVideo ? 'Missed Video Call' : 'Missed Call',
+      );
+    }
     if (lower.contains('voice') || lower.contains('audio') ||
         lower.contains('🎤') || lower.contains('🎵') || lower.contains('🎙')) {
       return _MediaTypeInfo(
@@ -1965,11 +2139,13 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
         label: 'Sticker / GIF',
       );
     }
-    if (lower.contains('document') || lower.contains('file') || lower.contains('📄') || lower.contains('📎')) {
+    if (lower.contains('document') || lower.contains('file') || lower.contains('📄') || lower.contains('📎') ||
+        lower.contains('.pdf') || lower.contains('.doc') || lower.contains('.xls') || lower.contains('.csv')) {
+      final isPdf = lower.contains('.pdf');
       return _MediaTypeInfo(
-        icon: Icons.insert_drive_file_rounded,
-        color: Colors.teal.shade300,
-        label: 'Document',
+        icon: isPdf ? Icons.picture_as_pdf_rounded : Icons.insert_drive_file_rounded,
+        color: isPdf ? Colors.red.shade400 : Colors.teal.shade300,
+        label: isPdf ? 'PDF Document' : 'Document',
       );
     }
     if (lower.contains('location') || lower.contains('🗺') || lower.contains('📍')) {

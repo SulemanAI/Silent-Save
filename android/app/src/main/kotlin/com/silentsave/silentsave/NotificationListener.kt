@@ -77,6 +77,48 @@ class NotificationListener : NotificationListenerService() {
             Regex("^WhatsApp Web.*$", RegexOption.IGNORE_CASE),
             Regex("^End-to-end encrypted$", RegexOption.IGNORE_CASE)
         )
+
+        /**
+         * CALL NOTIFICATION PATTERNS — these are NOT messages, they are call
+         * events. They must NEVER be saved to the database and must NEVER have
+         * media attached. The word "voice" in "Missed voice call" was being
+         * matched by audio media heuristics, causing spurious Voice Note
+         * widgets on call notifications. This set catches all known variants.
+         */
+        private val CALL_PATTERNS = listOf(
+            Regex("^Missed (voice|video) call$", RegexOption.IGNORE_CASE),
+            Regex("^Incoming (voice|video) call$", RegexOption.IGNORE_CASE),
+            Regex("^Ongoing (voice|video) call$", RegexOption.IGNORE_CASE),
+            Regex("^Ringing\\.{0,3}$", RegexOption.IGNORE_CASE),
+            Regex("^(Voice|Video) call$", RegexOption.IGNORE_CASE),
+            Regex("^Missed call$", RegexOption.IGNORE_CASE),
+            Regex("^Calling\\.{0,3}$", RegexOption.IGNORE_CASE),
+            Regex("^Call ended$", RegexOption.IGNORE_CASE),
+            Regex("^Group call$", RegexOption.IGNORE_CASE),
+            Regex("^Missed group (voice|video) call$", RegexOption.IGNORE_CASE)
+        )
+
+        /**
+         * Fast O(1) check for common call keywords. Used as a first-pass filter
+         * before the more expensive regex patterns. Covers all languages WhatsApp
+         * uses (the regex handles English; other languages fall through to the
+         * keyword check).
+         */
+        fun isCallNotification(text: String): Boolean {
+            val trimmed = text.trim()
+            if (trimmed.isEmpty()) return false
+            // Fast regex match against known exact call patterns
+            if (CALL_PATTERNS.any { it.matches(trimmed) }) return true
+            // Keyword fallback: if the text is short AND contains call + voice/video
+            if (trimmed.length <= 40) {
+                val lower = trimmed.lowercase()
+                val hasCall = lower.contains("call")
+                val hasVoiceVideo = lower.contains("voice") || lower.contains("video")
+                val hasMissedIncomingOngoing = lower.contains("missed") || lower.contains("incoming") || lower.contains("ongoing") || lower.contains("ringing")
+                if (hasCall && (hasVoiceVideo || hasMissedIncomingOngoing)) return true
+            }
+            return false
+        }
         
         // Regex to strip WhatsApp's dynamic unread count suffix from group titles
         // Matches patterns like: " (5 messages)", " (2 new messages)", " (12 messages)"
@@ -360,11 +402,12 @@ class NotificationListener : NotificationListenerService() {
                     setReferenceCounted(false)
                 }
             }
-            // 25-minute timeout — continuously renewed on each notification
-            // so it never expires as long as notifications keep arriving.
-            // When notifications stop, the lock auto-releases after 25 min
-            // (the KeepAliveService has its own perpetual lock as backup).
-            wakeLock?.acquire(25 * 60 * 1000L)
+            // 5-minute timeout, continuously renewed on each notification so it
+            // never expires while messages are actively arriving.
+            // When notifications stop, the lock auto-releases after 5 minutes,
+            // allowing the phone to sleep normally and preventing the OEM battery
+            // manager from force-killing the process due to excessive WakeLock hold.
+            wakeLock?.acquire(5 * 60 * 1000L)
         } catch (e: Exception) {
             Log.w(TAG, "WakeLock acquire failed: ${e.message}")
         }
@@ -527,6 +570,18 @@ class NotificationListener : NotificationListenerService() {
             if (title.isBlank() || 
                 title.equals("WhatsApp", ignoreCase = true) || 
                 title.equals("WhatsApp Business", ignoreCase = true)) {
+                return false
+            }
+            
+            // ── CALL NOTIFICATION FILTER ──────────────────────────────────
+            // WhatsApp call notifications (Missed/Incoming/Ongoing voice/video call)
+            // are NOT messages. They must NEVER be saved or have media attached.
+            // The word "voice" in "Missed voice call" was causing audio media
+            // to be erroneously linked. This is the primary, earliest filter.
+            val notifText = extras.getCharSequence("android.text")?.toString()?.trim() ?: ""
+            val bigText = extras.getCharSequence("android.bigText")?.toString()?.trim() ?: ""
+            if (isCallNotification(notifText) || isCallNotification(bigText) || isCallNotification(title)) {
+                Log.d(TAG, "Skipping call notification: title='$title' text='${notifText.take(50)}'")
                 return false
             }
         } else {
@@ -948,14 +1003,47 @@ class NotificationListener : NotificationListenerService() {
      *   2nd post  → BigPicture arrives, but the message is now a duplicate so
      *               toSave is empty and the picture would otherwise be discarded.
      *
-     * By writing to media_queue.json, Flutter's _checkForNewMedia() picks it up
-     * and calls updateMessageMediaPath() on the matched row.
+     * ZERO-TOUCH FIX:
+     * Previously this ONLY wrote to media_queue.json — which requires Flutter to be
+     * in the foreground to process. This broke zero-touch: if the user never opened
+     * the app, the BigPicture was never linked.
+     *
+     * Now we call matchAndLinkMedia() natively FIRST (full background, no Flutter needed),
+     * then also write to media_queue.json as a fallback to trigger a Flutter UI refresh
+     * if the app happens to be open.
      */
     private fun enqueuePictureToMediaQueue(picturePath: String, timestampMs: Long, targetSender: String? = null) {
         try {
             val pictureFile = File(picturePath)
             if (!pictureFile.exists() || pictureFile.length() == 0L) return
 
+            // ── PRIMARY: Native background linking (zero-touch, works without Flutter open) ──
+            // Attempt to link the BigPicture directly to the existing message row in SQLite.
+            // This is the same path used by MediaWatcherService for SAF-captured files,
+            // and it works completely in the background — the user never needs to open the app.
+            try {
+                val linked = nativeDb?.matchAndLinkMedia(
+                    fileName = pictureFile.name,
+                    mediaPath = picturePath,
+                    mediaType = "image",
+                    fileTimestamp = timestampMs,
+                    originalUri = "bigpicture://$picturePath",
+                    fileSizeBytes = pictureFile.length(),
+                    targetSender = targetSender
+                ) == true
+                if (linked) {
+                    Log.i(TAG, "✓ BigPicture natively linked in background (zero-touch): ${pictureFile.name} → $targetSender")
+                    // Still write to JSON queue so Flutter UI refreshes if the app is open
+                } else {
+                    Log.d(TAG, "BigPicture native link failed (will retry via JSON queue): ${pictureFile.name}")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "BigPicture native link error: ${e.message}")
+            }
+
+            // ── SECONDARY: JSON queue fallback (Flutter foreground path) ──
+            // Kept as a safety net: if native linking failed (e.g. message not yet in DB
+            // at the time of the 2nd notification), Flutter will process it on next open.
             val mediaQueueFile = File(applicationContext.filesDir, "media_queue.json")
             val lockFile = File(mediaQueueFile.absolutePath + ".lock")
             lockFile.createNewFile()
@@ -987,7 +1075,7 @@ class NotificationListener : NotificationListenerService() {
                     }
                 }
             }
-            Log.d(TAG, "BigPicture enqueued to media_queue for TimestampMatcher: ${pictureFile.name}")
+            Log.d(TAG, "BigPicture enqueued to media_queue (Flutter fallback): ${pictureFile.name}")
         } catch (e: Exception) {
             Log.e(TAG, "enqueuePictureToMediaQueue failed: ${e.message}")
         }
@@ -1104,6 +1192,15 @@ class NotificationListener : NotificationListenerService() {
                 }
                 
                 val rawMsgText = bundle.getCharSequence("text")?.toString()
+
+                // ── CALL NOTIFICATION GUARD ────────────────────────────────
+                // If the message text IS a call notification (e.g. "Missed voice call"),
+                // skip it entirely — it's not a message and must never get media.
+                if (rawMsgText != null && isCallNotification(rawMsgText)) {
+                    Log.d(TAG, "Skipping call notification in MessagingStyle: '$rawMsgText'")
+                    continue
+                }
+
                 // If message body text is blank but media is present (or media URI/MIME type indicated), provide appropriate label
                 val msgText = if (rawMsgText.isNullOrBlank()) {
                     if (perMessageMediaPath != null || mediaPicturePath != null || msgDataUri != null || msgMimeType != null) {
@@ -1116,6 +1213,13 @@ class NotificationListener : NotificationListenerService() {
                     } else {
                         // Check if top-level notification text has a media label
                         val topText = extras.getCharSequence("android.text")?.toString() ?: ""
+                        // ── CRITICAL: Check for call text BEFORE keyword matching ──
+                        // "Missed voice call" contains "voice", which previously matched
+                        // the audio branch below and created a phantom "Voice Message".
+                        if (isCallNotification(topText)) {
+                            Log.d(TAG, "Skipping call notification from topText: '$topText'")
+                            continue
+                        }
                         val topLower = topText.lowercase()
                         when {
                             topLower.contains("photo") || topLower.contains("📷") || topLower.contains("image") -> "Photo"
@@ -1126,10 +1230,15 @@ class NotificationListener : NotificationListenerService() {
                         }
                     }
                 } else {
+                    // Non-blank text — but still check if it's a call notification
+                    if (isCallNotification(rawMsgText)) {
+                        Log.d(TAG, "Skipping call notification text: '$rawMsgText'")
+                        continue
+                    }
                     rawMsgText
                 }
 
-                if (isCountSummaryMessage(msgText)) continue
+                if (isCountSummaryMessage(msgText) || isSummaryMessage(msgText)) continue
                 
                 hadValidMessages = true
                 
@@ -1373,6 +1482,14 @@ class NotificationListener : NotificationListenerService() {
 
         if (text.isBlank() || isCountSummaryMessage(text)) return 0
         
+        // ── CALL + SUMMARY GUARD ──────────────────────────────────────
+        // Reject call notifications and system summaries that reached this
+        // fallback path. "Missed voice call" must never be saved as a message.
+        if (isCallNotification(text) || isSummaryMessage(text)) {
+            Log.d(TAG, "processSingleMessage: skipping call/summary: '${text.take(40)}'")
+            return 0
+        }
+        
         // Instagram with title="Instagram": extract sender from text
         if (packageName == INSTAGRAM_PACKAGE && title.equals("Instagram", ignoreCase = true)) {
             val (sender, message) = extractSenderFromText(text, title, false)
@@ -1547,7 +1664,7 @@ class NotificationListener : NotificationListenerService() {
         // Trigger zero-touch media scan for WhatsApp messages
         if (packageName == WHATSAPP_PACKAGE || packageName == WHATSAPP_BUSINESS_PACKAGE) {
             val hint = determineMediaSubdirHint(text, packageName == WHATSAPP_BUSINESS_PACKAGE)
-            MediaWatcherService.triggerImmediateScan(applicationContext, hint, "notification_saved")
+            MediaWatcherService.triggerImmediateScan(applicationContext, hint, "notification_saved", targetSender = title)
         }
         
         // ── SECONDARY STORAGE: Throttled JSON queue for Flutter UI refresh ──
@@ -1646,9 +1763,19 @@ class NotificationListener : NotificationListenerService() {
                 )
             }
             dbInserted = nativeDb?.insertMessagesBatch(dbMessages) ?: 0
-            val waNotif = notifications.firstOrNull { it.optString("packageName") in listOf(WHATSAPP_PACKAGE, WHATSAPP_BUSINESS_PACKAGE) }
-            if (waNotif != null) {
-                MediaWatcherService.triggerImmediateScan(applicationContext, null, "batch_saved", targetSender = waNotif.optString("title"))
+            // Trigger immediate SAF scan for ALL distinct WhatsApp senders in
+            // the batch — not just the first one. Previously only the first
+            // WA notification triggered a scan, so media for other senders in
+            // the same batch was missed until the next periodic scan (60s).
+            val waNotifs = notifications.filter { it.optString("packageName") in listOf(WHATSAPP_PACKAGE, WHATSAPP_BUSINESS_PACKAGE) }
+            val scannedSenders = mutableSetOf<String>()
+            for (waNotif in waNotifs) {
+                val sender = waNotif.optString("title", "")
+                if (sender.isNotEmpty() && scannedSenders.add(sender)) {
+                    val isBiz = waNotif.optString("packageName") == WHATSAPP_BUSINESS_PACKAGE
+                    val hint = determineMediaSubdirHint(waNotif.optString("text"), isBiz)
+                    MediaWatcherService.triggerImmediateScan(applicationContext, hint, "batch_saved", targetSender = sender)
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Native DB batch insert error: ${e.message}")

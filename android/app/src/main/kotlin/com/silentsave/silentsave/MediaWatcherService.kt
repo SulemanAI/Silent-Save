@@ -61,6 +61,11 @@ class MediaWatcherService : Service() {
          * and copying media even if the screen is off or the app is backgrounded.
          * Automatically released early as soon as the media matches.
          */
+        @Volatile
+        var latestActiveSender: String? = null
+        @Volatile
+        var latestActiveSenderTime: Long = 0L
+
         fun triggerImmediateScan(
             context: Context, 
             hintSubdir: String? = null, 
@@ -68,6 +73,10 @@ class MediaWatcherService : Service() {
             targetSender: String? = null
         ) {
             Log.i(TAG, "triggerImmediateScan: hint=$hintSubdir reason=$reason targetSender=$targetSender")
+            if (!targetSender.isNullOrBlank()) {
+                latestActiveSender = targetSender
+                latestActiveSenderTime = System.currentTimeMillis()
+            }
             val treeUri = getPersistedUri(context) ?: run {
                 Log.w(TAG, "triggerImmediateScan: No SAF URI persisted")
                 return
@@ -214,7 +223,9 @@ class MediaWatcherService : Service() {
     override fun onDestroy() {
         if (instance == this) instance = null
         Log.w(TAG, "onDestroy — unregistering observers")
-        burstScanRunnables.forEach { ioHandler.removeCallbacks(it) }
+        burstScanRunnables.values.forEach { list ->
+            list.forEach { ioHandler.removeCallbacks(it) }
+        }
         burstScanRunnables.clear()
         stopPeriodicScan()
         unregisterObservers()
@@ -226,14 +237,23 @@ class MediaWatcherService : Service() {
 
     // ── Burst scans ────────────────────────────────────────────────────────
 
-    private val burstScanRunnables = mutableListOf<Runnable>()
+    // Tracks pending burst runnables per sender so scans for Sender A are not
+    // cancelled when a notification from Sender B arrives.
+    private val burstScanRunnables = java.util.concurrent.ConcurrentHashMap<String, MutableList<Runnable>>()
     private val subdirUriMap = java.util.concurrent.ConcurrentHashMap<String, Uri>()
 
-    fun cancelBurstScans() {
-        burstScanRunnables.forEach { ioHandler.removeCallbacks(it) }
-        burstScanRunnables.clear()
+    fun cancelBurstScans(targetSender: String? = null) {
+        val key = targetSender ?: "_all_"
+        if (key == "_all_") {
+            burstScanRunnables.values.forEach { list ->
+                list.forEach { ioHandler.removeCallbacks(it) }
+            }
+            burstScanRunnables.clear()
+        } else {
+            burstScanRunnables.remove(key)?.forEach { ioHandler.removeCallbacks(it) }
+        }
         try {
-            if (scanWakeLock?.isHeld == true) {
+            if (burstScanRunnables.isEmpty() && scanWakeLock?.isHeld == true) {
                 scanWakeLock?.release()
                 Log.d(TAG, "Burst scans cancelled & WakeLock released early")
             }
@@ -241,21 +261,45 @@ class MediaWatcherService : Service() {
     }
 
     fun scheduleBurstScans(treeUri: Uri, hintSubdir: String? = null, targetSender: String? = null) {
-        burstScanRunnables.forEach { ioHandler.removeCallbacks(it) }
-        burstScanRunnables.clear()
+        val senderKey = targetSender ?: "_global_"
 
-        // 7-step exponential backoff (0s to 40s): covers real-world download latency
-        // while cutting scan frequency by nearly 50% compared to tight polling.
-        val delays = listOf(0L, 1200L, 3000L, 7000L, 14000L, 25000L, 40000L)
+        // Only cancel previous pending scans for THIS sender, preserving other senders' scans
+        burstScanRunnables.remove(senderKey)?.forEach { ioHandler.removeCallbacks(it) }
+
+        val runnablesForSender = mutableListOf<Runnable>()
+        burstScanRunnables[senderKey] = runnablesForSender
+
+        // 9-step backoff: 0ms, 500ms, 800ms, 1500ms, 3000ms, 7000ms, 14000ms, 25000ms, 40000ms
+        // The 500ms and 800ms steps catch instant downloads (voice notes, stickers, fast compressed photos)
+        // without waiting for the 1.5s or 3s tick.
+        val delays = listOf(0L, 500L, 800L, 1500L, 3000L, 7000L, 14000L, 25000L, 40000L)
         for (delay in delays) {
-            val runnable = Runnable {
-                Log.d(TAG, "Executing burst scan (delay=${delay}ms, hint=$hintSubdir, sender=$targetSender)")
-                if (hintSubdir != null) {
-                    scanSubdirByName(treeUri, hintSubdir, targetSender)
+            val runnable = object : Runnable {
+                override fun run() {
+                    Log.d(TAG, "Executing burst scan (delay=${delay}ms, hint=$hintSubdir, sender=$targetSender)")
+                    if (hintSubdir != null) {
+                        scanSubdirByName(treeUri, hintSubdir, targetSender)
+                    }
+                    scanAllSubdirs(treeUri, targetSender)
+                    synchronized(runnablesForSender) {
+                        runnablesForSender.remove(this)
+                        if (runnablesForSender.isEmpty()) {
+                            burstScanRunnables.remove(senderKey, runnablesForSender)
+                            if (burstScanRunnables.isEmpty()) {
+                                try {
+                                    if (scanWakeLock?.isHeld == true) {
+                                        scanWakeLock?.release()
+                                        Log.d(TAG, "All burst scans completed & WakeLock released")
+                                    }
+                                } catch (_: Exception) {}
+                            }
+                        }
+                    }
                 }
-                scanAllSubdirs(treeUri, targetSender)
             }
-            burstScanRunnables.add(runnable)
+            synchronized(runnablesForSender) {
+                runnablesForSender.add(runnable)
+            }
             if (delay == 0L) {
                 ioHandler.post(runnable)
             } else {
@@ -363,17 +407,24 @@ class MediaWatcherService : Service() {
             override fun onChange(selfChange: Boolean, uri: Uri?) {
                 Log.d(TAG, "onChange fired: '$name' (selfChange=$selfChange)")
                 val key = subdirUri.toString()
+                // Use 50s window (last burst fires at 40s + 10s buffer) to prevent a
+                // stale sender from a previous notification misattributing new media.
+                val activeSender = if (System.currentTimeMillis() - latestActiveSenderTime < 50_000L) latestActiveSender else null
                 
                 // 1. INSTANT CAPTURE: Run immediately without debounce to beat "Delete for Everyone"
-                ioHandler.post { scanSubdir(treeUri, subdirUri, name) }
+                ioHandler.post { scanSubdir(treeUri, subdirUri, name, activeSender) }
                 
                 // 2. DELAYED CAPTURE: Run again 1500ms later to catch large videos that take time to finish downloading
                 scanRunnables[key]?.let { ioHandler.removeCallbacks(it) }
-                val runnable = Runnable { scanSubdir(treeUri, subdirUri, name) }
+                val runnable = Runnable { 
+                    val sender = if (System.currentTimeMillis() - latestActiveSenderTime < 50_000L) latestActiveSender else null
+                    scanSubdir(treeUri, subdirUri, name, sender) 
+                }
                 scanRunnables[key] = runnable
                 ioHandler.postDelayed(runnable, 1500)
             }
         }
+
 
     private fun unregisterObservers() {
         contentObservers.forEach { (uri, obs) ->
@@ -621,7 +672,6 @@ class MediaWatcherService : Service() {
             Log.i(TAG, "Zero-touch matched media: $displayName ($targetSender)")
             linkedPaths.add(privatePath)
             pendingRetries.remove(privatePath)
-            cancelBurstScans() // Early exit on match: stops remaining burst scans & releases WakeLock
             // Cap linkedPaths to prevent memory leak
             if (linkedPaths.size > 500) {
                 val iter = linkedPaths.iterator()
@@ -666,6 +716,7 @@ class MediaWatcherService : Service() {
                 put("fileTimestampMs", fileTimestampMs)
                 put("sizeBytes", sizeBytes)
                 put("displayName", displayName)
+                if (!targetSender.isNullOrEmpty()) put("targetSender", targetSender)
             }
             val file     = getMediaQueueFile(applicationContext)
             val lockFile = File(file.absolutePath + ".lock")

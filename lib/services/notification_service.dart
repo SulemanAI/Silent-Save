@@ -1,5 +1,6 @@
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
+import 'dart:io';
 import 'database_helper.dart';
 import '../models/message_model.dart';
 import '../utils/timestamp_matcher.dart';
@@ -82,9 +83,13 @@ class NotificationService with WidgetsBindingObserver {
   final LinkedHashSet<String> _processedNotificationIds = LinkedHashSet<String>();
   static const int _maxProcessedIds = 1000;
   
-  // Track whether we're currently checking, to prevent overlapping calls
+  // Track whether we're currently checking notifications, to prevent overlapping calls
   bool _isChecking = false;
   
+  // Track whether we're currently processing the media queue, to prevent overlapping calls.
+  // Media processing involves SQLite reads + file I/O which must never run concurrently.
+  bool _isCheckingMedia = false;
+
   // Periodic safety-net poll timer (only while app is in foreground)
   Timer? _pollTimer;
   bool _appInForeground = true;
@@ -149,16 +154,22 @@ class NotificationService with WidgetsBindingObserver {
     }
   }
 
-  /// Start periodic safety-net poll timer (10 seconds).
+  /// Start periodic safety-net poll timer.
   /// Only active while app is in foreground.
-  /// The native side captures messages independently — this poll is just for
-  /// quickly picking up messages from the file queue when the user is looking
-  /// at the app.
+  ///
+  /// The native side captures messages and inserts them into SQLite **immediately**
+  /// via NativeDatabaseHelper — so this poll is NOT the capture pipeline.
+  /// It is only a UI refresh fallback for edge cases where the push event
+  /// (notifyFlutterMessageOrMediaUpdated) was missed.
+  ///
+  /// 5-second interval is sufficient because:
+  /// - Instant capture: handled by native NativeDatabaseHelper (no delay)
+  /// - Instant UI update: handled by the db_updated MethodChannel push
+  /// - This timer: safety net only — a 5s delay in the fallback is acceptable
+  ///   and prevents SQLite lock exhaustion that caused the crash.
   void _startPollTimer() {
     _stopPollTimer();
-    // Poll every 1 second while the app is in the foreground for instant media/message updates.
-    // This is safe because the timer is killed immediately when the app goes to the background.
-    _pollTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+    _pollTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       if (_appInForeground) {
         _checkForNewNotifications();
         _checkForNewMedia();
@@ -327,6 +338,11 @@ class NotificationService with WidgetsBindingObserver {
   }
 
   Future<void> _checkForNewMedia() async {
+    // Prevent overlapping calls — media processing is heavy (SQLite + File I/O)
+    // and must never run concurrently. Without this guard, the 5s timer can
+    // trigger a second run before the first one finishes, causing DB lock errors.
+    if (_isCheckingMedia) return;
+    _isCheckingMedia = true;
     try {
       final List<dynamic>? results = await platform
           .invokeListMethod('getMediaQueue')
@@ -336,9 +352,22 @@ class NotificationService with WidgetsBindingObserver {
       
       debugPrint('[NotificationService] Received ${results.length} media queue events');
       
+      int processed = 0;
       for (final result in results) {
         if (result is! Map) continue;
         final mediaEvent = Map<String, dynamic>.from(result);
+
+        // Fast-path dedup: if this filePath is already linked in the DB
+        // (native matchAndLinkMedia already ran), skip the expensive TimestampMatcher
+        // query. This eliminates the 'already used by msg #X' flood seen in logs.
+        final filePath = mediaEvent['filePath'] as String? ?? '';
+        if (filePath.isNotEmpty) {
+          final alreadyLinked = await DatabaseHelper.instance.isMediaPathLinked(filePath);
+          if (alreadyLinked) {
+            processed++;
+            continue; // Already handled natively — skip redundant Flutter-side linking
+          }
+        }
         
         // 24-hour window: covers existing placeholder messages saved before SAF ran.
         // Widened from 1h to catch old "Video"/"Photo" messages that never got a file.
@@ -346,7 +375,7 @@ class NotificationService with WidgetsBindingObserver {
         
         final attachmentData = <String, dynamic>{
           'media_type': mediaEvent['mediaType'] ?? 'unknown',
-          'file_path': mediaEvent['filePath'] ?? '',
+          'file_path': filePath,
           'original_uri': mediaEvent['originalUri'] ?? '',
           'captured_at': mediaEvent['fileTimestampMs'] ?? 0,
         };
@@ -374,6 +403,11 @@ class NotificationService with WidgetsBindingObserver {
           attachmentData['matched'] = 0;
           await DatabaseHelper.instance.insertMediaAttachment(attachmentData);
         }
+
+        processed++;
+        // Yield to UI thread every 10 items to prevent Dart event loop starvation
+        // which caused false timeouts when queue had 100+ entries.
+        if (processed % 10 == 0) await Future.delayed(Duration.zero);
       }
       
       // Notify UI of new media
@@ -381,6 +415,74 @@ class NotificationService with WidgetsBindingObserver {
       
     } catch (e) {
       debugPrint('[NotificationService] Error checking new media: $e');
+    } finally {
+      _isCheckingMedia = false;
+      // Reconcile any previously unlinked attachments sitting in DB
+      await reconcileUnmatchedMedia();
+    }
+  }
+
+  /// Reconciles unmatched media_attachments (matched = 0) where the file exists on disk
+  /// against unlinked messages in the database.
+  Future<int> reconcileUnmatchedMedia([String? targetSender]) async {
+    try {
+      final unmatched = await DatabaseHelper.instance.getUnmatchedMediaAttachments(targetSender);
+      if (unmatched.isEmpty) return 0;
+      int linked = 0;
+
+      for (final item in unmatched) {
+        final fPath = item['file_path'] as String? ?? '';
+        if (fPath.isEmpty || !File(fPath).existsSync()) continue;
+        final fName = fPath.split(Platform.pathSeparator).last;
+        
+        final rawSender = (item['sender_name'] as String? ?? '').trim();
+        final effectiveSender = targetSender?.trim() ?? (
+          (rawSender.isNotEmpty &&
+           !rawSender.contains('.') &&
+           !rawSender.startsWith('IMG-') &&
+           !rawSender.startsWith('VID-') &&
+           !rawSender.startsWith('AUD-') &&
+           !rawSender.startsWith('PTT-') &&
+           !rawSender.startsWith('DOC-') &&
+           !rawSender.startsWith('STK-'))
+              ? rawSender
+              : null
+        );
+        // Only reconcile if we have a verified sender name.
+        // Ambiguous media attachments without a verified sender must NEVER
+        // be cross-linked into unrelated chats.
+        if (effectiveSender == null || effectiveSender.isEmpty) continue;
+
+        final mediaEvent = <String, dynamic>{
+          'originalUri': item['original_uri'] ?? '',
+          'mediaType': item['media_type'] ?? 'unknown',
+          'filePath': fPath,
+          'fileTimestampMs': item['captured_at'] ?? 0,
+          'displayName': fName,
+          'targetSender': effectiveSender,
+        };
+        final matchResult = await TimestampMatcher.matchMediaToNotification(mediaEvent, 86400000);
+        if (matchResult.isMatched && matchResult.matchedMessage != null) {
+          final msg = matchResult.matchedMessage!;
+          final msgId = msg['id'] as int;
+          final updated = await DatabaseHelper.instance.updateMessageMediaPath(msgId, fPath);
+          if (updated > 0) {
+            await DatabaseHelper.instance.markMediaAttachmentMatchedByPath(fPath, msgId);
+            linked++;
+            debugPrint('[NotificationService] Reconciled media $fName -> msg #$msgId (${msg['sender']})');
+          } else {
+            // Already assigned to another message - mark matched to unclog the queue
+            await DatabaseHelper.instance.markMediaAttachmentMatchedByPath(fPath);
+          }
+        }
+      }
+      if (linked > 0) {
+        newMessageNotifier.value++;
+      }
+      return linked;
+    } catch (e) {
+      debugPrint('[NotificationService] reconcileUnmatchedMedia error: $e');
+      return 0;
     }
   }
 
@@ -492,13 +594,15 @@ class NotificationService with WidgetsBindingObserver {
     debugPrint('[NotificationService] Manual refresh');
     try {
       await _checkForNewNotifications().timeout(
-        const Duration(seconds: 10),
+        const Duration(seconds: 15),
         onTimeout: () {
           debugPrint('[NotificationService] Refresh notifications timed out');
         },
       );
+      // Media processing can be slow when queue is large (155+ entries × DB query).
+      // 60s gives enough headroom without blocking the user indefinitely.
       await _checkForNewMedia().timeout(
-        const Duration(seconds: 10),
+        const Duration(seconds: 60),
         onTimeout: () {
           debugPrint('[NotificationService] Refresh media timed out');
         },

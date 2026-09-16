@@ -45,30 +45,77 @@ class NativeDatabaseHelper private constructor(context: Context) {
         }
     }
 
-    private val db: SQLiteDatabase
+    // Store application context for potential DB reopen after OEM process kill/restart
+    private val appContext: Context = context.applicationContext
+    private var db: SQLiteDatabase
 
     init {
         // Ensure the databases directory exists (handles first-run-before-Flutter scenario)
-        val dbDir = context.getDatabasePath(DB_NAME).parentFile
+        val dbDir = appContext.getDatabasePath(DB_NAME).parentFile
         if (dbDir != null && !dbDir.exists()) {
             dbDir.mkdirs()
             Log.i(TAG, "Created databases directory: ${dbDir.absolutePath}")
         }
 
-        val dbPath = context.getDatabasePath(DB_NAME).absolutePath
-        db = SQLiteDatabase.openOrCreateDatabase(dbPath, null)
-
-        // Enable WAL for concurrent reader+writer (Flutter sqflite + this Kotlin writer)
-        db.enableWriteAheadLogging()
-
-        // Set busy timeout to prevent SQLiteDatabaseLockedException when
-        // both Flutter and native side access the DB simultaneously
-        db.execSQL("PRAGMA busy_timeout = 5000;")
-
-        Log.i(TAG, "Database opened: $dbPath (WAL=${db.isWriteAheadLoggingEnabled})")
+        db = openDatabase()
+        Log.i(TAG, "Database opened: ${appContext.getDatabasePath(DB_NAME).absolutePath} (WAL=${db.isWriteAheadLoggingEnabled})")
 
         // Ensure schema exists (handles cold-start before Flutter has ever run)
         ensureSchema()
+    }
+
+    /**
+     * Open (or reopen) the SQLite database with WAL and busy timeout configured.
+     * Called from init and from safeDb() when the connection needs to be recovered.
+     */
+    private fun openDatabase(): SQLiteDatabase {
+        val dbPath = appContext.getDatabasePath(DB_NAME).absolutePath
+        val database = SQLiteDatabase.openOrCreateDatabase(dbPath, null)
+        // Enable WAL for concurrent reader+writer (Flutter sqflite + this Kotlin writer)
+        database.enableWriteAheadLogging()
+        // 8s busy timeout: gives Flutter sqflite time to release its lock before we fail.
+        // Increased from 5s to be more resilient when both sides write simultaneously.
+        database.execSQL("PRAGMA busy_timeout = 8000;")
+        return database
+    }
+
+    /**
+     * Returns a guaranteed-open database connection.
+     *
+     * WHY THIS EXISTS:
+     * When the OEM battery manager force-kills the app process, the SQLiteDatabase
+     * file descriptor becomes invalid. On the next service restart (BootReceiver,
+     * NlsHealthWorker, or alarm ping), the existing INSTANCE's [db] field is stale.
+     * Any write then throws SQLiteDatabaseNotOpenException, which propagates into
+     * the Flutter engine and corrupts its shared state — causing the "requires
+     * device restart" symptom the user reported.
+     *
+     * This method catches that scenario and transparently reopens the connection.
+     * It is synchronized to prevent two threads racing to reopen simultaneously.
+     */
+    @Synchronized
+    private fun safeDb(): SQLiteDatabase {
+        return try {
+            if (db.isOpen) {
+                db
+            } else {
+                Log.w(TAG, "Database was closed (OEM kill?). Reopening...")
+                db = openDatabase()
+                ensureSchema()
+                Log.i(TAG, "Database successfully reopened")
+                db
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "safeDb() reopen failed: ${e.message}. Attempting fresh open...")
+            try {
+                db = openDatabase()
+                ensureSchema()
+                db
+            } catch (e2: Exception) {
+                Log.e(TAG, "safeDb() fatal: ${e2.message}")
+                db // last resort: return whatever we have
+            }
+        }
     }
 
     /**
@@ -152,7 +199,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
      */
     private fun ensureColumns() {
         try {
-            val cursor = db.rawQuery("PRAGMA table_info(messages)", null)
+            val cursor = safeDb().rawQuery("PRAGMA table_info(messages)", null)
             val columnNames = mutableSetOf<String>()
             while (cursor.moveToNext()) {
                 val nameIdx = cursor.getColumnIndex("name")
@@ -173,7 +220,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
             for ((name, type) in requiredColumns) {
                 if (!columnNames.contains(name)) {
                     try {
-                        db.execSQL("ALTER TABLE messages ADD COLUMN $name $type")
+                        safeDb().execSQL("ALTER TABLE messages ADD COLUMN $name $type")
                         Log.i(TAG, "Added missing column: $name")
                     } catch (e: Exception) {
                         // Column may already exist
@@ -207,9 +254,10 @@ class NativeDatabaseHelper private constructor(context: Context) {
     ): Long {
         try {
             val dedupWindowMs = 2000L // ±2 seconds, matches Flutter's window
+            val database = safeDb() // Use resilient connection
 
             // Dedup check: same sender + app + message within ±2s
-            val cursor = db.query(
+            val cursor = database.query(
                 "messages",
                 arrayOf("id"),
                 "sender = ? AND app = ? AND message = ? AND timestamp BETWEEN ? AND ?",
@@ -245,7 +293,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
                 if (mediaPath != null) put("mediaPath", mediaPath)
             }
 
-            val rowId = db.insertWithOnConflict(
+            val rowId = database.insertWithOnConflict(
                 "messages", null, values,
                 SQLiteDatabase.CONFLICT_IGNORE
             )
@@ -274,9 +322,20 @@ class NativeDatabaseHelper private constructor(context: Context) {
         if (text == null || text.isBlank()) return true
         val lower = text.lowercase().trim()
         if (lower.startsWith("reacted ") || lower.startsWith("reacted to ")) return false
+        
+        // ── CALL NOTIFICATION EXCLUSION ─────────────────────────────
+        // "Missed voice call" contains "voice", which previously matched
+        // the audio placeholder check below. Call notifications are NOT
+        // media placeholders and must NEVER trigger media linking.
+        if (lower.contains("call") && (lower.contains("missed") || lower.contains("incoming") || 
+            lower.contains("ongoing") || lower.contains("ringing") || lower.contains("ended"))) {
+            return false
+        }
+        if (lower == "voice call" || lower == "video call" || lower == "group call") return false
+        
         val genericLabels = listOf(
-            "photo", "video", "audio", "voice message", "voice", "document", "file",
-            "sticker", "gif", "📷", "📹", "🎥", "🎞", "🎤", "🎙", "🎵", "📄", "📎",
+            "photo", "image", "video", "audio", "voice message", "voice", "document", "file",
+            "sticker", "gif", "📷", "🖼", "📹", "🎥", "🎞", "🎤", "🎙", "🎵", "📄", "📎",
             ".pdf", ".doc", ".docx", ".csv", ".xls", ".xlsx", ".txt", ".ppt", ".zip"
         )
         return genericLabels.any { lower.contains(it) }
@@ -288,10 +347,11 @@ class NativeDatabaseHelper private constructor(context: Context) {
      */
     fun cleanupCorruptedMediaLinks() {
         try {
-            db.beginTransaction()
+            val database = safeDb() // Use resilient connection
+            database.beginTransaction()
             try {
                 // 1. Clear mediaPath on emoji reaction messages
-                db.execSQL("""
+                database.execSQL("""
                     UPDATE messages 
                     SET mediaPath = NULL 
                     WHERE (message LIKE 'Reacted %' OR message LIKE 'Reacted to %') 
@@ -299,8 +359,26 @@ class NativeDatabaseHelper private constructor(context: Context) {
                       AND mediaPath != ''
                 """.trimIndent())
 
+                // 1b. Clear mediaPath on call notification messages (e.g. "Missed voice call")
+                // WhatsApp call notifications are NOT messages and must NEVER have media attached.
+                database.execSQL("""
+                    UPDATE messages 
+                    SET mediaPath = NULL 
+                    WHERE ((LOWER(message) LIKE '%call%' 
+                            AND (LOWER(message) LIKE '%missed%' 
+                                 OR LOWER(message) LIKE '%incoming%' 
+                                 OR LOWER(message) LIKE '%ongoing%' 
+                                 OR LOWER(message) LIKE '%ringing%' 
+                                 OR LOWER(message) LIKE '%ended%'))
+                           OR LOWER(message) = 'voice call'
+                           OR LOWER(message) = 'video call'
+                           OR LOWER(message) = 'group call')
+                      AND mediaPath IS NOT NULL 
+                      AND mediaPath != ''
+                """.trimIndent())
+
                 // 2. Find any mediaPath that is assigned to more than 1 message
-                val dupCursor = db.rawQuery("""
+                val dupCursor = database.rawQuery("""
                     SELECT mediaPath, COUNT(*) as cnt 
                     FROM messages 
                     WHERE mediaPath IS NOT NULL AND mediaPath != '' 
@@ -316,7 +394,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
                 dupCursor.close()
 
                 for (path in duplicatePaths) {
-                    val msgCursor = db.rawQuery("""
+                    val msgCursor = database.rawQuery("""
                         SELECT id, message, timestamp 
                         FROM messages 
                         WHERE mediaPath = ? 
@@ -349,12 +427,12 @@ class NativeDatabaseHelper private constructor(context: Context) {
                     }
 
                     for (id in otherIds) {
-                        db.execSQL("UPDATE messages SET mediaPath = NULL WHERE id = ?", arrayOf(id.toString()))
+                        database.execSQL("UPDATE messages SET mediaPath = NULL WHERE id = ?", arrayOf(id.toString()))
                     }
                 }
 
                 // 3. Clear matched media_attachments where notification_id points to message with null mediaPath
-                db.execSQL("""
+                database.execSQL("""
                     UPDATE media_attachments 
                     SET matched = 0, notification_id = NULL 
                     WHERE matched = 1 
@@ -364,10 +442,10 @@ class NativeDatabaseHelper private constructor(context: Context) {
                       )
                 """.trimIndent())
 
-                db.setTransactionSuccessful()
+                database.setTransactionSuccessful()
                 Log.i(TAG, "✓ Completed cleanupCorruptedMediaLinks")
             } finally {
-                db.endTransaction()
+                database.endTransaction()
             }
         } catch (e: Exception) {
             Log.e(TAG, "cleanupCorruptedMediaLinks error: ${e.message}")
@@ -379,12 +457,13 @@ class NativeDatabaseHelper private constructor(context: Context) {
      */
     fun isMediaAlreadyLinked(mediaPath: String): Boolean {
         try {
-            val c1 = db.rawQuery("SELECT id FROM messages WHERE mediaPath = ? LIMIT 1", arrayOf(mediaPath))
+            val database = safeDb()
+            val c1 = database.rawQuery("SELECT id FROM messages WHERE mediaPath = ? LIMIT 1", arrayOf(mediaPath))
             val inMessages = c1.moveToFirst()
             c1.close()
             if (inMessages) return true
 
-            val c2 = db.rawQuery("SELECT id FROM media_attachments WHERE file_path = ? AND matched = 1 AND notification_id IS NOT NULL LIMIT 1", arrayOf(mediaPath))
+            val c2 = database.rawQuery("SELECT id FROM media_attachments WHERE file_path = ? AND matched = 1 AND notification_id IS NOT NULL LIMIT 1", arrayOf(mediaPath))
             val inAttachments = c2.moveToFirst()
             c2.close()
             return inAttachments
@@ -402,7 +481,8 @@ class NativeDatabaseHelper private constructor(context: Context) {
 
         var inserted = 0
         try {
-            db.beginTransaction()
+            val database = safeDb()
+            database.beginTransaction()
             try {
                 for (msg in messages) {
                     val result = insertMessage(
@@ -417,9 +497,9 @@ class NativeDatabaseHelper private constructor(context: Context) {
                     )
                     if (result > 0) inserted++
                 }
-                db.setTransactionSuccessful()
+                database.setTransactionSuccessful()
             } finally {
-                db.endTransaction()
+                database.endTransaction()
             }
         } catch (e: Exception) {
             Log.e(TAG, "Batch insert error: ${e.message}")
@@ -446,7 +526,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
             val values = ContentValues().apply {
                 put("mediaPath", mediaPath)
             }
-            val rows = db.update(
+            val rows = safeDb().update(
                 "messages",
                 values,
                 "sender = ? AND app = ? AND message = ? AND timestamp BETWEEN ? AND ? AND (mediaPath IS NULL OR mediaPath = '')",
@@ -469,14 +549,25 @@ class NativeDatabaseHelper private constructor(context: Context) {
      */
     private fun linkWaitingMediaToMessage(messageId: Long, sender: String, senderName: String, messageText: String, timestampMs: Long) {
         try {
+            // ── CALL NOTIFICATION GUARD ─────────────────────────────────
+            // If the message text is a call notification, NEVER link media to it.
+            val lowerMsg = messageText.lowercase().trim()
+            if (lowerMsg.contains("call") && (lowerMsg.contains("missed") || lowerMsg.contains("incoming") || 
+                lowerMsg.contains("ongoing") || lowerMsg.contains("ringing") || lowerMsg.contains("ended"))) {
+                Log.d(TAG, "linkWaitingMediaToMessage: skipping call text '$messageText'")
+                return
+            }
+            
             val now = System.currentTimeMillis()
             val windowStart = minOf(timestampMs, now) - 24 * 60 * 60 * 1000L // 24 hours
-            val cursor = db.rawQuery(
+            val windowEnd = maxOf(timestampMs, now) + 60_000L // 1 min future buffer for clock skew
+            val database = safeDb() // Use resilient connection for the whole linking operation
+            val cursor = database.rawQuery(
                 """
                 SELECT id, media_type, file_path, captured_at, sender_name 
                 FROM media_attachments 
                 WHERE matched = 0 
-                  AND captured_at >= $windowStart
+                  AND captured_at BETWEEN $windowStart AND $windowEnd
                 ORDER BY ABS(captured_at - $timestampMs) ASC 
                 LIMIT 10
                 """.trimIndent(),
@@ -485,7 +576,6 @@ class NativeDatabaseHelper private constructor(context: Context) {
 
             var matchedAttachmentId: Long? = null
             var matchedFilePath: String? = null
-            val lowerMsg = messageText.lowercase().trim()
 
             cursor.use {
                 while (it.moveToNext()) {
@@ -499,23 +589,30 @@ class NativeDatabaseHelper private constructor(context: Context) {
                     if (!file.exists() || file.length() <= 0L) continue
 
                     // Check if this file is already linked in the messages table
-                    val checkCursor = db.rawQuery("SELECT id FROM messages WHERE mediaPath = ? LIMIT 1", arrayOf(fPath))
+                    val checkCursor = database.rawQuery("SELECT id FROM messages WHERE mediaPath = ? LIMIT 1", arrayOf(fPath))
                     val alreadyUsed = checkCursor.moveToFirst()
                     checkCursor.close()
                     if (alreadyUsed) {
                         // Mark as matched so it won't be checked again
                         val markVals = ContentValues().apply { put("matched", 1) }
-                        db.update("media_attachments", markVals, "id = ?", arrayOf(attachId.toString()))
+                        database.update("media_attachments", markVals, "id = ?", arrayOf(attachId.toString()))
                         continue
                     }
 
-                    // If attachment has a sender recorded and it's not a raw filename, ensure sender matches
-                    if (attachSender.isNotEmpty() && !attachSender.endsWith(".jpg") && !attachSender.endsWith(".mp4") && !attachSender.endsWith(".opus")) {
-                        val senderMatches = attachSender.equals(sender, ignoreCase = true) ||
-                            (senderName.isNotEmpty() && attachSender.equals(senderName, ignoreCase = true))
-                        if (!senderMatches) {
-                            continue
-                        }
+                    // ── STRICT SENDER MATCHING ──────────────────────────────
+                    val senderMatches = attachSender.isNotEmpty() && !attachSender.contains('.') && (
+                        attachSender.equals(sender, ignoreCase = true) ||
+                        (senderName.isNotEmpty() && attachSender.equals(senderName, ignoreCase = true)) ||
+                        attachSender.trim().equals(sender.trim(), ignoreCase = true)
+                    )
+
+                    // If attachSender was unassigned (e.g. captured by ContentObserver from directory before notification arrived):
+                    // allow linking ONLY if captured within 45 seconds of this incoming message.
+                    val isRecentUnassigned = (attachSender.isEmpty() || attachSender.endsWith(".jpg") || attachSender.endsWith(".mp4") || attachSender.endsWith(".opus")) 
+                        && Math.abs(capAt - timestampMs) <= 45_000L
+
+                    if (!senderMatches && !isRecentUnassigned) {
+                        continue
                     }
 
                     val cleanBase = file.nameWithoutExtension.lowercase()
@@ -536,22 +633,22 @@ class NativeDatabaseHelper private constructor(context: Context) {
             }
 
             if (matchedAttachmentId != null && matchedFilePath != null) {
-                db.beginTransaction()
+                database.beginTransaction()
                 try {
                     val msgVals = ContentValues().apply { put("mediaPath", matchedFilePath) }
-                    db.update("messages", msgVals, "id = ?", arrayOf(messageId.toString()))
+                    database.update("messages", msgVals, "id = ?", arrayOf(messageId.toString()))
 
                     val attachVals = ContentValues().apply {
                         put("notification_id", messageId)
                         put("sender_name", sender)
                         put("matched", 1)
                     }
-                    db.update("media_attachments", attachVals, "id = ?", arrayOf(matchedAttachmentId.toString()))
+                    database.update("media_attachments", attachVals, "id = ?", arrayOf(matchedAttachmentId.toString()))
 
-                    db.setTransactionSuccessful()
+                    database.setTransactionSuccessful()
                     Log.i(TAG, "✓ Reverse-linked waiting media $matchedFilePath to msg #$messageId ($sender)")
                 } finally {
-                    db.endTransaction()
+                    database.endTransaction()
                 }
                 MainActivity.notifyFlutterMessageOrMediaUpdated()
             }
@@ -590,15 +687,33 @@ class NativeDatabaseHelper private constructor(context: Context) {
             val windowEnd = maxOf(effectiveTime, now) + 60_000L // 1 min buffer
 
             val cleanBase = fileName.substringBeforeLast('.').lowercase()
+            val cleanBaseNorm = cleanBase.replace('_', ' ')
 
             fun checkMatch(msgText: String): Boolean {
-                if (msgText.isBlank()) return true
+                // NOTE: Do NOT short-circuit on blank text here — blank messages are
+                // handled upstream by isMediaPlaceholderText(). Returning true for any
+                // blank text here would cause false-positive links to plain-text messages
+                // that got normalized/truncated to empty.
+                if (msgText.isBlank()) return false
                 if (msgText.startsWith("reacted ") || msgText.startsWith("reacted to ")) return false
+                // ── CALL NOTIFICATION EXCLUSION ─────────────────────────────
+                // Prevent "Missed voice call" (contains "voice") from matching audio media.
+                // This check is redundant with shouldProcessNotification but acts as a
+                // safety net in case a call text somehow reaches the database.
+                if (msgText.contains("call") && (msgText.contains("missed") || msgText.contains("incoming") || 
+                    msgText.contains("ongoing") || msgText.contains("ringing") || msgText.contains("ended"))) return false
+                if (msgText == "voice call" || msgText == "video call" || msgText == "group call") return false
+                
+                val matchesBase = cleanBase.length >= 3 && (
+                    msgText.contains(cleanBase) ||
+                    msgText.contains(cleanBaseNorm) ||
+                    msgText.contains(fileName.lowercase())
+                )
                 return when (mediaType) {
-                    "image" -> msgText.contains("photo") || msgText.contains("📷") || msgText.contains("🖼") || msgText.contains("image") || msgText.contains("sticker") || msgText.contains("gif") || msgText.contains("👾") || msgText.contains("💟") || (fileName.startsWith("STK-") && msgText.contains("sticker"))
-                    "video" -> msgText.contains("video") || msgText.contains("🎥") || msgText.contains("📹") || msgText.contains("🎞") || msgText.contains("gif")
-                    "audio" -> msgText.contains("voice") || msgText.contains("audio") || msgText.contains("🎙") || msgText.contains("🎤") || msgText.contains("🎵")
-                    "document" -> msgText.contains("document") || msgText.contains("📄") || msgText.contains("📎") || msgText.contains("file") || msgText.contains(".pdf") || msgText.contains(".doc") || msgText.contains(".csv") || msgText.contains(".xls") || msgText.contains(".txt") || msgText.contains(".ppt") || msgText.contains(".zip") || (cleanBase.length >= 3 && msgText.contains(cleanBase))
+                    "image" -> msgText.contains("photo") || msgText.contains("📷") || msgText.contains("🖼") || msgText.contains("image") || msgText.contains("sticker") || msgText.contains("gif") || msgText.contains("👾") || msgText.contains("💟") || (fileName.startsWith("STK-") && msgText.contains("sticker")) || matchesBase
+                    "video" -> msgText.contains("video") || msgText.contains("🎥") || msgText.contains("📹") || msgText.contains("🎞") || msgText.contains("gif") || matchesBase
+                    "audio" -> msgText.contains("voice") || msgText.contains("audio") || msgText.contains("🎙") || msgText.contains("🎤") || msgText.contains("🎵") || matchesBase
+                    "document" -> msgText.contains("document") || msgText.contains("📄") || msgText.contains("📎") || msgText.contains("file") || msgText.contains(".pdf") || msgText.contains(".doc") || msgText.contains(".csv") || msgText.contains(".xls") || msgText.contains(".txt") || msgText.contains(".ppt") || msgText.contains(".zip") || matchesBase
                     else -> false
                 }
             }
@@ -607,48 +722,71 @@ class NativeDatabaseHelper private constructor(context: Context) {
             var matchedSenderName: String = ""
 
             // Pass 1: If targetSender is known, prioritize matching unlinked messages from that specific sender/chat
-            // Uses ABS(timestamp - effectiveTime) as strict tiebreaker so the message closest to the file's creation wins
             if (!targetSender.isNullOrBlank()) {
-                val senderCursor = db.rawQuery(
+                val cleanTarget = targetSender.trim()
+                val senderCursor = safeDb().rawQuery(
                     """
                     SELECT id, message, timestamp, sender, senderName 
                     FROM messages 
                     WHERE (app LIKE '%whatsapp%') 
-                      AND (sender = ? OR senderName = ?)
+                      AND (sender = ? COLLATE NOCASE OR senderName = ? COLLATE NOCASE OR LOWER(TRIM(sender)) = LOWER(?) OR LOWER(TRIM(senderName)) = LOWER(?))
                       AND (mediaPath IS NULL OR mediaPath = '') 
                       AND timestamp BETWEEN $windowStart AND $windowEnd
                       AND (message NOT LIKE 'Reacted %' AND message NOT LIKE 'Reacted to %')
                     ORDER BY ABS(timestamp - $effectiveTime) ASC
                     LIMIT 10
                     """.trimIndent(),
-                    arrayOf(targetSender, targetSender)
+                    arrayOf(cleanTarget, cleanTarget, cleanTarget, cleanTarget)
                 )
 
                 senderCursor.use {
+                    var bestGenericId: Long? = null
+                    var bestGenericSender: String = ""
+
                     while (it.moveToNext()) {
                         val msgId = it.getLong(0)
                         val msgText = it.getString(1)?.lowercase() ?: ""
                         val sender = it.getString(3) ?: ""
                         val senderName = it.getString(4) ?: sender
 
-                        if (checkMatch(msgText)) {
+                        val hasFilenameMatch = cleanBase.length >= 3 && (
+                            msgText.contains(cleanBase) ||
+                            msgText.contains(cleanBaseNorm) ||
+                            msgText.contains(fileName.lowercase())
+                        )
+
+                        if (hasFilenameMatch) {
                             matchedMessageId = msgId
                             matchedSenderName = senderName
                             break
+                        } else if (bestGenericId == null && checkMatch(msgText)) {
+                            bestGenericId = msgId
+                            bestGenericSender = senderName
                         }
+                    }
+                    if (matchedMessageId == null && bestGenericId != null) {
+                        matchedMessageId = bestGenericId
+                        matchedSenderName = bestGenericSender
                     }
                 }
             }
 
-            // Pass 2: If no sender-specific match, check general unlinked WhatsApp messages (only matching valid media placeholders)
+            // Pass 2: If no sender-specific match found in Pass 1:
+            // - If targetSender is blank, check global unlinked messages within 24h.
+            // - If targetSender was specified but Pass 1 found nothing, check global pool
+            //   ONLY within a tight ±45-second window around this file's capture time.
+            //   This allows matching if there was a minor sender title variance (e.g. contact name vs group name vs phone number)
+            //   while strictly preventing cross-chat misattribution of older messages.
             if (matchedMessageId == null) {
-                val globalCursor = db.rawQuery(
+                val p2WindowStart = if (!targetSender.isNullOrBlank()) maxOf(windowStart, effectiveTime - 45_000L) else windowStart
+                val p2WindowEnd = if (!targetSender.isNullOrBlank()) minOf(windowEnd, effectiveTime + 45_000L) else windowEnd
+                val globalCursor = safeDb().rawQuery(
                     """
                     SELECT id, message, timestamp, sender, senderName 
                     FROM messages 
                     WHERE (app LIKE '%whatsapp%') 
                       AND (mediaPath IS NULL OR mediaPath = '') 
-                      AND timestamp BETWEEN $windowStart AND $windowEnd
+                      AND timestamp BETWEEN $p2WindowStart AND $p2WindowEnd
                       AND (message NOT LIKE 'Reacted %' AND message NOT LIKE 'Reacted to %')
                     ORDER BY ABS(timestamp - $effectiveTime) ASC
                     LIMIT 20
@@ -657,17 +795,37 @@ class NativeDatabaseHelper private constructor(context: Context) {
                 )
 
                 globalCursor.use {
+                    var bestGenericId: Long? = null
+                    var bestGenericSender: String = ""
+
                     while (it.moveToNext()) {
                         val msgId = it.getLong(0)
                         val msgText = it.getString(1)?.lowercase() ?: ""
                         val sender = it.getString(3) ?: ""
                         val senderName = it.getString(4) ?: sender
 
-                        if (checkMatch(msgText)) {
+                        // Skip call notifications that somehow made it into the DB
+                        if (msgText.contains("call") && (msgText.contains("missed") || msgText.contains("incoming") || 
+                            msgText.contains("ongoing") || msgText.contains("ringing"))) continue
+
+                        val hasFilenameMatch = cleanBase.length >= 3 && (
+                            msgText.contains(cleanBase) ||
+                            msgText.contains(cleanBaseNorm) ||
+                            msgText.contains(fileName.lowercase())
+                        )
+
+                        if (hasFilenameMatch) {
                             matchedMessageId = msgId
                             matchedSenderName = senderName
                             break
+                        } else if (bestGenericId == null && checkMatch(msgText)) {
+                            bestGenericId = msgId
+                            bestGenericSender = senderName
                         }
+                    }
+                    if (matchedMessageId == null && bestGenericId != null) {
+                        matchedMessageId = bestGenericId
+                        matchedSenderName = bestGenericSender
                     }
                 }
             }
@@ -676,10 +834,11 @@ class NativeDatabaseHelper private constructor(context: Context) {
             // A media file is NEVER attached to plain text messages like "Tu bata", "Sett", or "Ok".
 
             if (matchedMessageId != null) {
-                db.beginTransaction()
+                val database = safeDb()
+                database.beginTransaction()
                 try {
                     // Re-verify uniqueness inside transaction
-                    val checkCursor = db.rawQuery("SELECT id FROM messages WHERE mediaPath = ? LIMIT 1", arrayOf(mediaPath))
+                    val checkCursor = database.rawQuery("SELECT id FROM messages WHERE mediaPath = ? LIMIT 1", arrayOf(mediaPath))
                     val alreadyInUse = checkCursor.moveToFirst()
                     checkCursor.close()
                     if (alreadyInUse) {
@@ -691,10 +850,10 @@ class NativeDatabaseHelper private constructor(context: Context) {
                     val msgValues = ContentValues().apply {
                         put("mediaPath", mediaPath)
                     }
-                    db.update("messages", msgValues, "id = ?", arrayOf(matchedMessageId.toString()))
+                    database.update("messages", msgValues, "id = ?", arrayOf(matchedMessageId.toString()))
 
                     // Insert or update the attachment record
-                    val existingCursor = db.rawQuery("SELECT id FROM media_attachments WHERE file_path = ?", arrayOf(mediaPath))
+                    val existingCursor = database.rawQuery("SELECT id FROM media_attachments WHERE file_path = ?", arrayOf(mediaPath))
                     val exists = existingCursor.moveToFirst()
                     val existingId = if (exists) existingCursor.getLong(0) else -1L
                     existingCursor.close()
@@ -705,7 +864,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
                             put("sender_name", matchedSenderName)
                             put("matched", 1)
                         }
-                        db.update("media_attachments", attachValues, "id = ?", arrayOf(existingId.toString()))
+                        database.update("media_attachments", attachValues, "id = ?", arrayOf(existingId.toString()))
                     } else {
                         val attachValues = ContentValues().apply {
                             put("notification_id", matchedMessageId)
@@ -716,21 +875,22 @@ class NativeDatabaseHelper private constructor(context: Context) {
                             put("captured_at", fileTimestamp)
                             put("matched", 1)
                         }
-                        db.insert("media_attachments", null, attachValues)
+                        database.insert("media_attachments", null, attachValues)
                     }
 
-                    db.setTransactionSuccessful()
+                    database.setTransactionSuccessful()
                     Log.i(TAG, "✓ Natively matched and linked media $mediaType to msg $matchedMessageId ($matchedSenderName)")
                     MainActivity.notifyFlutterMessageOrMediaUpdated()
                     return true
                 } finally {
-                    db.endTransaction()
+                    database.endTransaction()
                 }
             } else {
                 // If not matched immediately, record in media_attachments with matched = 0
                 // so when the notification arrives later, linkWaitingMediaToMessage will claim it!
                 try {
-                    val existingCursor = db.rawQuery("SELECT id FROM media_attachments WHERE file_path = ?", arrayOf(mediaPath))
+                    val database = safeDb()
+                    val existingCursor = database.rawQuery("SELECT id FROM media_attachments WHERE file_path = ?", arrayOf(mediaPath))
                     val exists = existingCursor.moveToFirst()
                     existingCursor.close()
                     if (!exists) {
@@ -743,7 +903,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
                             put("captured_at", fileTimestamp)
                             put("matched", 0)
                         }
-                        db.insert("media_attachments", null, attachValues)
+                        database.insert("media_attachments", null, attachValues)
                         Log.d(TAG, "Recorded waiting media for reverse-linking: $fileName (sender=${targetSender ?: "unknown"})")
                     }
                 } catch (e: Exception) {

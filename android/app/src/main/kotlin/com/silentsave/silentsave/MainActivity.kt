@@ -673,7 +673,15 @@ class MainActivity : FlutterFragmentActivity() {
             val lockFile = File(file.absolutePath + ".lock")
             lockFile.createNewFile()
             RandomAccessFile(lockFile, "rw").use { raf ->
-                raf.channel.lock().use { _ ->
+                val lock = try {
+                    raf.channel.tryLock() ?: raf.channel.lock()
+                } catch (_: java.nio.channels.OverlappingFileLockException) {
+                    null
+                } catch (_: Exception) {
+                    null
+                }
+
+                try {
                     val json = if (file.exists()) file.readText().trim() else "[]"
                     if (json.isEmpty() || json == "[]") return list
                     val arr = JSONArray(json)
@@ -688,6 +696,7 @@ class MainActivity : FlutterFragmentActivity() {
                                 "displayName"     to obj.optString("displayName", "")
                             )
                             if (obj.has("filePath")) entry["filePath"] = obj.optString("filePath")
+                            if (obj.has("targetSender")) entry["targetSender"] = obj.optString("targetSender")
                             list.add(entry)
                         } catch (e: Exception) {
                             Log.e(TAG, "Corrupt media queue entry $i: ${e.message}")
@@ -701,6 +710,8 @@ class MainActivity : FlutterFragmentActivity() {
                     } catch (e: Exception) {
                         Log.e(TAG, "Error clearing media queue (data safe): ${e.message}")
                     }
+                } finally {
+                    try { lock?.release() } catch (_: Exception) {}
                 }
             }
         } catch (e: Exception) {
@@ -721,6 +732,7 @@ class MainActivity : FlutterFragmentActivity() {
                                 "displayName"     to obj.optString("displayName", "")
                             )
                             if (obj.has("filePath")) entry["filePath"] = obj.optString("filePath")
+                            if (obj.has("targetSender")) entry["targetSender"] = obj.optString("targetSender")
                             list.add(entry)
                         } catch (_: Exception) {}
                     }
