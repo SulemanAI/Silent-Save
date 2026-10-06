@@ -407,18 +407,25 @@ class MediaWatcherService : Service() {
             override fun onChange(selfChange: Boolean, uri: Uri?) {
                 Log.d(TAG, "onChange fired: '$name' (selfChange=$selfChange)")
                 val key = subdirUri.toString()
-                // Use 50s window (last burst fires at 40s + 10s buffer) to prevent a
-                // stale sender from a previous notification misattributing new media.
-                val activeSender = if (System.currentTimeMillis() - latestActiveSenderTime < 50_000L) latestActiveSender else null
-                
+                // ── SENDER-SAFETY: Do NOT read latestActiveSender here ──────────────────
+                // ContentObserver fires for ANY WhatsApp directory change, not only the one
+                // triggered by the current chat's notification. Reading the global
+                // latestActiveSender causes media from Chat A to be attributed to the last
+                // active user (Chat B). The notification-driven burst scans scheduled by
+                // triggerImmediateScan() already pass the correct targetSender directly —
+                // zero-touch matching is handled there. ContentObserver scans must use
+                // targetSender = null so files are matched strictly by timestamp + media-type
+                // (matchAndLinkMedia Pass 2) or reverse-linked when the real notification
+                // arrives (linkWaitingMediaToMessage).
+                // ────────────────────────────────────────────────────────────────────────
+
                 // 1. INSTANT CAPTURE: Run immediately without debounce to beat "Delete for Everyone"
-                ioHandler.post { scanSubdir(treeUri, subdirUri, name, activeSender) }
-                
+                ioHandler.post { scanSubdir(treeUri, subdirUri, name, null) }
+
                 // 2. DELAYED CAPTURE: Run again 1500ms later to catch large videos that take time to finish downloading
                 scanRunnables[key]?.let { ioHandler.removeCallbacks(it) }
-                val runnable = Runnable { 
-                    val sender = if (System.currentTimeMillis() - latestActiveSenderTime < 50_000L) latestActiveSender else null
-                    scanSubdir(treeUri, subdirUri, name, sender) 
+                val runnable = Runnable {
+                    scanSubdir(treeUri, subdirUri, name, null)
                 }
                 scanRunnables[key] = runnable
                 ioHandler.postDelayed(runnable, 1500)
@@ -546,16 +553,22 @@ class MediaWatcherService : Service() {
                                 continue
                             }
 
-                            // Prune historical files: ONLY skip if rawModified is a valid millisecond timestamp (> year 2001)
-                            // AND strictly older than cutoffTime. If 0, -1, or unpopulated by OEM, keep it!
-                            if (rawModified > 1_000_000_000_000L && rawModified < cutoffTime) {
-                                continue
-                            }
-
-                            // Skip files that have already been copied and successfully linked
                             val safeName = name.replace(Regex("[^a-zA-Z0-9._-]"), "_")
                             val destDir  = getMediaAttachmentsDir(applicationContext)
                             val destFile = File(destDir, safeName)
+
+                            // Prune historical files: ONLY skip if rawModified is a valid millisecond timestamp (> year 2001)
+                            // AND strictly older than cutoffTime. If 0, -1, or unpopulated by OEM, keep it!
+                            // SENDER-SAFETY: During an active burst scan (targetSender != null) for newly arrived media,
+                            // if destFile does not exist yet, do NOT prune it! Photos/videos sent from a gallery
+                            // often carry their original camera/creation timestamp which can be hours or days old.
+                            if (rawModified > 1_000_000_000_000L && rawModified < cutoffTime) {
+                                if (targetSender == null || destFile.exists()) {
+                                    continue
+                                }
+                            }
+
+                            // Skip files that have already been copied and successfully linked
                             if (destFile.exists() && destFile.length() == size && (linkedPaths.contains(destFile.absolutePath) || nativeDb?.isMediaAlreadyLinked(destFile.absolutePath) == true)) {
                                 continue
                             }
@@ -566,9 +579,31 @@ class MediaWatcherService : Service() {
 
                             val path = copyToPrivateStorage(fileUri, name, size)
                             if (path != null) {
-                                // Use actual file modified time if valid, else current time
-                                val captureTime = if (rawModified > 1_000_000_000_000L) rawModified else System.currentTimeMillis()
-                                processMediaEvent(fileUri.toString(), type, path, captureTime, size, name, 0, targetSender)
+                                // For audio (voice notes), rawModified is when it was recorded live in WhatsApp.
+                                // For images, videos, and documents: the file just arrived on this device right now,
+                                // so captureTime is scanStart. The EXIF/camera timestamp (rawModified) can be days old!
+                                val captureTime = if (type == "audio") {
+                                    if (rawModified > 1_000_000_000_000L) rawModified else scanStart
+                                } else {
+                                    scanStart
+                                }
+
+                                // SENDER-SAFETY:
+                                // Audio/voice notes share weekly folders without contact names in filenames,
+                                // so audio requires rawModified to be within 60s of scanStart to inherit targetSender.
+                                // For images, videos, and documents: newly copied files arriving during an active
+                                // burst scan for targetSender belong to targetSender!
+                                val fileSender = if (targetSender != null) {
+                                    if (type == "audio") {
+                                        if (rawModified > 1_000_000_000_000L && Math.abs(rawModified - scanStart) <= 60_000L) targetSender else null
+                                    } else {
+                                        targetSender
+                                    }
+                                } else {
+                                    null
+                                }
+
+                                processMediaEvent(fileUri.toString(), type, path, captureTime, size, name, 0, fileSender)
                             }
                         } catch (e: Exception) { Log.e(TAG, "file processing: ${e.message}") }
                     }

@@ -27,6 +27,18 @@ class _VideoThumbnailWidgetState extends State<VideoThumbnailWidget> {
     _generateThumbnail();
   }
 
+  @override
+  void didUpdateWidget(covariant VideoThumbnailWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.videoPath != widget.videoPath) {
+      setState(() {
+        _thumbnailBytes = null;
+        _isLoading = true;
+      });
+      _generateThumbnail();
+    }
+  }
+
   Future<void> _generateThumbnail() async {
     try {
       final uint8list = await VideoThumbnail.thumbnailData(

@@ -442,6 +442,123 @@ class NativeDatabaseHelper private constructor(context: Context) {
                       )
                 """.trimIndent())
 
+                // 4. Unlink cross-chat misattributions where media_attachments sender differs from messages sender
+                database.execSQL("""
+                    UPDATE messages 
+                    SET mediaPath = NULL 
+                    WHERE id IN (
+                        SELECT m.id 
+                        FROM messages m 
+                        JOIN media_attachments a ON a.file_path = m.mediaPath 
+                        WHERE a.sender_name IS NOT NULL 
+                          AND a.sender_name != '' 
+                          AND a.sender_name NOT LIKE '%.%' 
+                          AND LOWER(TRIM(m.sender)) != LOWER(TRIM(a.sender_name)) 
+                          AND LOWER(TRIM(m.senderName)) != LOWER(TRIM(a.sender_name))
+                    )
+                """.trimIndent())
+
+                // 5. Unlink audio/voice notes where time delta is > 2 minutes (120,000 ms)
+                database.execSQL("""
+                    UPDATE messages 
+                    SET mediaPath = NULL 
+                    WHERE id IN (
+                        SELECT m.id 
+                        FROM messages m 
+                        JOIN media_attachments a ON a.file_path = m.mediaPath 
+                        WHERE (a.media_type = 'audio' OR m.mediaPath LIKE '%.opus')
+                          AND ABS(m.timestamp - a.captured_at) > 120000
+                    )
+                """.trimIndent())
+
+                // 6. Reset matched flag on unlinked media_attachments
+                database.execSQL("""
+                    UPDATE media_attachments 
+                    SET matched = 0, notification_id = NULL 
+                    WHERE matched = 1 
+                      AND notification_id IS NOT NULL 
+                      AND notification_id NOT IN (
+                          SELECT id FROM messages WHERE mediaPath IS NOT NULL AND mediaPath != ''
+                      )
+                """.trimIndent())
+
+                // 7. Auto-reconcile orphaned recent media placeholders (last 24 hours)
+                // If a WhatsApp message was saved with text like "Photo" or "Video" but mediaPath is null,
+                // and an unmatched media_attachment of matching type exists, link them!
+                try {
+                    val recentCutoff = System.currentTimeMillis() - 24 * 60 * 60 * 1000L
+                    val unlinkedCursor = database.rawQuery("""
+                        SELECT id, sender, senderName, message, timestamp 
+                        FROM messages 
+                        WHERE (mediaPath IS NULL OR mediaPath = '') 
+                          AND app LIKE '%whatsapp%' 
+                          AND timestamp >= $recentCutoff
+                          AND message NOT LIKE 'Reacted %'
+                        ORDER BY timestamp DESC
+                    """.trimIndent(), null)
+
+                    val unlinkedMessages = mutableListOf<Map<String, Any>>()
+                    while (unlinkedCursor.moveToNext()) {
+                        val mId = unlinkedCursor.getLong(0)
+                        val mSender = unlinkedCursor.getString(1) ?: ""
+                        val mSenderName = unlinkedCursor.getString(2) ?: ""
+                        val mText = unlinkedCursor.getString(3) ?: ""
+                        val mTs = unlinkedCursor.getLong(4)
+                        if (isMediaPlaceholderText(mText)) {
+                            unlinkedMessages.add(mapOf(
+                                "id" to mId,
+                                "sender" to mSender,
+                                "senderName" to mSenderName,
+                                "text" to mText,
+                                "timestamp" to mTs
+                            ))
+                        }
+                    }
+                    unlinkedCursor.close()
+
+                    for (msg in unlinkedMessages) {
+                        val mId = msg["id"] as Long
+                        val mSender = msg["sender"] as String
+                        val mSenderName = msg["senderName"] as String
+                        val mText = (msg["text"] as String).lowercase()
+                        val mTs = msg["timestamp"] as Long
+
+                        val targetType = when {
+                            mText.contains("photo") || mText.contains("image") || mText.contains("📷") || mText.contains("🖼") -> "image"
+                            mText.contains("video") || mText.contains("📹") || mText.contains("🎥") -> "video"
+                            mText.contains("document") || mText.contains("file") || mText.contains("📄") || mText.contains("📎") -> "document"
+                            else -> null
+                        } ?: continue
+
+                        // Look for an unmatched attachment of matching type where sender either matches or is empty/filename
+                        val attachCursor = database.rawQuery("""
+                            SELECT id, file_path, sender_name 
+                            FROM media_attachments 
+                            WHERE matched = 0 
+                              AND media_type = ?
+                              AND (sender_name IS NULL OR sender_name = '' OR sender_name LIKE '%.%' OR LOWER(TRIM(sender_name)) = LOWER(?) OR LOWER(TRIM(sender_name)) = LOWER(?))
+                              AND file_path NOT IN (SELECT mediaPath FROM messages WHERE mediaPath IS NOT NULL AND mediaPath != '')
+                            ORDER BY ABS(captured_at - $mTs) ASC 
+                            LIMIT 1
+                        """.trimIndent(), arrayOf(targetType, mSender.trim(), mSenderName.trim()))
+
+                        if (attachCursor.moveToFirst()) {
+                            val aId = attachCursor.getLong(0)
+                            val fPath = attachCursor.getString(1)
+                            val file = File(fPath)
+                            if (file.exists() && file.length() > 0L) {
+                                database.execSQL("UPDATE messages SET mediaPath = ? WHERE id = ?", arrayOf(fPath, mId.toString()))
+                                database.execSQL("UPDATE media_attachments SET matched = 1, notification_id = ?, sender_name = ? WHERE id = ?", 
+                                    arrayOf(mId.toString(), mSender, aId.toString()))
+                                Log.i(TAG, "✓ Auto-reconciled orphaned $targetType $fPath to message #$mId ($mSender)")
+                            }
+                        }
+                        attachCursor.close()
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Auto-reconcile orphaned media error: ${e.message}")
+                }
+
                 database.setTransactionSuccessful()
                 Log.i(TAG, "✓ Completed cleanupCorruptedMediaLinks")
             } finally {
@@ -474,28 +591,38 @@ class NativeDatabaseHelper private constructor(context: Context) {
 
     /**
      * Batch insert multiple messages in a single transaction.
-     * Returns the count of messages actually inserted.
+     * Returns a list of inserted row IDs (or -1L for duplicates/errors).
      */
-    fun insertMessagesBatch(messages: List<Map<String, Any?>>): Int {
-        if (messages.isEmpty()) return 0
+    fun insertMessagesBatch(messages: List<Map<String, Any?>>): List<Long> {
+        if (messages.isEmpty()) return emptyList()
 
-        var inserted = 0
+        val insertedIds = mutableListOf<Long>()
+        var insertedCount = 0
         try {
             val database = safeDb()
             database.beginTransaction()
             try {
                 for (msg in messages) {
+                    val sender = msg["sender"] as? String
+                    val message = msg["message"] as? String
+                    val app = msg["app"] as? String
+                    val timestampMs = msg["timestampMs"] as? Long
+                    if (sender == null || message == null || app == null || timestampMs == null) {
+                        insertedIds.add(-1L)
+                        continue
+                    }
                     val result = insertMessage(
-                        sender = msg["sender"] as? String ?: continue,
-                        message = msg["message"] as? String ?: continue,
-                        app = msg["app"] as? String ?: continue,
-                        timestampMs = msg["timestampMs"] as? Long ?: continue,
+                        sender = sender,
+                        message = message,
+                        app = app,
+                        timestampMs = timestampMs,
                         senderName = msg["senderName"] as? String ?: "",
                         isGroupChat = msg["isGroupChat"] as? Boolean ?: false,
                         avatarPath = msg["avatarPath"] as? String,
                         mediaPath = msg["mediaPath"] as? String
                     )
-                    if (result > 0) inserted++
+                    insertedIds.add(result)
+                    if (result > 0) insertedCount++
                 }
                 database.setTransactionSuccessful()
             } finally {
@@ -505,10 +632,10 @@ class NativeDatabaseHelper private constructor(context: Context) {
             Log.e(TAG, "Batch insert error: ${e.message}")
         }
 
-        if (inserted > 0) {
-            Log.i(TAG, "✓ Batch inserted $inserted/${messages.size} messages")
+        if (insertedCount > 0) {
+            Log.i(TAG, "✓ Batch inserted $insertedCount/${messages.size} messages")
         }
-        return inserted
+        return insertedIds
     }
 
     /**
@@ -606,10 +733,42 @@ class NativeDatabaseHelper private constructor(context: Context) {
                         attachSender.trim().equals(sender.trim(), ignoreCase = true)
                     )
 
-                    // If attachSender was unassigned (e.g. captured by ContentObserver from directory before notification arrived):
-                    // allow linking ONLY if captured within 45 seconds of this incoming message.
-                    val isRecentUnassigned = (attachSender.isEmpty() || attachSender.endsWith(".jpg") || attachSender.endsWith(".mp4") || attachSender.endsWith(".opus")) 
-                        && Math.abs(capAt - timestampMs) <= 45_000L
+                    // ── UNASSIGNED SENDER FALLBACK ───────────────────────────────────────
+                    // When a file is captured by ContentObserver before the notification
+                    // arrives, it is stored with sender_name = fileName (e.g. "IMG-xxx.jpg")
+                    // or empty string. We allow reverse-linking under strict time constraints:
+                    //
+                    //   • attachSender == ""       → truly unknown sender: 45s window (rare case)
+                    //   • attachSender == fileName → captured without a sender: 10s tight window
+                    //     (was 45s — the primary cause of cross-user misattribution)
+                    //
+                    // In both cases the media type must explicitly match the message text;
+                    // blank messages are NOT accepted as wildcards (see requireExplicitMediaKeyword).
+                    val attachSenderIsFilename = attachSender.contains('.') && (
+                        attachSender.startsWith("IMG-") || attachSender.startsWith("VID-") ||
+                        attachSender.startsWith("AUD-") || attachSender.startsWith("PTT-") ||
+                        attachSender.startsWith("DOC-") || attachSender.startsWith("STK-") ||
+                        attachSender.endsWith(".jpg") || attachSender.endsWith(".jpeg") ||
+                        attachSender.endsWith(".mp4") || attachSender.endsWith(".opus") ||
+                        attachSender.endsWith(".webp") || attachSender.endsWith(".aac") ||
+                        attachSender.endsWith(".pdf") || attachSender.endsWith(".zip")
+                    )
+
+                    val isRecentUnassigned = when {
+                        // Audio/voice notes contain no sender info and arrive concurrently.
+                        // NEVER reverse-link audio without an explicit confirmed sender match!
+                        mType == "audio" -> false
+                        // Truly empty — 30s window
+                        attachSender.isEmpty() -> Math.abs(capAt - timestampMs) <= 30_000L
+                        // Filename stored as sender — captured without notification: 30s window
+                        attachSenderIsFilename -> Math.abs(capAt - timestampMs) <= 30_000L
+                        else -> false
+                    }
+
+                    // For the unconfirmed path: require an explicit media keyword in the message.
+                    // A blank placeholder (lowerMsg.isEmpty()) alone must NOT match an unknown-sender
+                    // file — that was the direct cause of "Mamma Photo/Video" misattribution.
+                    val requireExplicitMediaKeyword = !senderMatches && isRecentUnassigned
 
                     if (!senderMatches && !isRecentUnassigned) {
                         continue
@@ -617,10 +776,10 @@ class NativeDatabaseHelper private constructor(context: Context) {
 
                     val cleanBase = file.nameWithoutExtension.lowercase()
                     val isMatch = when (mType) {
-                        "image" -> lowerMsg.contains("photo") || lowerMsg.contains("📷") || lowerMsg.contains("🖼") || lowerMsg.contains("image") || lowerMsg.contains("sticker") || lowerMsg.contains("gif") || lowerMsg.contains("👾") || lowerMsg.contains("💟") || lowerMsg.isEmpty()
-                        "video" -> lowerMsg.contains("video") || lowerMsg.contains("🎥") || lowerMsg.contains("📹") || lowerMsg.contains("🎞") || lowerMsg.contains("gif") || lowerMsg.isEmpty()
-                        "audio" -> lowerMsg.contains("voice") || lowerMsg.contains("audio") || lowerMsg.contains("🎙") || lowerMsg.contains("🎤") || lowerMsg.contains("🎵") || lowerMsg.isEmpty()
-                        "document" -> lowerMsg.contains("document") || lowerMsg.contains("📄") || lowerMsg.contains("📎") || lowerMsg.contains("file") || lowerMsg.contains(".pdf") || lowerMsg.contains(".doc") || lowerMsg.contains(".csv") || lowerMsg.contains(".xls") || lowerMsg.contains(".txt") || lowerMsg.contains(".ppt") || lowerMsg.contains(".zip") || (cleanBase.length >= 3 && lowerMsg.contains(cleanBase)) || lowerMsg.isEmpty()
+                        "image" -> lowerMsg.contains("photo") || lowerMsg.contains("📷") || lowerMsg.contains("🖼") || lowerMsg.contains("image") || lowerMsg.contains("sticker") || lowerMsg.contains("gif") || lowerMsg.contains("👾") || lowerMsg.contains("💟") || (!requireExplicitMediaKeyword && lowerMsg.isEmpty())
+                        "video" -> lowerMsg.contains("video") || lowerMsg.contains("🎥") || lowerMsg.contains("📹") || lowerMsg.contains("🎞") || lowerMsg.contains("gif") || (!requireExplicitMediaKeyword && lowerMsg.isEmpty())
+                        "audio" -> lowerMsg.contains("voice") || lowerMsg.contains("audio") || lowerMsg.contains("🎙") || lowerMsg.contains("🎤") || lowerMsg.contains("🎵") || (!requireExplicitMediaKeyword && lowerMsg.isEmpty())
+                        "document" -> lowerMsg.contains("document") || lowerMsg.contains("📄") || lowerMsg.contains("📎") || lowerMsg.contains("file") || lowerMsg.contains(".pdf") || lowerMsg.contains(".doc") || lowerMsg.contains(".csv") || lowerMsg.contains(".xls") || lowerMsg.contains(".txt") || lowerMsg.contains(".ppt") || lowerMsg.contains(".zip") || (cleanBase.length >= 3 && lowerMsg.contains(cleanBase)) || (!requireExplicitMediaKeyword && lowerMsg.isEmpty())
                         else -> false
                     }
 
@@ -681,10 +840,17 @@ class NativeDatabaseHelper private constructor(context: Context) {
                 return true
             }
 
+            // ─────────────────────────────────────────────────────────────────────────────────
+            // The no-sender fallback can now safely auto-link only when a single valid candidate
+            // exists. All remaining sender-aware logic below is still used when targetSender is known.
+
             val now = System.currentTimeMillis()
             val effectiveTime = if (fileTimestamp > 1_000_000_000_000L) fileTimestamp else now
-            val windowStart = minOf(effectiveTime, now) - 24 * 60 * 60 * 1000L
-            val windowEnd = maxOf(effectiveTime, now) + 60_000L // 1 min buffer
+            // Audio files (voice notes) arrive within seconds. Restrict audio to ±60s!
+            val windowStart = if (mediaType == "audio") maxOf(minOf(effectiveTime, now) - 60_000L, 0L)
+                              else minOf(effectiveTime, now) - 24 * 60 * 60 * 1000L
+            val windowEnd = if (mediaType == "audio") minOf(effectiveTime, now) + 60_000L
+                            else maxOf(effectiveTime, now) + 60_000L // 1 min buffer
 
             val cleanBase = fileName.substringBeforeLast('.').lowercase()
             val cleanBaseNorm = cleanBase.replace('_', ' ')
@@ -720,6 +886,48 @@ class NativeDatabaseHelper private constructor(context: Context) {
 
             var matchedMessageId: Long? = null
             var matchedSenderName: String = ""
+
+            // Zero-touch fallback: if no sender context exists yet, only auto-link when there
+            // is exactly one valid message candidate in the time window. Multiple matches remain
+            // ambiguous and must be left pending instead of guessing across chats.
+            if (targetSender.isNullOrBlank()) {
+                var senderlessCandidateCount = 0
+                var senderlessMatchId: Long? = null
+                var senderlessMatchSender: String = ""
+
+                val senderlessCursor = safeDb().rawQuery(
+                    """
+                    SELECT id, message, timestamp, sender, senderName
+                    FROM messages
+                    WHERE (app LIKE '%whatsapp%')
+                      AND (mediaPath IS NULL OR mediaPath = '')
+                      AND timestamp BETWEEN $windowStart AND $windowEnd
+                      AND (message NOT LIKE 'Reacted %' AND message NOT LIKE 'Reacted to %')
+                    ORDER BY ABS(timestamp - $effectiveTime) ASC
+                    """.trimIndent(), null
+                )
+
+                senderlessCursor.use {
+                    while (it.moveToNext()) {
+                        val msgText = it.getString(1)?.lowercase() ?: ""
+                        if (!checkMatch(msgText)) continue
+
+                        senderlessCandidateCount += 1
+                        if (senderlessCandidateCount == 1) {
+                            senderlessMatchId = it.getLong(0)
+                            senderlessMatchSender = it.getString(4) ?: it.getString(3) ?: ""
+                        } else {
+                            senderlessMatchId = null
+                            senderlessMatchSender = ""
+                        }
+                    }
+                }
+
+                if (senderlessCandidateCount == 1 && senderlessMatchId != null) {
+                    matchedMessageId = senderlessMatchId
+                    matchedSenderName = senderlessMatchSender
+                }
+            }
 
             // Pass 1: If targetSender is known, prioritize matching unlinked messages from that specific sender/chat
             if (!targetSender.isNullOrBlank()) {
@@ -771,68 +979,9 @@ class NativeDatabaseHelper private constructor(context: Context) {
                 }
             }
 
-            // Pass 2: If no sender-specific match found in Pass 1:
-            // - If targetSender is blank, check global unlinked messages within 24h.
-            // - If targetSender was specified but Pass 1 found nothing, check global pool
-            //   ONLY within a tight ±45-second window around this file's capture time.
-            //   This allows matching if there was a minor sender title variance (e.g. contact name vs group name vs phone number)
-            //   while strictly preventing cross-chat misattribution of older messages.
-            if (matchedMessageId == null) {
-                val p2WindowStart = if (!targetSender.isNullOrBlank()) maxOf(windowStart, effectiveTime - 45_000L) else windowStart
-                val p2WindowEnd = if (!targetSender.isNullOrBlank()) minOf(windowEnd, effectiveTime + 45_000L) else windowEnd
-                val globalCursor = safeDb().rawQuery(
-                    """
-                    SELECT id, message, timestamp, sender, senderName 
-                    FROM messages 
-                    WHERE (app LIKE '%whatsapp%') 
-                      AND (mediaPath IS NULL OR mediaPath = '') 
-                      AND timestamp BETWEEN $p2WindowStart AND $p2WindowEnd
-                      AND (message NOT LIKE 'Reacted %' AND message NOT LIKE 'Reacted to %')
-                    ORDER BY ABS(timestamp - $effectiveTime) ASC
-                    LIMIT 20
-                    """.trimIndent(),
-                    null
-                )
-
-                globalCursor.use {
-                    var bestGenericId: Long? = null
-                    var bestGenericSender: String = ""
-
-                    while (it.moveToNext()) {
-                        val msgId = it.getLong(0)
-                        val msgText = it.getString(1)?.lowercase() ?: ""
-                        val sender = it.getString(3) ?: ""
-                        val senderName = it.getString(4) ?: sender
-
-                        // Skip call notifications that somehow made it into the DB
-                        if (msgText.contains("call") && (msgText.contains("missed") || msgText.contains("incoming") || 
-                            msgText.contains("ongoing") || msgText.contains("ringing"))) continue
-
-                        val hasFilenameMatch = cleanBase.length >= 3 && (
-                            msgText.contains(cleanBase) ||
-                            msgText.contains(cleanBaseNorm) ||
-                            msgText.contains(fileName.lowercase())
-                        )
-
-                        if (hasFilenameMatch) {
-                            matchedMessageId = msgId
-                            matchedSenderName = senderName
-                            break
-                        } else if (bestGenericId == null && checkMatch(msgText)) {
-                            bestGenericId = msgId
-                            bestGenericSender = senderName
-                        }
-                    }
-                    if (matchedMessageId == null && bestGenericId != null) {
-                        matchedMessageId = bestGenericId
-                        matchedSenderName = bestGenericSender
-                    }
-                }
-            }
-
-            // NOTE: Arbitrary 10-minute fallback to plain text messages has been completely removed.
-            // A media file is NEVER attached to plain text messages like "Tu bata", "Sett", or "Ok".
-
+            // Strict per-chat/user ID scoping:
+            // Under no circumstances should unmatched media fall back to a global search across all senders in the database!
+            // If Pass 1 found no matching message for targetSender, we do NOT guess or assign to another chat.
             if (matchedMessageId != null) {
                 val database = safeDb()
                 database.beginTransaction()
@@ -886,7 +1035,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
                     database.endTransaction()
                 }
             } else {
-                // If not matched immediately, record in media_attachments with matched = 0
+                // If not matched immediately with targetSender, record in media_attachments with matched = 0 and confirmed sender_name
                 // so when the notification arrives later, linkWaitingMediaToMessage will claim it!
                 try {
                     val database = safeDb()
@@ -899,7 +1048,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
                             put("media_type", mediaType)
                             put("file_path", mediaPath)
                             put("original_uri", originalUri)
-                            put("sender_name", targetSender ?: fileName)
+                            put("sender_name", targetSender ?: "") // Explicit targetSender, never guess fileName
                             put("captured_at", fileTimestamp)
                             put("matched", 0)
                         }

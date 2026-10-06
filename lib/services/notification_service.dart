@@ -3,6 +3,7 @@ import 'package:flutter/widgets.dart';
 import 'dart:io';
 import 'database_helper.dart';
 import '../models/message_model.dart';
+import '../utils/text_sanitizer.dart';
 import '../utils/timestamp_matcher.dart';
 import 'dart:async';
 import 'dart:collection';
@@ -22,45 +23,6 @@ final RegExp _groupNameCountSuffix = RegExp(
 String cleanGroupName(String rawTitle) {
   final cleaned = rawTitle.replaceAll(_groupNameCountSuffix, '').trim();
   return cleaned.isNotEmpty ? cleaned : rawTitle.trim();
-}
-
-/// Sanitize text to remove invalid UTF-16 characters that could crash the app.
-/// This is critical because notifications from apps like WhatsApp can sometimes
-/// contain malformed UTF-16 data (unpaired surrogates).
-String sanitizeText(String? text) {
-  if (text == null || text.isEmpty) return '';
-  try {
-    // Remove isolated surrogate code units which cause UTF-16 errors
-    final buffer = StringBuffer();
-    for (int i = 0; i < text.length; i++) {
-      final codeUnit = text.codeUnitAt(i);
-      // Check if it's a high surrogate (0xD800-0xDBFF)
-      if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
-        // Check if next character is a valid low surrogate
-        if (i + 1 < text.length) {
-          final nextCodeUnit = text.codeUnitAt(i + 1);
-          if (nextCodeUnit >= 0xDC00 && nextCodeUnit <= 0xDFFF) {
-            // Valid surrogate pair - keep both
-            buffer.writeCharCode(codeUnit);
-            buffer.writeCharCode(nextCodeUnit);
-            i++; // Skip the low surrogate
-            continue;
-          }
-        }
-        // Isolated high surrogate - replace with replacement character
-        buffer.write('\uFFFD');
-      } else if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) {
-        // Isolated low surrogate - replace with replacement character
-        buffer.write('\uFFFD');
-      } else {
-        buffer.writeCharCode(codeUnit);
-      }
-    }
-    return buffer.toString();
-  } catch (e) {
-    // If anything fails, return a safe fallback
-    return text.replaceAll(RegExp(r'[\uD800-\uDFFF]'), '\uFFFD');
-  }
 }
 
 /// NotificationService — the Flutter-side bridge to the native NotificationListener.
@@ -143,7 +105,7 @@ class NotificationService with WidgetsBindingObserver {
       _requestNlsRebind();
       // Check for any notifications that arrived while app was in background
       _checkForNewNotifications();
-      _checkForNewMedia();
+      _checkForNewMedia(); // reconcileNoSenderMedia() is called inside _checkForNewMedia
       _checkForCleanup();
       // Restart poll timer
       _startPollTimer();
@@ -369,9 +331,26 @@ class NotificationService with WidgetsBindingObserver {
           }
         }
         
-        // 24-hour window: covers existing placeholder messages saved before SAF ran.
-        // Widened from 1h to catch old "Video"/"Photo" messages that never got a file.
-        final matchResult = await TimestampMatcher.matchMediaToNotification(mediaEvent, 86400000);
+        // Sender-gated matching: the window and ambiguity rules differ based on
+        // whether a confirmed sender is attached to this media event.
+        //
+        // • targetSender present → sender-confirmed path: 24 h window, pick closest.
+        //   This covers all burst-scan events where the notification arrived first.
+        //
+        // • targetSender absent  → no-sender path (ContentObserver captured the file
+        //   before its notification was processed). Use a tight 30 s window AND require
+        //   an unambiguous single-candidate match (Option 2). If 2+ candidates exist
+        //   in the window we cannot safely guess, so we fall through to matched=0 and
+        //   let the 48 h TTL clean it up. Never wrong attribution.
+        final hasSender = (mediaEvent['targetSender'] as String?)?.trim().isNotEmpty == true;
+        final isAudio = mediaEvent['mediaType'] == 'audio';
+        final window = isAudio ? 60000 : (hasSender ? 86400000 : 30000);
+        final matchResult = hasSender
+            ? await TimestampMatcher.matchMediaToNotification(mediaEvent, window)
+            : (isAudio
+                ? MatchResult.unmatched()
+                : await TimestampMatcher.matchMediaToNotification(
+                    mediaEvent, window, requireUnambiguous: true));
         
         final attachmentData = <String, dynamic>{
           'media_type': mediaEvent['mediaType'] ?? 'unknown',
@@ -390,7 +369,11 @@ class NotificationService with WidgetsBindingObserver {
           await DatabaseHelper.instance.insertMediaAttachment(attachmentData);
           
           // Update the message so ConversationScreen sees the media directly
-          await DatabaseHelper.instance.updateMessageMediaPath(msg['id'] as int, attachmentData['file_path'] as String);
+          await DatabaseHelper.instance.updateMessageMediaPath(
+            msg['id'] as int,
+            attachmentData['file_path'] as String,
+            attachmentData['sender_name'] as String?,
+          );
           
           // Notify UI immediately so the conversation view refreshes without waiting
           newMessageNotifier.value++;
@@ -417,8 +400,74 @@ class NotificationService with WidgetsBindingObserver {
       debugPrint('[NotificationService] Error checking new media: $e');
     } finally {
       _isCheckingMedia = false;
-      // Reconcile any previously unlinked attachments sitting in DB
+      // Reconcile sender-confirmed unmatched media (known sender, matched=0)
       await reconcileUnmatchedMedia();
+      // Reconcile sender-unknown media (ContentObserver files with no sender context)
+      // using Option 2: auto-link only when exactly one candidate in ±30 s window.
+      await reconcileNoSenderMedia();
+    }
+  }
+
+  /// Reconciles sender-unknown media_attachments (sender_name = '', matched = 0)
+  /// using Option 2: auto-link ONLY when exactly one candidate message exists in a
+  /// ±30-second window across all chats. If two or more chats have eligible messages
+  /// in that window the result is ambiguous — leave matched=0 for the 48 h TTL rather
+  /// than guessing. This is the final safety net for files captured by ContentObserver
+  /// before their notification was processed.
+  Future<int> reconcileNoSenderMedia() async {
+    try {
+      final unmatched = await DatabaseHelper.instance.getUnmatchedNoSenderMedia();
+      if (unmatched.isEmpty) return 0;
+      int linked = 0;
+
+      for (final item in unmatched) {
+        final fPath = item['file_path'] as String? ?? '';
+        if (fPath.isEmpty || !File(fPath).existsSync()) continue;
+        final fName = fPath.split(Platform.pathSeparator).last;
+        final mediaType = item['media_type'] as String? ?? 'unknown';
+
+        // Voice notes contain no contact metadata and arrive concurrently.
+        // NEVER auto-link audio/voice notes in the no-sender path!
+        if (mediaType == 'audio' || fName.endsWith('.opus') || fName.startsWith('PTT-')) continue;
+
+        final mediaEvent = <String, dynamic>{
+          'originalUri': item['original_uri'] ?? '',
+          'mediaType': mediaType,
+          'filePath': fPath,
+          'fileTimestampMs': item['captured_at'] ?? 0,
+          'displayName': fName,
+          // No targetSender — this is the no-sender path by definition
+        };
+
+        // Tight 30s window (30000 ms); requireUnambiguous=true → ambiguous if 2+ candidates exist.
+        final matchResult = await TimestampMatcher.matchMediaToNotification(
+            mediaEvent, 30000, requireUnambiguous: true);
+
+        if (matchResult.isMatched && matchResult.matchedMessage != null) {
+          final msg = matchResult.matchedMessage!;
+          final msgId = msg['id'] as int;
+          final updated = await DatabaseHelper.instance.updateMessageMediaPath(
+            msgId,
+            fPath,
+            msg['sender'] as String?,
+          );
+          if (updated > 0) {
+            await DatabaseHelper.instance.markMediaAttachmentMatchedByPath(fPath, msgId);
+            linked++;
+            debugPrint('[NotificationService] reconcileNoSender: linked $fName -> msg #$msgId (${msg['sender']})');
+          } else {
+            // mediaPath slot already taken — mark as matched so it leaves the queue
+            await DatabaseHelper.instance.markMediaAttachmentMatchedByPath(fPath);
+          }
+        }
+        // isAmbiguous or isUnmatched → leave matched=0, TTL will handle it
+      }
+
+      if (linked > 0) newMessageNotifier.value++;
+      return linked;
+    } catch (e) {
+      debugPrint('[NotificationService] reconcileNoSenderMedia error: $e');
+      return 0;
     }
   }
 
@@ -453,6 +502,9 @@ class NotificationService with WidgetsBindingObserver {
         // be cross-linked into unrelated chats.
         if (effectiveSender == null || effectiveSender.isEmpty) continue;
 
+        final isAudio = item['media_type'] == 'audio' || fName.endsWith('.opus') || fName.startsWith('PTT-');
+        final window = isAudio ? 60000 : 86400000;
+
         final mediaEvent = <String, dynamic>{
           'originalUri': item['original_uri'] ?? '',
           'mediaType': item['media_type'] ?? 'unknown',
@@ -461,11 +513,15 @@ class NotificationService with WidgetsBindingObserver {
           'displayName': fName,
           'targetSender': effectiveSender,
         };
-        final matchResult = await TimestampMatcher.matchMediaToNotification(mediaEvent, 86400000);
+        final matchResult = await TimestampMatcher.matchMediaToNotification(mediaEvent, window);
         if (matchResult.isMatched && matchResult.matchedMessage != null) {
           final msg = matchResult.matchedMessage!;
           final msgId = msg['id'] as int;
-          final updated = await DatabaseHelper.instance.updateMessageMediaPath(msgId, fPath);
+          final updated = await DatabaseHelper.instance.updateMessageMediaPath(
+            msgId,
+            fPath,
+            effectiveSender,
+          );
           if (updated > 0) {
             await DatabaseHelper.instance.markMediaAttachmentMatchedByPath(fPath, msgId);
             linked++;
@@ -564,6 +620,15 @@ class NotificationService with WidgetsBindingObserver {
     }
   }
 
+  Future<bool> isNlsConnected() async {
+    try {
+      return await platform.invokeMethod('isNlsConnected') as bool;
+    } catch (e) {
+      debugPrint('[NotificationService] NLS connection check error: $e');
+      return false;
+    }
+  }
+
   Future<void> openNotificationSettings() async {
     try {
       await platform.invokeMethod('openNotificationSettings');
@@ -584,6 +649,14 @@ class NotificationService with WidgetsBindingObserver {
     try {
       final deletedCount = await DatabaseHelper.instance.deleteOldMessages();
       debugPrint('[NotificationService] Cleaned up $deletedCount old messages');
+      // TTL: remove matched=0 media_attachments older than 48 h (rows + physical files).
+      // These are files that were never claimed by any notification — either the message
+      // was deleted, the notification was missed, or the file was a false ContentObserver
+      // trigger with no corresponding WhatsApp activity.
+      final orphanCount = await DatabaseHelper.instance.cleanOrphanedUnmatchedAttachments();
+      if (orphanCount > 0) {
+        debugPrint('[NotificationService] TTL: removed $orphanCount orphaned media_attachments');
+      }
     } catch (e) {
       debugPrint('[NotificationService] Cleanup error: $e');
     }

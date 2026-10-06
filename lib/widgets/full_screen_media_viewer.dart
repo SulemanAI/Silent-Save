@@ -133,16 +133,25 @@ class _FullScreenMediaViewerState extends State<FullScreenMediaViewer> {
             : null,
         centerTitle: true,
         actions: [
-          IconButton(
-            icon: const Icon(Icons.copy, color: Colors.white),
-            tooltip: 'Copy to clipboard',
-            onPressed: () async {
-              final ok = await NotificationService.instance.copyMediaToClipboard(
-                filePath: _paths[_currentIndex],
-              );
-              _showSnack(ok ? 'Media copied to clipboard' : 'Failed to copy to clipboard');
-            },
-          ),
+            IconButton(
+              icon: const Icon(Icons.copy, color: Colors.white),
+              tooltip: 'Copy to clipboard',
+              onPressed: () async {
+                final ok = await NotificationService.instance.copyMediaToClipboard(
+                  filePath: _paths[_currentIndex],
+                );
+                if (!mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    backgroundColor: Colors.white,
+                    content: Text(
+                      ok ? 'Media copied to clipboard' : 'Failed to copy to clipboard',
+                      style: const TextStyle(color: Colors.black87),
+                    ),
+                  ),
+                );
+              },
+            ),
           IconButton(
             icon: const Icon(Icons.share, color: Colors.white),
             tooltip: 'Share',

@@ -1,15 +1,17 @@
 class MessageModel {
-  final int? id;
-  final String sender;  // Chat/Group name for grouping
+  final int? id;  final String sender; // Chat/Group name for grouping
   final String message;
   final String app;
   final DateTime timestamp;
   final bool? isDeleted; // Track if message was deleted/recalled
   final bool? isRead; // Track if message has been read
-  final String? senderName; // Individual sender name (for group chats, shows who sent the message)
+  final bool? isSaved; // Keep message in the user's saved messages
+  final String?
+  senderName; // Individual sender name (for group chats, shows who sent the message)
   final bool? isGroupChat; // Whether this message is from a group chat
   final String? avatarPath; // Path to sender's profile picture
-  final String? mediaPath;  // Path to saved media image (photo/sticker/video thumb)
+  final String?
+  mediaPath; // Path to saved media image (photo/sticker/video thumb)
 
   MessageModel({
     this.id,
@@ -19,6 +21,7 @@ class MessageModel {
     required this.timestamp,
     this.isDeleted = false,
     this.isRead = false,
+    this.isSaved = false,
     this.senderName,
     this.isGroupChat = false,
     this.avatarPath,
@@ -34,6 +37,7 @@ class MessageModel {
       'timestamp': timestamp.millisecondsSinceEpoch,
       'isDeleted': isDeleted == true ? 1 : 0,
       'isRead': isRead == true ? 1 : 0,
+      'isSaved': isSaved == true ? 1 : 0,
       'senderName': senderName ?? sender,
       'isGroupChat': isGroupChat == true ? 1 : 0,
     };
@@ -54,7 +58,7 @@ class MessageModel {
     final timestamp = timestampValue != null
         ? DateTime.fromMillisecondsSinceEpoch(timestampValue as int)
         : DateTime.now();
-    
+
     return MessageModel(
       id: map['id'],
       sender: map['sender'] ?? 'Unknown',
@@ -63,6 +67,7 @@ class MessageModel {
       timestamp: timestamp,
       isDeleted: map['isDeleted'] == 1,
       isRead: map['isRead'] == 1,
+      isSaved: map['isSaved'] == 1,
       senderName: map['senderName'] ?? map['sender'] ?? 'Unknown',
       isGroupChat: map['isGroupChat'] == 1,
       avatarPath: map['avatarPath'],

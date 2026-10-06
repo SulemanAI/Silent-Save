@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import 'package:flutter/foundation.dart';
@@ -23,7 +24,7 @@ class DatabaseHelper {
 
     final db = await openDatabase(
       path,
-      version: 8,  // v8: added indexes for getConversations performance
+      version: 9, // v9: added permanent saved-message state
       onCreate: _createDB,
       onUpgrade: _onUpgrade,
     );
@@ -44,7 +45,9 @@ class DatabaseHelper {
       final columnNames = columns.map((c) => c['name'] as String).toSet();
 
       if (!columnNames.contains('isRead')) {
-        await db.execute('ALTER TABLE messages ADD COLUMN isRead INTEGER DEFAULT 0');
+        await db.execute(
+          'ALTER TABLE messages ADD COLUMN isRead INTEGER DEFAULT 0',
+        );
         debugPrint('[DatabaseHelper] Added missing column: isRead');
       }
       if (!columnNames.contains('senderName')) {
@@ -52,7 +55,9 @@ class DatabaseHelper {
         debugPrint('[DatabaseHelper] Added missing column: senderName');
       }
       if (!columnNames.contains('isGroupChat')) {
-        await db.execute('ALTER TABLE messages ADD COLUMN isGroupChat INTEGER DEFAULT 0');
+        await db.execute(
+          'ALTER TABLE messages ADD COLUMN isGroupChat INTEGER DEFAULT 0',
+        );
         debugPrint('[DatabaseHelper] Added missing column: isGroupChat');
       }
       if (!columnNames.contains('avatarPath')) {
@@ -63,6 +68,12 @@ class DatabaseHelper {
         await db.execute('ALTER TABLE messages ADD COLUMN mediaPath TEXT');
         debugPrint('[DatabaseHelper] Added missing column: mediaPath');
       }
+      if (!columnNames.contains('isSaved')) {
+        await db.execute(
+          'ALTER TABLE messages ADD COLUMN isSaved INTEGER DEFAULT 0',
+        );
+        debugPrint('[DatabaseHelper] Added missing column: isSaved');
+      }
     } catch (e) {
       debugPrint('[DatabaseHelper] _ensureColumns error: $e');
     }
@@ -71,12 +82,16 @@ class DatabaseHelper {
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
     if (oldVersion < 2) {
       // Add isRead column for version 2
-      await db.execute('ALTER TABLE messages ADD COLUMN isRead INTEGER DEFAULT 0');
+      await db.execute(
+        'ALTER TABLE messages ADD COLUMN isRead INTEGER DEFAULT 0',
+      );
     }
     if (oldVersion < 3) {
       // Add senderName and isGroupChat columns for version 3
       await db.execute('ALTER TABLE messages ADD COLUMN senderName TEXT');
-      await db.execute('ALTER TABLE messages ADD COLUMN isGroupChat INTEGER DEFAULT 0');
+      await db.execute(
+        'ALTER TABLE messages ADD COLUMN isGroupChat INTEGER DEFAULT 0',
+      );
     }
     if (oldVersion < 4) {
       // Add composite index for fast dedup lookups
@@ -113,6 +128,19 @@ class DatabaseHelper {
         ON messages(sender, app, isDeleted, isRead)
       ''');
     }
+    if (oldVersion < 9) {
+      try {
+        await db.execute(
+          'ALTER TABLE messages ADD COLUMN isSaved INTEGER DEFAULT 0',
+        );
+      } catch (_) {
+        // Column may already exist from _ensureColumns safety net
+      }
+      await db.execute('''
+        CREATE INDEX IF NOT EXISTS idx_saved_messages
+        ON messages(isSaved, timestamp)
+      ''');
+    }
   }
 
   Future<void> _createDB(Database db, int version) async {
@@ -128,7 +156,8 @@ class DatabaseHelper {
         senderName TEXT,
         isGroupChat INTEGER DEFAULT 0,
         avatarPath TEXT,
-        mediaPath TEXT
+        mediaPath TEXT,
+        isSaved INTEGER DEFAULT 0
       )
     ''');
 
@@ -148,6 +177,10 @@ class DatabaseHelper {
     await db.execute('''
       CREATE INDEX IF NOT EXISTS idx_conversations_unread 
       ON messages(sender, app, isDeleted, isRead)
+    ''');
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS idx_saved_messages
+      ON messages(isSaved, timestamp)
     ''');
 
     // media_attachments table (v7)
@@ -181,25 +214,25 @@ class DatabaseHelper {
     debugPrint('[DatabaseHelper] media_attachments table created');
   }
 
-
   Future<int> insertMessage(MessageModel message) async {
     final db = await database;
-    
+
     // Encrypt message if encryption is enabled
     final isEncrypted = await _encryptionService.isEncryptionEnabled();
     final encryptedMessage = isEncrypted
         ? await _encryptionService.encrypt(message.message)
         : message.message;
-    
+
     // Time-window dedup: check for same sender+app+message within ±2 seconds.
     // WhatsApp/Instagram sometimes re-post the same message with slightly
     // different timestamps, so exact-match isn't enough.
     final tsMs = message.timestamp.millisecondsSinceEpoch;
     const dedupWindowMs = 2000; // ±2 seconds
-    
+
     final duplicateCheck = await db.query(
       'messages',
-      where: 'sender = ? AND app = ? AND message = ? AND timestamp BETWEEN ? AND ?',
+      where:
+          'sender = ? AND app = ? AND message = ? AND timestamp BETWEEN ? AND ?',
       whereArgs: [
         message.sender,
         message.app,
@@ -209,12 +242,12 @@ class DatabaseHelper {
       ],
       limit: 1,
     );
-    
+
     if (duplicateCheck.isNotEmpty) {
       debugPrint('[DatabaseHelper] Duplicate (±2s window), skipping');
       return -1;
     }
-    
+
     final messageToInsert = MessageModel(
       sender: message.sender,
       message: encryptedMessage,
@@ -222,15 +255,16 @@ class DatabaseHelper {
       timestamp: message.timestamp,
       isDeleted: message.isDeleted,
       isRead: message.isRead,
+      isSaved: message.isSaved,
       senderName: message.senderName,
       isGroupChat: message.isGroupChat,
       avatarPath: message.avatarPath,
       mediaPath: message.mediaPath,
     );
-    
+
     final result = await db.insert('messages', messageToInsert.toMap());
     debugPrint('[DatabaseHelper] ✓ Saved #$result from "${message.sender}"');
-    
+
     return result;
   }
 
@@ -238,24 +272,25 @@ class DatabaseHelper {
   /// Returns the number of messages actually inserted (excluding deduped).
   Future<int> insertMessages(List<MessageModel> messages) async {
     if (messages.isEmpty) return 0;
-    
+
     final db = await database;
     final isEncrypted = await _encryptionService.isEncryptionEnabled();
     int inserted = 0;
-    
+
     await db.transaction((txn) async {
       for (final message in messages) {
         try {
           final encryptedMessage = isEncrypted
               ? await _encryptionService.encrypt(message.message)
               : message.message;
-          
+
           final tsMs = message.timestamp.millisecondsSinceEpoch;
           const dedupWindowMs = 2000;
-          
+
           final duplicateCheck = await txn.query(
             'messages',
-            where: 'sender = ? AND app = ? AND message = ? AND timestamp BETWEEN ? AND ?',
+            where:
+                'sender = ? AND app = ? AND message = ? AND timestamp BETWEEN ? AND ?',
             whereArgs: [
               message.sender,
               message.app,
@@ -265,12 +300,14 @@ class DatabaseHelper {
             ],
             limit: 1,
           );
-          
+
           if (duplicateCheck.isNotEmpty) {
-            debugPrint('[DatabaseHelper] Dedup skip: "${message.sender}" @${message.timestamp.millisecondsSinceEpoch}ms');
+            debugPrint(
+              '[DatabaseHelper] Dedup skip: "${message.sender}" @${message.timestamp.millisecondsSinceEpoch}ms',
+            );
             continue;
           }
-          
+
           final messageToInsert = MessageModel(
             sender: message.sender,
             message: encryptedMessage,
@@ -278,38 +315,45 @@ class DatabaseHelper {
             timestamp: message.timestamp,
             isDeleted: message.isDeleted,
             isRead: message.isRead,
+            isSaved: message.isSaved,
             senderName: message.senderName,
             isGroupChat: message.isGroupChat,
             avatarPath: message.avatarPath,
             mediaPath: message.mediaPath,
           );
-          
+
           await txn.insert('messages', messageToInsert.toMap());
           inserted++;
         } catch (e) {
-          debugPrint('[DatabaseHelper] Batch insert error for "${message.sender}": $e');
+          debugPrint(
+            '[DatabaseHelper] Batch insert error for "${message.sender}": $e',
+          );
         }
       }
     });
-    
+
     if (inserted > 0) {
-      debugPrint('[DatabaseHelper] ✓ Batch saved $inserted/${messages.length} messages');
+      debugPrint(
+        '[DatabaseHelper] ✓ Batch saved $inserted/${messages.length} messages',
+      );
     }
-    
+
     return inserted;
   }
 
   Future<List<MessageModel>> getAllMessages() async {
     final db = await database;
     final result = await db.query('messages', orderBy: 'timestamp DESC');
-    
+
     final messages = result.map((map) => MessageModel.fromMap(map)).toList();
-    
+
     // Decrypt messages if encryption is enabled
     if (await _encryptionService.isEncryptionEnabled()) {
       for (var i = 0; i < messages.length; i++) {
         try {
-          final decryptedMessage = await _encryptionService.decrypt(messages[i].message);
+          final decryptedMessage = await _encryptionService.decrypt(
+            messages[i].message,
+          );
           messages[i] = MessageModel(
             id: messages[i].id,
             sender: messages[i].sender,
@@ -318,6 +362,7 @@ class DatabaseHelper {
             timestamp: messages[i].timestamp,
             isDeleted: messages[i].isDeleted,
             isRead: messages[i].isRead,
+            isSaved: messages[i].isSaved,
             senderName: messages[i].senderName,
             isGroupChat: messages[i].isGroupChat,
             avatarPath: messages[i].avatarPath,
@@ -328,11 +373,15 @@ class DatabaseHelper {
         }
       }
     }
-    
+
     return messages;
   }
 
-  Future<List<MessageModel>> getMessagesBySender(String sender, {int? limit, int? offset}) async {
+  Future<List<MessageModel>> getMessagesBySender(
+    String sender, {
+    int? limit,
+    int? offset,
+  }) async {
     final db = await database;
     final result = await db.query(
       'messages',
@@ -342,14 +391,16 @@ class DatabaseHelper {
       limit: limit,
       offset: offset,
     );
-    
+
     final messages = result.map((map) => MessageModel.fromMap(map)).toList();
-    
+
     // Decrypt messages if encryption is enabled
     if (await _encryptionService.isEncryptionEnabled()) {
       for (var i = 0; i < messages.length; i++) {
         try {
-          final decryptedMessage = await _encryptionService.decrypt(messages[i].message);
+          final decryptedMessage = await _encryptionService.decrypt(
+            messages[i].message,
+          );
           messages[i] = MessageModel(
             id: messages[i].id,
             sender: messages[i].sender,
@@ -358,6 +409,7 @@ class DatabaseHelper {
             timestamp: messages[i].timestamp,
             isDeleted: messages[i].isDeleted,
             isRead: messages[i].isRead,
+            isSaved: messages[i].isSaved,
             senderName: messages[i].senderName,
             isGroupChat: messages[i].isGroupChat,
             avatarPath: messages[i].avatarPath,
@@ -368,55 +420,155 @@ class DatabaseHelper {
         }
       }
     }
-    
+
     return messages;
   }
 
-  Future<List<MessageModel>> getMediaMessagesBySender(String sender) async {
+  /// Permanently marks one message as saved or unsaved.
+  Future<int> setMessageSaved(int messageId, bool isSaved) async {
     final db = await database;
+    return db.update(
+      'messages',
+      {'isSaved': isSaved ? 1 : 0},
+      where: 'id = ?',
+      whereArgs: [messageId],
+    );
+  }
+
+  /// Updates saved state for several messages in one transaction.
+  Future<int> setMessagesSaved(Iterable<int> messageIds, bool isSaved) async {
+    final ids = messageIds.toList();
+    if (ids.isEmpty) return 0;
+
+    final db = await database;
+    final placeholders = List.filled(ids.length, '?').join(', ');
+    return db.update(
+      'messages',
+      {'isSaved': isSaved ? 1 : 0},
+      where: 'id IN ($placeholders)',
+      whereArgs: ids,
+    );
+  }
+
+  /// Returns all saved messages, newest first, with encrypted content decrypted.
+  Future<List<MessageModel>> getSavedMessages() async {
+    final messages = await getAllMessages();
+    return messages.where((message) => message.isSaved == true).toList();
+  }
+
+  Future<List<MessageModel>> getMediaMessagesBySender(
+    String sender, {
+    String? senderName,
+  }) async {
+    final db = await database;
+    final whereClause = senderName != null && senderName.isNotEmpty
+        ? 'sender = ? AND mediaPath IS NOT NULL AND mediaPath != \'\' AND COALESCE(NULLIF(TRIM(senderName), \'\'), sender) = ?'
+        : 'sender = ? AND mediaPath IS NOT NULL AND mediaPath != \'\'';
+    final whereArgs = senderName != null && senderName.isNotEmpty
+        ? [sender, senderName]
+        : [sender];
+
     final result = await db.query(
       'messages',
-      where: 'sender = ? AND mediaPath IS NOT NULL AND mediaPath != \'\'',
-      whereArgs: [sender],
+      where: whereClause,
+      whereArgs: whereArgs,
       orderBy: 'timestamp DESC',
     );
-    
+
     return result.map((map) => MessageModel.fromMap(map)).toList();
   }
 
-  Future<List<Map<String, dynamic>>> getDailyMessageCounts(String sender) async {
+  Future<List<Map<String, dynamic>>> getDailyMessageCounts(
+    String sender, {
+    String? senderName,
+  }) async {
     final db = await database;
-    final result = await db.rawQuery('''
+    final whereSenderClause = senderName != null && senderName.isNotEmpty
+        ? ' AND COALESCE(NULLIF(TRIM(senderName), \'\'), sender) = ?'
+        : '';
+    final whereArgs = senderName != null && senderName.isNotEmpty
+        ? [sender, senderName]
+        : [sender];
+
+    final result = await db.rawQuery(
+      '''
       SELECT 
         date(timestamp / 1000, 'unixepoch', 'localtime') as day,
         COUNT(*) as count
       FROM messages
-      WHERE sender = ? AND isDeleted = 0
+      WHERE sender = ? AND isDeleted = 0$whereSenderClause
       GROUP BY day
       ORDER BY day ASC
-    ''', [sender]);
+    ''',
+      whereArgs,
+    );
     return result;
   }
 
-  Future<Map<String, int>> getChatStatsSummary(String sender) async {
+  Future<Map<String, int>> getChatStatsSummary(
+    String sender, {
+    String? senderName,
+  }) async {
     final db = await database;
-    final totalResult = await db.rawQuery('SELECT COUNT(*) as count FROM messages WHERE sender = ? AND isDeleted = 0', [sender]);
-    final mediaResult = await db.rawQuery('SELECT COUNT(*) as count FROM messages WHERE sender = ? AND isDeleted = 0 AND mediaPath IS NOT NULL AND mediaPath != \'\'', [sender]);
-    
-    int totalCount = totalResult.isNotEmpty ? totalResult.first['count'] as int : 0;
-    int mediaCount = mediaResult.isNotEmpty ? mediaResult.first['count'] as int : 0;
-    
-    return {
-      'total': totalCount,
-      'media': mediaCount,
-    };
+    final whereSenderClause = senderName != null && senderName.isNotEmpty
+        ? ' AND COALESCE(NULLIF(TRIM(senderName), \'\'), sender) = ?'
+        : '';
+    final whereArgs = senderName != null && senderName.isNotEmpty
+        ? [sender, senderName]
+        : [sender];
+
+    final totalResult = await db.rawQuery(
+      'SELECT COUNT(*) as count FROM messages WHERE sender = ? AND isDeleted = 0$whereSenderClause',
+      whereArgs,
+    );
+    final mediaResult = await db.rawQuery(
+      'SELECT COUNT(*) as count FROM messages WHERE sender = ? AND isDeleted = 0 AND mediaPath IS NOT NULL AND mediaPath != \'\'$whereSenderClause',
+      whereArgs,
+    );
+
+    int totalCount = totalResult.isNotEmpty
+        ? totalResult.first['count'] as int
+        : 0;
+    int mediaCount = mediaResult.isNotEmpty
+        ? mediaResult.first['count'] as int
+        : 0;
+
+    return {'total': totalCount, 'media': mediaCount};
+  }
+
+  /// Get detailed stats per member for a group conversation.
+  /// Returns a list of maps containing: name, messageCount, mediaCount, lastTimestamp.
+  Future<List<Map<String, dynamic>>> getGroupMembersWithStats(String sender) async {
+    final db = await database;
+    final result = await db.rawQuery(
+      '''
+      SELECT 
+        COALESCE(NULLIF(TRIM(senderName), ''), sender) as memberName, 
+        COUNT(*) as messageCount,
+        COALESCE(SUM(CASE WHEN mediaPath IS NOT NULL AND mediaPath != '' THEN 1 ELSE 0 END), 0) as mediaCount,
+        MAX(timestamp) as lastTimestamp
+      FROM messages 
+      WHERE sender = ? AND isDeleted = 0 
+      GROUP BY COALESCE(NULLIF(TRIM(senderName), ''), sender)
+      ORDER BY messageCount DESC, memberName COLLATE NOCASE ASC
+    ''',
+      [sender],
+    );
+
+    return result.map((row) => {
+      'name': (row['memberName'] as String? ?? '').trim(),
+      'messageCount': (row['messageCount'] as num? ?? 0).toInt(),
+      'mediaCount': (row['mediaCount'] as num? ?? 0).toInt(),
+      'lastTimestamp': row['lastTimestamp'] != null ? (row['lastTimestamp'] as num).toInt() : null,
+    }).where((m) => (m['name'] as String).isNotEmpty).toList();
   }
 
   /// Get message counts per member for a group conversation.
   /// Returns a Map of memberName -> messageCount.
   Future<Map<String, int>> getGroupMemberMessageCounts(String sender) async {
     final db = await database;
-    final result = await db.rawQuery('''
+    final result = await db.rawQuery(
+      '''
       SELECT 
         COALESCE(NULLIF(TRIM(senderName), ''), sender) as memberName, 
         COUNT(*) as count 
@@ -424,7 +576,9 @@ class DatabaseHelper {
       WHERE sender = ? AND isDeleted = 0 
       GROUP BY COALESCE(NULLIF(TRIM(senderName), ''), sender)
       ORDER BY count DESC, memberName COLLATE NOCASE ASC
-    ''', [sender]);
+    ''',
+      [sender],
+    );
 
     final Map<String, int> counts = {};
     for (final row in result) {
@@ -447,15 +601,25 @@ class DatabaseHelper {
     return result.isNotEmpty;
   }
 
-  Future<List<String>> getAllTextMessages(String sender) async {
+  Future<List<String>> getAllTextMessages(
+    String sender, {
+    String? senderName,
+  }) async {
     final db = await database;
+    final whereClause = senderName != null && senderName.isNotEmpty
+        ? 'sender = ? AND isDeleted = 0 AND (mediaPath IS NULL OR mediaPath = \'\') AND COALESCE(NULLIF(TRIM(senderName), \'\'), sender) = ?'
+        : 'sender = ? AND isDeleted = 0 AND (mediaPath IS NULL OR mediaPath = \'\')';
+    final whereArgs = senderName != null && senderName.isNotEmpty
+        ? [sender, senderName]
+        : [sender];
+
     final result = await db.query(
       'messages',
       columns: ['message'],
-      where: 'sender = ? AND isDeleted = 0 AND (mediaPath IS NULL OR mediaPath = \'\')',
-      whereArgs: [sender],
+      where: whereClause,
+      whereArgs: whereArgs,
     );
-    
+
     final messages = <String>[];
     final isEnc = await _encryptionService.isEncryptionEnabled();
     for (var row in result) {
@@ -472,7 +636,7 @@ class DatabaseHelper {
 
   Future<List<Map<String, dynamic>>> getConversations() async {
     final db = await database;
-    
+
     // Get conversations with last message, unread count, group chat info, and avatar
     final result = await db.rawQuery('''
       SELECT 
@@ -496,14 +660,16 @@ class DatabaseHelper {
       GROUP BY m.sender, m.app
       ORDER BY lastTimestamp DESC
     ''');
-    
+
     // Decrypt last message if encryption is enabled
     if (await _encryptionService.isEncryptionEnabled()) {
       final decryptedResults = <Map<String, dynamic>>[];
       for (var row in result) {
         final mutableRow = Map<String, dynamic>.from(row);
         try {
-          final decryptedMessage = await _encryptionService.decrypt(row['lastMessage'] as String? ?? '');
+          final decryptedMessage = await _encryptionService.decrypt(
+            row['lastMessage'] as String? ?? '',
+          );
           mutableRow['lastMessage'] = decryptedMessage;
         } catch (e) {
           // Keep original if decryption fails
@@ -512,19 +678,32 @@ class DatabaseHelper {
       }
       return decryptedResults;
     }
-    
-    debugPrint('[DatabaseHelper] getConversations returning ${result.length} conversations');
+
+    debugPrint(
+      '[DatabaseHelper] getConversations returning ${result.length} conversations',
+    );
     for (var conv in result) {
-      debugPrint('[DatabaseHelper] Conversation: sender=${conv['sender']}, messageCount=${conv['messageCount']}, unreadCount=${conv['unreadCount']}');
+      debugPrint(
+        '[DatabaseHelper] Conversation: sender=${conv['sender']}, messageCount=${conv['messageCount']}, unreadCount=${conv['unreadCount']}',
+      );
     }
-    
+
     return result;
+  }
+
+  Future<bool> hasSavedMessages(String sender) async {
+    final db = await database;
+    final result = await db.rawQuery(
+      'SELECT 1 FROM messages WHERE sender = ? AND isSaved = 1 AND isDeleted = 0 LIMIT 1',
+      [sender],
+    );
+    return result.isNotEmpty;
   }
 
   Future<List<MessageModel>> searchMessages(String query) async {
     final db = await database;
     final isEncrypted = await _encryptionService.isEncryptionEnabled();
-    
+
     // If encryption is enabled, we need to search in decrypted content
     // So we fetch all messages first, decrypt, then filter
     if (isEncrypted) {
@@ -534,14 +713,18 @@ class DatabaseHelper {
         where: 'isDeleted = 0',
         orderBy: 'timestamp DESC',
       );
-      
-      final messages = allResult.map((map) => MessageModel.fromMap(map)).toList();
+
+      final messages = allResult
+          .map((map) => MessageModel.fromMap(map))
+          .toList();
       final queryLower = query.toLowerCase();
       final filteredMessages = <MessageModel>[];
-      
+
       for (var i = 0; i < messages.length; i++) {
         try {
-          final decryptedMessage = await _encryptionService.decrypt(messages[i].message);
+          final decryptedMessage = await _encryptionService.decrypt(
+            messages[i].message,
+          );
           final decryptedModel = MessageModel(
             id: messages[i].id,
             sender: messages[i].sender,
@@ -550,12 +733,13 @@ class DatabaseHelper {
             timestamp: messages[i].timestamp,
             isDeleted: messages[i].isDeleted,
             isRead: messages[i].isRead,
+            isSaved: messages[i].isSaved,
             senderName: messages[i].senderName,
             isGroupChat: messages[i].isGroupChat,
             avatarPath: messages[i].avatarPath,
             mediaPath: messages[i].mediaPath,
           );
-          
+
           // Filter by query on decrypted content
           if (decryptedModel.sender.toLowerCase().contains(queryLower) ||
               decryptedModel.message.toLowerCase().contains(queryLower)) {
@@ -569,7 +753,7 @@ class DatabaseHelper {
           }
         }
       }
-      
+
       return filteredMessages;
     } else {
       // Non-encrypted: use regular SQL search
@@ -579,7 +763,7 @@ class DatabaseHelper {
         whereArgs: ['%$query%', '%$query%'],
         orderBy: 'timestamp DESC',
       );
-      
+
       return result.map((map) => MessageModel.fromMap(map)).toList();
     }
   }
@@ -617,7 +801,10 @@ class DatabaseHelper {
   }
 
   // Mark message as deleted by matching sender and message content
-  Future<int> markMessageAsDeletedByContent(String sender, String message) async {
+  Future<int> markMessageAsDeletedByContent(
+    String sender,
+    String message,
+  ) async {
     final db = await database;
     return await db.update(
       'messages',
@@ -631,10 +818,10 @@ class DatabaseHelper {
   Future<int> deleteOldMessages() async {
     final db = await database;
     final fifteenDaysAgo = DateTime.now().subtract(const Duration(days: 15));
-    
+
     return await db.delete(
       'messages',
-      where: 'timestamp < ?',
+      where: 'timestamp < ? AND isSaved = 0',
       whereArgs: [fifteenDaysAgo.millisecondsSinceEpoch],
     );
   }
@@ -653,11 +840,9 @@ class DatabaseHelper {
   // Mark all messages as read (for "Mark all read" feature)
   Future<int> markAllMessagesAsRead() async {
     final db = await database;
-    return await db.update(
-      'messages',
-      {'isRead': 1},
-      where: 'isRead = 0 AND isDeleted = 0',
-    );
+    return await db.update('messages', {
+      'isRead': 1,
+    }, where: 'isRead = 0 AND isDeleted = 0');
   }
 
   // Mark all messages from a specific app as read
@@ -673,7 +858,11 @@ class DatabaseHelper {
 
   /// Check if a message already exists in DB (for AccessibilityService dedup)
   /// Returns true if duplicate exists within the time window
-  Future<bool> isDuplicateMessage(String sender, String message, int timestampMs) async {
+  Future<bool> isDuplicateMessage(
+    String sender,
+    String message,
+    int timestampMs,
+  ) async {
     final db = await database;
     const dedupWindowMs = 10000; // ±10 seconds for accessibility service
 
@@ -729,13 +918,17 @@ class DatabaseHelper {
   /// no media assigned yet. Excludes emoji reaction messages.
   /// Automatically decrypts message text if database encryption is enabled
   /// so TimestampMatcher can evaluate actual content keywords.
-  Future<List<Map<String, dynamic>>> getRecentWhatsAppMessages(int windowMs, int fileTimestampMs) async {
+  Future<List<Map<String, dynamic>>> getRecentWhatsAppMessages(
+    int windowMs,
+    int fileTimestampMs,
+  ) async {
     final db = await database;
     final minTs = fileTimestampMs - windowMs;
     final maxTs = fileTimestampMs + windowMs;
     final rows = await db.query(
       'messages',
-      where: 'app LIKE ? AND timestamp BETWEEN ? AND ? AND (mediaPath IS NULL OR mediaPath = \'\') AND (message NOT LIKE \'Reacted %\' AND message NOT LIKE \'Reacted to %\')',
+      where:
+          'app LIKE ? AND timestamp BETWEEN ? AND ? AND (mediaPath IS NULL OR mediaPath = \'\') AND (message NOT LIKE \'Reacted %\' AND message NOT LIKE \'Reacted to %\')',
       whereArgs: ['%whatsapp%', minTs, maxTs],
       orderBy: 'timestamp DESC',
     );
@@ -751,14 +944,17 @@ class DatabaseHelper {
     }
     return rows;
   }
-  
+
   /// Gets distinct unmatched media attachments for reconciliation.
   /// Automatically filters out any files that are already linked in the messages table
   /// to prevent queue clogging.
-  Future<List<Map<String, dynamic>>> getUnmatchedMediaAttachments([String? targetSender]) async {
+  Future<List<Map<String, dynamic>>> getUnmatchedMediaAttachments([
+    String? targetSender,
+  ]) async {
     final db = await database;
     if (targetSender != null && targetSender.trim().isNotEmpty) {
-      return await db.rawQuery('''
+      return await db.rawQuery(
+        '''
         SELECT id, notification_id, media_type, file_path, original_uri, sender_name, captured_at, matched
         FROM media_attachments
         WHERE matched = 0
@@ -769,7 +965,9 @@ class DatabaseHelper {
         GROUP BY file_path
         ORDER BY captured_at DESC
         LIMIT 100
-      ''', [targetSender.trim(), '%${targetSender.trim()}%']);
+      ''',
+        [targetSender.trim(), '%${targetSender.trim()}%'],
+      );
     }
 
     return await db.rawQuery('''
@@ -786,7 +984,10 @@ class DatabaseHelper {
   }
 
   /// Marks all media_attachments rows with [filePath] as matched.
-  Future<int> markMediaAttachmentMatchedByPath(String filePath, [int? messageId]) async {
+  Future<int> markMediaAttachmentMatchedByPath(
+    String filePath, [
+    int? messageId,
+  ]) async {
     final db = await database;
     final data = <String, dynamic>{'matched': 1};
     if (messageId != null) {
@@ -801,7 +1002,9 @@ class DatabaseHelper {
   }
 
   /// Gets all media attachments for a specific notification ID
-  Future<List<Map<String, dynamic>>> getMediaAttachmentsForMessage(int messageId) async {
+  Future<List<Map<String, dynamic>>> getMediaAttachmentsForMessage(
+    int messageId,
+  ) async {
     final db = await database;
     return await db.query(
       'media_attachments',
@@ -809,25 +1012,61 @@ class DatabaseHelper {
       whereArgs: [messageId],
     );
   }
-  
+
   /// Updates a media attachment with its matched notification ID
-  Future<int> updateMediaAttachmentMatch(int attachmentId, int messageId) async {
+  Future<int> updateMediaAttachmentMatch(
+    int attachmentId,
+    int messageId,
+  ) async {
     final db = await database;
     return await db.update(
       'media_attachments',
-      {
-        'notification_id': messageId,
-        'matched': 1,
-      },
+      {'notification_id': messageId, 'matched': 1},
       where: 'id = ?',
       whereArgs: [attachmentId],
     );
   }
 
+  /// Gets a single message by ID
+  Future<MessageModel?> getMessageById(int id) async {
+    final db = await database;
+    final result = await db.query(
+      'messages',
+      where: 'id = ?',
+      whereArgs: [id],
+      limit: 1,
+    );
+    if (result.isEmpty) return null;
+    return MessageModel.fromMap(result.first);
+  }
+
   /// Updates the mediaPath of a message when a SAF file is successfully matched.
   /// Enforces 1-to-1 uniqueness: a mediaPath can never be assigned to more than one message.
-  Future<int> updateMessageMediaPath(int messageId, String mediaPath) async {
+  /// When [expectedSender] is provided, validates that the message belongs to that sender.
+  Future<int> updateMessageMediaPath(int messageId, String mediaPath, [String? expectedSender]) async {
     final db = await database;
+
+    if (expectedSender != null && expectedSender.trim().isNotEmpty) {
+      final msg = await db.query(
+        'messages',
+        columns: ['sender', 'senderName'],
+        where: 'id = ?',
+        whereArgs: [messageId],
+        limit: 1,
+      );
+      if (msg.isNotEmpty) {
+        final s = (msg.first['sender'] as String? ?? '').trim().toLowerCase();
+        final sn = (msg.first['senderName'] as String? ?? '').trim().toLowerCase();
+        final es = expectedSender.trim().toLowerCase();
+        if (s != es && sn != es) {
+          debugPrint(
+            '[DatabaseHelper] Cross-chat rejected: msg #$messageId is for "$s", not "$expectedSender"',
+          );
+          return 0;
+        }
+      }
+    }
+
     // Check if another message already has this mediaPath
     final existing = await db.query(
       'messages',
@@ -835,7 +1074,9 @@ class DatabaseHelper {
       whereArgs: [mediaPath, messageId],
     );
     if (existing.isNotEmpty) {
-      debugPrint('[DatabaseHelper] mediaPath $mediaPath already used by msg #${existing.first['id']}, skipping duplicate link');
+      debugPrint(
+        '[DatabaseHelper] mediaPath $mediaPath already used by msg #${existing.first['id']}, skipping duplicate link',
+      );
       return 0;
     }
     return await db.update(
@@ -871,6 +1112,90 @@ class DatabaseHelper {
       DELETE FROM media_attachments 
       WHERE matched = 1 AND notification_id NOT IN (SELECT id FROM messages)
     ''');
+  }
+
+  /// Gets sender-unknown media_attachments (sender_name = '', matched = 0).
+  /// These are files captured by ContentObserver before their notification arrived,
+  /// stored by matchAndLinkMedia's early-return path. Processed by reconcileNoSenderMedia()
+  /// using Option 2 unambiguous single-candidate matching.
+  Future<List<Map<String, dynamic>>> getUnmatchedNoSenderMedia() async {
+    final db = await database;
+    return await db.rawQuery('''
+      SELECT id, notification_id, media_type, file_path, original_uri, sender_name, captured_at, matched
+      FROM media_attachments
+      WHERE matched = 0
+        AND (sender_name IS NULL OR sender_name = '')
+        AND file_path NOT IN (SELECT mediaPath FROM messages WHERE mediaPath IS NOT NULL AND mediaPath != '')
+      ORDER BY captured_at DESC
+      LIMIT 50
+    ''');
+  }
+
+  /// TTL cleanup: removes matched=0 media_attachments older than 48 hours.
+  ///
+  /// These are files that were never claimed by any notification after 48 h —
+  /// either the message was deleted, the notification was permanently missed,
+  /// or the file was a spurious ContentObserver trigger with no corresponding
+  /// WhatsApp activity. Deletes both the DB rows and the physical files from
+  /// private storage so disk space is reclaimed.
+  ///
+  /// Safety: only deletes files NOT referenced by any message's mediaPath,
+  /// so linked media is never affected.
+  Future<int> cleanOrphanedUnmatchedAttachments() async {
+    try {
+      final db = await database;
+      final cutoffMs =
+          DateTime.now().millisecondsSinceEpoch - (48 * 60 * 60 * 1000);
+
+      // Collect file paths before deletion so we can remove physical files
+      final rows = await db.rawQuery(
+        '''
+        SELECT file_path FROM media_attachments
+        WHERE matched = 0
+          AND captured_at < ?
+          AND file_path NOT IN (
+            SELECT mediaPath FROM messages WHERE mediaPath IS NOT NULL AND mediaPath != '')
+      ''',
+        [cutoffMs],
+      );
+
+      int deletedFiles = 0;
+      for (final row in rows) {
+        final path = row['file_path'] as String? ?? '';
+        if (path.isNotEmpty) {
+          try {
+            final f = File(path);
+            if (await f.exists()) {
+              await f.delete();
+              deletedFiles++;
+            }
+          } catch (_) {}
+        }
+      }
+
+      final deletedRows = await db.rawDelete(
+        '''
+        DELETE FROM media_attachments
+        WHERE matched = 0
+          AND captured_at < ?
+          AND file_path NOT IN (
+            SELECT mediaPath FROM messages WHERE mediaPath IS NOT NULL AND mediaPath != '')
+      ''',
+        [cutoffMs],
+      );
+
+      if (deletedRows > 0) {
+        debugPrint(
+          '[DatabaseHelper] TTL: purged $deletedRows orphaned media_attachments, $deletedFiles physical files',
+        );
+      }
+      return deletedRows;
+    } catch (e) {
+      debugPrint(
+        '[DatabaseHelper] cleanOrphanedUnmatchedAttachments error: $e',
+      );
+      return 0;
+    }
   }
 
   /// One-time cleanup for any historically corrupted or cross-linked media
@@ -914,9 +1239,32 @@ class DatabaseHelper {
       ''');
 
       const mediaKeywords = [
-        'photo', 'video', 'voice', 'audio', 'document', 'file',
-        'sticker', 'gif', '📷', '📹', '🎥', '🎞', '🎤', '🎙', '🎵', '📄', '📎',
-        '.pdf', '.doc', '.docx', '.csv', '.xls', '.xlsx', '.txt', '.ppt', '.zip'
+        'photo',
+        'video',
+        'voice',
+        'audio',
+        'document',
+        'file',
+        'sticker',
+        'gif',
+        '📷',
+        '📹',
+        '🎥',
+        '🎞',
+        '🎤',
+        '🎙',
+        '🎵',
+        '📄',
+        '📎',
+        '.pdf',
+        '.doc',
+        '.docx',
+        '.csv',
+        '.xls',
+        '.xlsx',
+        '.txt',
+        '.ppt',
+        '.zip',
       ];
 
       for (final dup in duplicates) {
@@ -939,7 +1287,10 @@ class DatabaseHelper {
         for (final row in rows) {
           final id = row['id'] as int;
           final msg = (row['message'] as String? ?? '').toLowerCase().trim();
-          final isPlaceholder = msg.isEmpty || (!msg.startsWith('reacted ') && mediaKeywords.any((k) => msg.contains(k)));
+          final isPlaceholder =
+              msg.isEmpty ||
+              (!msg.startsWith('reacted ') &&
+                  mediaKeywords.any((k) => msg.contains(k)));
 
           if (winnerId == null && isPlaceholder) {
             winnerId = id;
@@ -957,11 +1308,56 @@ class DatabaseHelper {
         }
 
         for (final id in otherIds) {
-          await db.update('messages', {'mediaPath': null}, where: 'id = ?', whereArgs: [id]);
+          await db.update(
+            'messages',
+            {'mediaPath': null},
+            where: 'id = ?',
+            whereArgs: [id],
+          );
         }
       }
 
       // 3. Unlink media_attachments that point to cleared messages
+      await db.execute('''
+        UPDATE media_attachments 
+        SET matched = 0, notification_id = NULL 
+        WHERE matched = 1 
+          AND notification_id IS NOT NULL 
+          AND notification_id NOT IN (
+            SELECT id FROM messages WHERE mediaPath IS NOT NULL AND mediaPath != ''
+          )
+      ''');
+
+      // 3b. Unlink cross-chat misattributions where media_attachments sender differs from messages sender
+      await db.execute('''
+        UPDATE messages 
+        SET mediaPath = NULL 
+        WHERE id IN (
+          SELECT m.id 
+          FROM messages m 
+          JOIN media_attachments a ON a.file_path = m.mediaPath 
+          WHERE a.sender_name IS NOT NULL 
+            AND a.sender_name != '' 
+            AND a.sender_name NOT LIKE '%.%' 
+            AND LOWER(TRIM(m.sender)) != LOWER(TRIM(a.sender_name)) 
+            AND LOWER(TRIM(m.senderName)) != LOWER(TRIM(a.sender_name))
+        )
+      ''');
+
+      // 3c. Unlink audio/voice notes where time delta is > 2 minutes (120,000 ms)
+      await db.execute('''
+        UPDATE messages 
+        SET mediaPath = NULL 
+        WHERE id IN (
+          SELECT m.id 
+          FROM messages m 
+          JOIN media_attachments a ON a.file_path = m.mediaPath 
+          WHERE (a.media_type = 'audio' OR m.mediaPath LIKE '%.opus')
+            AND ABS(m.timestamp - a.captured_at) > 120000
+        )
+      ''');
+
+      // 3d. Clear matched media_attachments where notification_id points to message with null mediaPath
       await db.execute('''
         UPDATE media_attachments 
         SET matched = 0, notification_id = NULL 
@@ -990,6 +1386,61 @@ class DatabaseHelper {
         WHERE file_path IN (SELECT mediaPath FROM messages WHERE mediaPath IS NOT NULL AND mediaPath != '')
           AND matched = 0
       ''');
+
+      // 6. Auto-reconcile orphaned recent media placeholders (last 24 hours)
+      try {
+        final recentCutoff = DateTime.now().subtract(const Duration(hours: 24)).millisecondsSinceEpoch;
+        final unlinkedRows = await db.rawQuery('''
+          SELECT id, sender, senderName, message, timestamp 
+          FROM messages 
+          WHERE (mediaPath IS NULL OR mediaPath = '') 
+            AND app LIKE '%whatsapp%' 
+            AND timestamp >= ?
+            AND message NOT LIKE 'Reacted %'
+          ORDER BY timestamp DESC
+        ''', [recentCutoff]);
+
+        for (final row in unlinkedRows) {
+          final mId = row['id'] as int;
+          final mSender = (row['sender'] as String? ?? '').trim();
+          final mSenderName = (row['senderName'] as String? ?? '').trim();
+          final mText = (row['message'] as String? ?? '').toLowerCase();
+          final mTs = row['timestamp'] as int;
+
+          String? targetType;
+          if (mText.contains('photo') || mText.contains('image') || mText.contains('📷') || mText.contains('🖼')) {
+            targetType = 'image';
+          } else if (mText.contains('video') || mText.contains('📹') || mText.contains('🎥')) {
+            targetType = 'video';
+          } else if (mText.contains('document') || mText.contains('file') || mText.contains('📄') || mText.contains('📎')) {
+            targetType = 'document';
+          }
+          if (targetType == null) continue;
+
+          final attachRows = await db.rawQuery('''
+            SELECT id, file_path, sender_name 
+            FROM media_attachments 
+            WHERE matched = 0 
+              AND media_type = ?
+              AND (sender_name IS NULL OR sender_name = '' OR sender_name LIKE '%.%' OR LOWER(TRIM(sender_name)) = LOWER(?) OR LOWER(TRIM(sender_name)) = LOWER(?))
+              AND file_path NOT IN (SELECT mediaPath FROM messages WHERE mediaPath IS NOT NULL AND mediaPath != '')
+            ORDER BY ABS(captured_at - ?) ASC 
+            LIMIT 1
+          ''', [targetType, mSender, mSenderName, mTs]);
+
+          if (attachRows.isNotEmpty) {
+            final aId = attachRows.first['id'] as int;
+            final fPath = attachRows.first['file_path'] as String;
+            if (File(fPath).existsSync() && File(fPath).lengthSync() > 0) {
+              await db.execute('UPDATE messages SET mediaPath = ? WHERE id = ?', [fPath, mId]);
+              await db.execute('UPDATE media_attachments SET matched = 1, notification_id = ?, sender_name = ? WHERE id = ?', [mId, mSender, aId]);
+              debugPrint('[DatabaseHelper] Auto-reconciled orphaned $targetType $fPath -> message #$mId ($mSender)');
+            }
+          }
+        }
+      } catch (e) {
+        debugPrint('[DatabaseHelper] Auto-reconcile orphaned media error: $e');
+      }
 
       debugPrint('[DatabaseHelper] Completed cleanupCorruptedMediaLinks');
     } catch (e) {

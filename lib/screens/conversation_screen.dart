@@ -11,6 +11,7 @@ import 'package:share_plus/share_plus.dart';
 import '../models/message_model.dart';
 import '../services/database_helper.dart';
 import '../services/notification_service.dart';
+import '../utils/text_sanitizer.dart';
 import '../widgets/full_screen_media_viewer.dart';
 import 'chat_info_screen.dart';
 
@@ -18,19 +19,22 @@ class ConversationScreen extends StatefulWidget {
   final String sender;
   final String app;
   final String? initialAvatarPath;
+  final int? initialMessageId;
 
   const ConversationScreen({
     super.key,
     required this.sender,
     required this.app,
     this.initialAvatarPath,
+    this.initialMessageId,
   });
 
   @override
   State<ConversationScreen> createState() => _ConversationScreenState();
 }
 
-class _ConversationScreenState extends State<ConversationScreen> with WidgetsBindingObserver {
+class _ConversationScreenState extends State<ConversationScreen>
+    with WidgetsBindingObserver {
   List<MessageModel> _messages = [];
   int _totalMessageCount = 0;
   bool _hasFetchedAllMessagesForSearch = false;
@@ -41,12 +45,13 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   // causing SQLite lock errors and Dart heap spikes on large group chats.
   bool _isLoadingMessages = false;
   bool _isGroupChat = false;
+  bool _hasSavedMessages = false;
   String? _avatarPath;
   String? _avatarsDir; // For looking up sender-specific avatars in groups
 
   bool _isSearching = false;
   final TextEditingController _searchController = TextEditingController();
-  
+
   List<String> _groupMembers = [];
   final Set<String> _selectedSenders = {};
   Map<String, int> _groupMemberCounts = {};
@@ -57,22 +62,23 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     }
     final cleanName = name.toLowerCase().trim();
     if (cleanName.isEmpty) return 0;
-    
+
     // 1. Case-insensitive exact match
     for (final entry in _groupMemberCounts.entries) {
       if (entry.key.toLowerCase().trim() == cleanName) {
         return entry.value;
       }
     }
-    
+
     // 2. Prefix/first name match (e.g. "Hammad" matches "Hammad Tahir")
     for (final entry in _groupMemberCounts.entries) {
       final entryKey = entry.key.toLowerCase().trim();
-      if (entryKey.startsWith('$cleanName ') || cleanName.startsWith('$entryKey ')) {
+      if (entryKey.startsWith('$cleanName ') ||
+          cleanName.startsWith('$entryKey ')) {
         return entry.value;
       }
     }
-    
+
     return 0;
   }
 
@@ -86,17 +92,19 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     }
     return sum;
   }
-  
+
   // Highlighting and scrolling
   String _searchQuery = '';
   final List<int> _matchIndices = [];
   int _currentMatchIndex = -1;
   final ItemScrollController _itemScrollController = ItemScrollController();
-  final ItemPositionsListener _itemPositionsListener = ItemPositionsListener.create();
+  final ItemPositionsListener _itemPositionsListener =
+      ItemPositionsListener.create();
   final List<_ListItem> _displayItems = [];
-  
+
   bool _isSelectionMode = false;
   final Set<int> _selectedMessageIds = {};
+  bool _hasShownInitialMessage = false;
 
   bool _hasMore = true;
   bool _isLoadingMore = false;
@@ -106,7 +114,9 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    NotificationService.instance.newMessageNotifier.addListener(_onNewMessageReceived);
+    NotificationService.instance.newMessageNotifier.addListener(
+      _onNewMessageReceived,
+    );
     _itemPositionsListener.itemPositions.addListener(_scrollListener);
     _avatarPath = widget.initialAvatarPath;
     _loadMessages();
@@ -115,7 +125,9 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   @override
   void dispose() {
     _itemPositionsListener.itemPositions.removeListener(_scrollListener);
-    NotificationService.instance.newMessageNotifier.removeListener(_onNewMessageReceived);
+    NotificationService.instance.newMessageNotifier.removeListener(
+      _onNewMessageReceived,
+    );
     WidgetsBinding.instance.removeObserver(this);
     _searchController.dispose();
     super.dispose();
@@ -124,8 +136,10 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   void _scrollListener() {
     final positions = _itemPositionsListener.itemPositions.value;
     if (positions.isNotEmpty) {
-      final maxIndex = positions.map((p) => p.index).reduce((a, b) => a > b ? a : b);
-      
+      final maxIndex = positions
+          .map((p) => p.index)
+          .reduce((a, b) => a > b ? a : b);
+
       // If we've scrolled near the end (visually top) of the list
       if (maxIndex >= _displayItems.length - 10) {
         _loadMoreMessages();
@@ -152,119 +166,293 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     if (_isLoadingMessages) return;
     _isLoadingMessages = true;
     try {
-    if (!isSilent) {
-      setState(() {
-        _isLoading = true;
-      });
-    }
-
-    // Mark all messages as read when opening the conversation
-    await DatabaseHelper.instance.markMessagesAsRead(widget.sender);
-
-    // Auto-reconcile any pending media files captured for this sender
-    NotificationService.instance.reconcileUnmatchedMedia(widget.sender).then((linked) {
-      if (linked > 0 && mounted) {
-        _loadMessages(isSilent: true);
+      if (!isSilent) {
+        setState(() {
+          _isLoading = true;
+        });
       }
-    });
-    
-    bool isGroup = await DatabaseHelper.instance.isGroupChat(widget.sender);
-    
-    List<MessageModel> messages;
-    Map<String, int> memberCounts = {};
-    List<String> allGroupSenders = [];
 
-    if (isGroup) {
-      // For group chats, load all messages at once efficiently following professional practice
-      messages = await DatabaseHelper.instance.getMessagesBySender(widget.sender);
-      _hasMore = false;
-      _hasFetchedAllMessagesForSearch = true;
+      // Mark all messages as read when opening the conversation
+      await DatabaseHelper.instance.markMessagesAsRead(widget.sender);
 
-      memberCounts = await DatabaseHelper.instance.getGroupMemberMessageCounts(widget.sender);
-      allGroupSenders = memberCounts.keys.toList();
-      allGroupSenders.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
-    } else {
-      messages = await DatabaseHelper.instance.getMessagesBySender(widget.sender, limit: _pageSize, offset: 0);
-      isGroup = messages.any((msg) => msg.isGroupChat == true);
+      // Auto-reconcile any pending media files captured for this sender
+      NotificationService.instance.reconcileUnmatchedMedia(widget.sender).then((
+        linked,
+      ) {
+        if (linked > 0 && mounted) {
+          _loadMessages(isSilent: true);
+        }
+      });
+
+      bool isGroup = await DatabaseHelper.instance.isGroupChat(widget.sender);
+      final hasSavedMessages = await DatabaseHelper.instance.hasSavedMessages(
+        widget.sender,
+      );
+
+      List<MessageModel> messages;
+      Map<String, int> memberCounts = {};
+      List<String> allGroupSenders = [];
+
       if (isGroup) {
-        // If detected as group chat from loaded messages, load all at once
-        messages = await DatabaseHelper.instance.getMessagesBySender(widget.sender);
+        // For group chats, load all messages at once efficiently following professional practice
+        messages = await DatabaseHelper.instance.getMessagesBySender(
+          widget.sender,
+        );
         _hasMore = false;
         _hasFetchedAllMessagesForSearch = true;
 
-        memberCounts = await DatabaseHelper.instance.getGroupMemberMessageCounts(widget.sender);
+        memberCounts = await DatabaseHelper.instance
+            .getGroupMemberMessageCounts(widget.sender);
         allGroupSenders = memberCounts.keys.toList();
-        allGroupSenders.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+        allGroupSenders.sort(
+          (a, b) => a.toLowerCase().compareTo(b.toLowerCase()),
+        );
       } else {
-        _hasMore = messages.length >= _pageSize;
-        allGroupSenders = messages.map((m) => m.senderName ?? m.sender).toSet().toList();
-        allGroupSenders.sort();
-      }
-    }
+        messages = widget.initialMessageId != null
+            ? await DatabaseHelper.instance.getMessagesBySender(widget.sender)
+            : await DatabaseHelper.instance.getMessagesBySender(
+                widget.sender,
+                limit: _pageSize,
+                offset: 0,
+              );
+        isGroup = messages.any((msg) => msg.isGroupChat == true);
+        if (isGroup) {
+          // If detected as group chat from loaded messages, load all at once
+          messages = await DatabaseHelper.instance.getMessagesBySender(
+            widget.sender,
+          );
+          _hasMore = false;
+          _hasFetchedAllMessagesForSearch = true;
 
-    // Ensure any senders present in loaded messages are included in member list
-    for (final m in messages) {
-      final name = m.senderName ?? m.sender;
-      if (name.isNotEmpty && !allGroupSenders.contains(name)) {
-        allGroupSenders.add(name);
-      }
-    }
-
-    final stats = await DatabaseHelper.instance.getChatStatsSummary(widget.sender);
-    
-    // Get the most recent avatarPath (from any message that has one)
-    String? latestAvatarPath;
-    for (final msg in messages) {
-      if (msg.avatarPath != null && msg.avatarPath!.isNotEmpty) {
-        latestAvatarPath = msg.avatarPath;
-        break; // Messages are sorted by timestamp DESC, so first one is most recent
-      }
-    }
-    
-    // Initialize avatars directory for sender avatar lookup in group chats
-    if (_avatarsDir == null) {
-      try {
-        final supportDir = await getApplicationSupportDirectory();
-        _avatarsDir = '${supportDir.path}/avatars';
-      } catch (e) {
-        // Fallback: derive from existing avatar path
-        if (latestAvatarPath != null && latestAvatarPath.isNotEmpty) {
-          _avatarsDir = File(latestAvatarPath).parent.path;
+          memberCounts = await DatabaseHelper.instance
+              .getGroupMemberMessageCounts(widget.sender);
+          allGroupSenders = memberCounts.keys.toList();
+          allGroupSenders.sort(
+            (a, b) => a.toLowerCase().compareTo(b.toLowerCase()),
+          );
+        } else {
+          _hasMore = widget.initialMessageId == null && messages.length >= _pageSize;
+          _hasFetchedAllMessagesForSearch = widget.initialMessageId != null;
+          allGroupSenders = messages
+              .map((m) => m.senderName ?? m.sender)
+              .toSet()
+              .toList();
+          allGroupSenders.sort();
         }
       }
-    }
 
-    if (mounted) {
-      setState(() {
-        _messages = messages;
-        _totalMessageCount = stats['total'] ?? messages.length;
-        _isGroupChat = isGroup;
-        _groupMembers = allGroupSenders;
-        _groupMemberCounts = memberCounts;
-        _avatarPath = latestAvatarPath;
-        _isLoading = false;
-        
-        _updateDisplayItems();
-        
-        if (_isSearching && _searchController.text.isNotEmpty) {
-          _filterMessages(_searchController.text);
+      // Ensure any senders present in loaded messages are included in member list
+      for (final m in messages) {
+        final name = m.senderName ?? m.sender;
+        if (name.isNotEmpty && !allGroupSenders.contains(name)) {
+          allGroupSenders.add(name);
         }
-      });
-    }
+      }
+
+      final stats = await DatabaseHelper.instance.getChatStatsSummary(
+        widget.sender,
+      );
+
+      // Get the most recent avatarPath (from any message that has one)
+      String? latestAvatarPath;
+      for (final msg in messages) {
+        if (msg.avatarPath != null && msg.avatarPath!.isNotEmpty) {
+          latestAvatarPath = msg.avatarPath;
+          break; // Messages are sorted by timestamp DESC, so first one is most recent
+        }
+      }
+
+      // Initialize avatars directory for sender avatar lookup in group chats
+      if (_avatarsDir == null) {
+        try {
+          final supportDir = await getApplicationSupportDirectory();
+          _avatarsDir = '${supportDir.path}/avatars';
+        } catch (e) {
+          // Fallback: derive from existing avatar path
+          if (latestAvatarPath != null && latestAvatarPath.isNotEmpty) {
+            _avatarsDir = File(latestAvatarPath).parent.path;
+          }
+        }
+      }
+
+      if (mounted) {
+        setState(() {
+          _messages = messages;
+          _totalMessageCount = stats['total'] ?? messages.length;
+          _isGroupChat = isGroup;
+          _hasSavedMessages = hasSavedMessages;
+          _groupMembers = allGroupSenders;
+          _groupMemberCounts = memberCounts;
+          _avatarPath = latestAvatarPath;
+          _isLoading = false;
+
+          _updateDisplayItems();
+
+          if (_isSearching && _searchController.text.isNotEmpty) {
+            _filterMessages(_searchController.text);
+          }
+        });
+        if (widget.initialMessageId != null) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            _showInitialMessage();
+          });
+        }
+      }
     } finally {
       // Always release the load guard so subsequent events can trigger a reload
       _isLoadingMessages = false;
     }
   }
 
+  void _showInitialMessage() {
+    if (_hasShownInitialMessage) return;
+    final messageIndex = _displayItems.indexWhere(
+      (item) => !item.isHeader && item.message?.id == widget.initialMessageId,
+    );
+    if (messageIndex == -1 || !mounted) return;
+
+    _hasShownInitialMessage = true;
+    setState(() {
+      _matchIndices
+        ..clear()
+        ..add(messageIndex);
+      _currentMatchIndex = 0;
+    });
+    _scrollToCurrentMatch();
+  }
+
+  Future<void> _showSavedMessage() async {
+    final messages = await DatabaseHelper.instance.getMessagesBySender(
+      widget.sender,
+    );
+    final savedMessages = messages
+        .where((message) => message.isSaved == true && message.isDeleted != true)
+        .toList();
+    if (savedMessages.isEmpty || !mounted) return;
+
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.grey.shade900,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (sheetContext) {
+        return SafeArea(
+          child: DraggableScrollableSheet(
+            expand: false,
+            initialChildSize: 0.5,
+            minChildSize: 0.3,
+            maxChildSize: 0.9,
+            builder: (context, scrollController) {
+              return Column(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 16, 20, 12),
+                    child: Row(
+                      children: [
+                        Icon(Icons.bookmark, color: Colors.amber.shade300),
+                        const SizedBox(width: 10),
+                        Text(
+                          'Saved messages (${savedMessages.length})',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 17,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const Divider(height: 1, color: Colors.white24),
+                  Expanded(
+                    child: ListView.separated(
+                      controller: scrollController,
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      itemCount: savedMessages.length,
+                      separatorBuilder: (_, __) => const Divider(
+                        height: 1,
+                        indent: 56,
+                        color: Colors.white12,
+                      ),
+                      itemBuilder: (context, index) {
+                        final message = savedMessages[index];
+                        final preview = message.message.trim().isEmpty
+                            ? 'Saved media'
+                            : message.message.trim();
+                        return ListTile(
+                          leading: Icon(
+                            message.mediaPath?.isNotEmpty == true
+                                ? Icons.perm_media
+                                : Icons.bookmark,
+                            color: Colors.amber.shade300,
+                          ),
+                          title: Text(
+                            preview,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(color: Colors.white),
+                          ),
+                          subtitle: Text(
+                            '${DateFormat('dd/MMM/yyyy').format(message.timestamp)} ${_formatMessageTime(message.timestamp)}',
+                            style: TextStyle(color: Colors.grey.shade400),
+                          ),
+                          onTap: () {
+                            Navigator.pop(sheetContext);
+                            _showMessageById(message.id!);
+                          },
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _showMessageById(int messageId) async {
+    final messages = await DatabaseHelper.instance.getMessagesBySender(
+      widget.sender,
+    );
+    if (!mounted) return;
+
+    setState(() {
+      _messages = messages;
+      _hasMore = false;
+      _hasFetchedAllMessagesForSearch = true;
+      _updateDisplayItems();
+      final index = _displayItems.indexWhere(
+        (item) => !item.isHeader && item.message?.id == messageId,
+      );
+      if (index == -1) return;
+      _matchIndices
+        ..clear()
+        ..add(index);
+      _currentMatchIndex = 0;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _scrollToCurrentMatch();
+    });
+  }
+
   Future<void> _loadMoreMessages() async {
     if (_isGroupChat || _isLoadingMore || !_hasMore) return;
     if (mounted) {
-      setState(() { _isLoadingMore = true; });
+      setState(() {
+        _isLoadingMore = true;
+      });
     }
-    
-    final newMessages = await DatabaseHelper.instance.getMessagesBySender(widget.sender, limit: _pageSize, offset: _messages.length);
-    
+
+    final newMessages = await DatabaseHelper.instance.getMessagesBySender(
+      widget.sender,
+      limit: _pageSize,
+      offset: _messages.length,
+    );
+
     if (mounted) {
       setState(() {
         if (newMessages.length < _pageSize) {
@@ -279,55 +467,68 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
 
   void _updateDisplayItems() {
     _displayItems.clear();
-    var activeMessages = _messages.where((msg) => msg.isDeleted != true).toList();
-    
+    var activeMessages = _messages
+        .where((msg) => msg.isDeleted != true)
+        .toList();
+
     if (_selectedSenders.isNotEmpty) {
       activeMessages = activeMessages.where((msg) {
         final rawSender = msg.senderName ?? msg.sender;
         final cleanRaw = rawSender.toLowerCase().trim();
         return _selectedSenders.contains(rawSender) ||
-               _selectedSenders.any((s) {
-                 final cleanS = s.toLowerCase().trim();
-                 return cleanS == cleanRaw ||
-                        cleanRaw.startsWith('$cleanS ') ||
-                        cleanS.startsWith('$cleanRaw ');
-               });
+            _selectedSenders.any((s) {
+              final cleanS = s.toLowerCase().trim();
+              return cleanS == cleanRaw ||
+                  cleanRaw.startsWith('$cleanS ') ||
+                  cleanS.startsWith('$cleanRaw ');
+            });
       }).toList();
     }
-    
+
     // Deduplicate — include mediaPath in key so a "📷 Photo" message with a
     // captured image is not merged with one that has no image.
     final seen = <String>{};
     activeMessages = activeMessages.where((msg) {
-      final key = '${msg.message}||${msg.timestamp.millisecondsSinceEpoch}||${msg.mediaPath ?? ''}';
+      final key =
+          '${msg.message}||${msg.timestamp.millisecondsSinceEpoch}||${msg.mediaPath ?? ''}';
       if (seen.contains(key)) return false;
       seen.add(key);
       return true;
     }).toList();
 
     if (activeMessages.isEmpty) return;
-    
+
     // Build display items from Newest (index 0) to Oldest
     // activeMessages is descending (newest at index 0).
     for (int i = 0; i < activeMessages.length; i++) {
-        final message = activeMessages[i];
-        final messageDate = DateTime(message.timestamp.year, message.timestamp.month, message.timestamp.day);
-        
-        _displayItems.add(_ListItem(isHeader: false, message: message, messageIndex: i));
-        
-        // Add header after the last message of the day (which appears above it in UI)
-        bool needsHeader = false;
-        if (i == activeMessages.length - 1) {
-            needsHeader = true;
-        } else {
-            final nextMessage = activeMessages[i + 1];
-            final nextDate = DateTime(nextMessage.timestamp.year, nextMessage.timestamp.month, nextMessage.timestamp.day);
-            if (!_isSameDay(messageDate, nextDate)) needsHeader = true;
-        }
-        
-        if (needsHeader) {
-            _displayItems.add(_ListItem(isHeader: true, date: messageDate));
-        }
+      final message = activeMessages[i];
+      final messageDate = DateTime(
+        message.timestamp.year,
+        message.timestamp.month,
+        message.timestamp.day,
+      );
+
+      _displayItems.add(
+        _ListItem(isHeader: false, message: message, messageIndex: i),
+      );
+
+      // Add header after the last message of the day (which appears above it in UI)
+      bool needsHeader = false;
+      if (i == activeMessages.length - 1) {
+        needsHeader = true;
+      } else {
+        final nextMessage = activeMessages[i + 1];
+        final nextDate = DateTime(
+          nextMessage.timestamp.year,
+          nextMessage.timestamp.month,
+          nextMessage.timestamp.day,
+        );
+        if (!_isSameDay(messageDate, nextDate)) needsHeader = true;
+      }
+
+      if (needsHeader) {
+        _displayItems.add(_ListItem(isHeader: true, date: messageDate));
+      }
     }
   }
 
@@ -337,9 +538,11 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
       setState(() {
         _isLoading = true;
       });
-      
-      final allMessages = await DatabaseHelper.instance.getMessagesBySender(widget.sender); // no limit = all
-      
+
+      final allMessages = await DatabaseHelper.instance.getMessagesBySender(
+        widget.sender,
+      ); // no limit = all
+
       if (mounted) {
         setState(() {
           _messages = allMessages;
@@ -352,18 +555,49 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
       }
       return;
     }
-    
+
     _performSearch(query);
+  }
+
+  void _handleChatInfoResult(dynamic result) {
+    if (result == null || !mounted) return;
+    if (result is String) {
+      setState(() {
+        _isSearching = true;
+        _searchController.text = result;
+        _filterMessages(result);
+      });
+    } else if (result is Map) {
+      if (result['action'] == 'search_word') {
+        final word = result['word'] as String?;
+        if (word != null && word.isNotEmpty) {
+          setState(() {
+            _isSearching = true;
+            _searchController.text = word;
+            _filterMessages(word);
+          });
+        }
+      } else if (result['action'] == 'filter_sender') {
+        final sender = result['sender'] as String?;
+        setState(() {
+          _selectedSenders.clear();
+          if (sender != null && sender.isNotEmpty) {
+            _selectedSenders.add(sender);
+          }
+          _updateDisplayItems();
+        });
+      }
+    }
   }
 
   void _performSearch(String query) {
     setState(() {
       _searchQuery = query;
       _matchIndices.clear();
-      
+
       if (query.isNotEmpty) {
         final queryLower = query.toLowerCase();
-        
+
         // Find matches in display items
         for (int i = 0; i < _displayItems.length; i++) {
           final item = _displayItems[i];
@@ -375,9 +609,9 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
             }
           }
         }
-        
+
         if (_matchIndices.isNotEmpty) {
-          _currentMatchIndex = 0; 
+          _currentMatchIndex = 0;
           _scrollToCurrentMatch();
         } else {
           _currentMatchIndex = -1;
@@ -396,7 +630,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
           index: index,
           duration: const Duration(milliseconds: 300),
           curve: Curves.easeInOut,
-          alignment: 0.5, 
+          alignment: 0.5,
         );
       }
     }
@@ -423,7 +657,8 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
 
   void _showFilterDialog() {
     String searchQuery = '';
-    
+    bool sortByMostMessages = true;
+
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -435,21 +670,36 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
         return StatefulBuilder(
           builder: (context, setModalState) {
             final filteredMembers = _groupMembers
-                .where((m) => m.toLowerCase().contains(searchQuery.toLowerCase()))
+                .where(
+                  (m) => m.toLowerCase().contains(searchQuery.toLowerCase()),
+                )
                 .toList();
+            filteredMembers.sort((a, b) {
+              final countComparison = _getMemberCount(a).compareTo(
+                _getMemberCount(b),
+              );
+              if (countComparison != 0) {
+                return sortByMostMessages
+                    ? -countComparison
+                    : countComparison;
+              }
+              return a.toLowerCase().compareTo(b.toLowerCase());
+            });
 
             return Padding(
               padding: EdgeInsets.only(
                 bottom: MediaQuery.of(context).viewInsets.bottom,
               ),
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 24,
+                ),
                 height: MediaQuery.of(context).size.height * 0.7,
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
                         const Text(
                           'Filter by Sender',
@@ -458,6 +708,72 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                             fontWeight: FontWeight.bold,
                             color: Colors.white,
                           ),
+                        ),
+                        const SizedBox(width: 8),
+                        IconButton(
+                          icon: const Icon(
+                            Icons.analytics_outlined,
+                            color: Colors.deepPurpleAccent,
+                            size: 22,
+                          ),
+                          tooltip: 'Group Stats & Activity',
+                          onPressed: () async {
+                            Navigator.pop(context);
+                            final result = await Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (context) => ChatInfoScreen(
+                                  sender: widget.sender,
+                                  app: widget.app,
+                                  avatarPath: _avatarPath,
+                                  isGroupChat: _isGroupChat,
+                                ),
+                              ),
+                            );
+                            _handleChatInfoResult(result);
+                          },
+                        ),
+                        const Spacer(),
+                        PopupMenuButton<bool>(
+                          icon: const Icon(Icons.sort, color: Colors.white70),
+                          tooltip: 'Sort by message count',
+                          onSelected: (mostMessagesFirst) {
+                            setModalState(() {
+                              sortByMostMessages = mostMessagesFirst;
+                            });
+                          },
+                          itemBuilder: (context) => [
+                            PopupMenuItem<bool>(
+                              value: true,
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    sortByMostMessages
+                                        ? Icons.radio_button_checked
+                                        : Icons.radio_button_unchecked,
+                                    size: 20,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  const Text('Most messages first'),
+                                ],
+                              ),
+                            ),
+                            PopupMenuItem<bool>(
+                              value: false,
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    !sortByMostMessages
+                                        ? Icons.radio_button_checked
+                                        : Icons.radio_button_unchecked,
+                                    size: 20,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  const Text('Least messages first'),
+                                ],
+                              ),
+                            ),
+                          ],
                         ),
                         TextButton(
                           onPressed: () {
@@ -468,7 +784,10 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                               _updateDisplayItems();
                             });
                           },
-                          child: const Text('Clear All', style: TextStyle(color: Colors.orangeAccent)),
+                          child: const Text(
+                            'Clear All',
+                            style: TextStyle(color: Colors.orangeAccent),
+                          ),
                         ),
                       ],
                     ),
@@ -478,10 +797,16 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                       decoration: InputDecoration(
                         hintText: 'Search members...',
                         hintStyle: TextStyle(color: Colors.grey.shade500),
-                        prefixIcon: Icon(Icons.search, color: Colors.grey.shade400),
+                        prefixIcon: Icon(
+                          Icons.search,
+                          color: Colors.grey.shade400,
+                        ),
                         filled: true,
                         fillColor: Colors.grey.shade800,
-                        contentPadding: const EdgeInsets.symmetric(vertical: 0, horizontal: 16),
+                        contentPadding: const EdgeInsets.symmetric(
+                          vertical: 0,
+                          horizontal: 16,
+                        ),
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(12),
                           borderSide: BorderSide.none,
@@ -506,35 +831,87 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                               itemCount: filteredMembers.length,
                               itemBuilder: (context, index) {
                                 final member = filteredMembers[index];
-                                final isSelected = _selectedSenders.contains(member);
+                                final isSelected = _selectedSenders.contains(
+                                  member,
+                                );
                                 final memberCount = _getMemberCount(member);
                                 return CheckboxListTile(
-                                  contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-                                  secondary: _buildSenderAvatar(member, _getSenderColor(member)),
-                                  title: Text.rich(
-                                    TextSpan(
-                                      text: member,
-                                      style: const TextStyle(color: Colors.white, fontSize: 16),
-                                      children: [
-                                        if (_isGroupChat)
+                                  contentPadding: const EdgeInsets.symmetric(
+                                    horizontal: 4,
+                                    vertical: 4,
+                                  ),
+                                  secondary: _buildSenderAvatar(
+                                    member,
+                                    _getSenderColor(member),
+                                  ),
+                                  title: Row(
+                                    children: [
+                                      Expanded(
+                                        child: Text.rich(
                                           TextSpan(
-                                            text: ' ($memberCount)',
-                                            style: TextStyle(
-                                              color: Colors.grey.shade400,
-                                              fontSize: 14,
-                                              fontWeight: FontWeight.normal,
+                                            text: member,
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 16,
                                             ),
+                                            children: [
+                                              if (_isGroupChat)
+                                                TextSpan(
+                                                  text: ' ($memberCount)',
+                                                  style: TextStyle(
+                                                    color: Colors.grey.shade400,
+                                                    fontSize: 14,
+                                                    fontWeight: FontWeight.normal,
+                                                  ),
+                                                ),
+                                            ],
                                           ),
-                                      ],
-                                    ),
-                                    overflow: TextOverflow.ellipsis,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      ),
+                                      IconButton(
+                                        icon: const Icon(
+                                          Icons.insights_rounded,
+                                          size: 20,
+                                          color: Colors.deepPurpleAccent,
+                                        ),
+                                        tooltip: 'View activity & stats',
+                                        padding: EdgeInsets.zero,
+                                        constraints: const BoxConstraints(
+                                          minWidth: 32,
+                                          minHeight: 32,
+                                        ),
+                                        onPressed: () async {
+                                          Navigator.pop(context);
+                                          final result = await Navigator.push(
+                                            context,
+                                            MaterialPageRoute(
+                                              builder: (context) =>
+                                                  ChatInfoScreen(
+                                                sender: widget.sender,
+                                                app: widget.app,
+                                                avatarPath: _avatarPath,
+                                                isGroupChat: _isGroupChat,
+                                                initialSenderFilter: member,
+                                              ),
+                                            ),
+                                          );
+                                          _handleChatInfoResult(result);
+                                        },
+                                      ),
+                                    ],
                                   ),
                                   value: isSelected,
                                   activeColor: Colors.orangeAccent,
                                   checkColor: Colors.black,
-                                  controlAffinity: ListTileControlAffinity.trailing,
-                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                                  checkboxShape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+                                  controlAffinity:
+                                      ListTileControlAffinity.trailing,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  checkboxShape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
                                   onChanged: (val) {
                                     setModalState(() {
                                       if (val == true) {
@@ -563,25 +940,23 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
 
   Widget _getAppIcon(String packageName, {double size = 12, Color? color}) {
     if (packageName.contains('whatsapp')) {
-      return FaIcon(FontAwesomeIcons.whatsapp, size: size, color: color ?? Colors.green);
+      return FaIcon(
+        FontAwesomeIcons.whatsapp,
+        size: size,
+        color: color ?? Colors.green,
+      );
     } else if (packageName.contains('instagram')) {
-      return FaIcon(FontAwesomeIcons.instagram, size: size, color: color ?? Colors.pinkAccent);
+      return FaIcon(
+        FontAwesomeIcons.instagram,
+        size: size,
+        color: color ?? Colors.pinkAccent,
+      );
     }
     return Icon(Icons.notifications, size: size, color: color ?? Colors.grey);
   }
 
   // Sanitize text to remove invalid UTF-16 characters that could crash the app
-  String _sanitizeText(String? text) {
-    if (text == null || text.isEmpty) return '';
-    try {
-      // Dart's Runes iterator naturally handles surrogate pairs correctly 
-      // and replaces isolated surrogates with the replacement character U+FFFD.
-      return String.fromCharCodes(text.runes);
-    } catch (e) {
-      // If anything fails, return a safe fallback
-      return text.replaceAll(RegExp(r'[\uD800-\uDFFF]'), '\uFFFD');
-    }
-  }
+  String _sanitizeText(String? text) => sanitizeText(text);
 
   // Format time in AM/PM format for individual messages
   String _formatMessageTime(DateTime timestamp) {
@@ -602,15 +977,17 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     } else if (now.year == date.year) {
       return DateFormat('MMMM dd').format(date); // e.g., "November 23"
     } else {
-      return DateFormat('MMMM dd, yyyy').format(date); // e.g., "November 23, 2024"
+      return DateFormat(
+        'MMMM dd, yyyy',
+      ).format(date); // e.g., "November 23, 2024"
     }
   }
 
   // Check if two dates are on the same day
   bool _isSameDay(DateTime date1, DateTime date2) {
     return date1.year == date2.year &&
-           date1.month == date2.month &&
-           date1.day == date2.day;
+        date1.month == date2.month &&
+        date1.day == date2.day;
   }
 
   // Generate a consistent color for sender names in group chats
@@ -633,37 +1010,46 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
 
   // Build avatar widget with profile picture or fallback to letter/group icon
   Widget _buildAvatarWidget() {
-    final bool hasAvatar = _avatarPath != null && 
-                           _avatarPath!.isNotEmpty && 
-                           File(_avatarPath!).existsSync();
-    
+    final bool hasAvatar =
+        _avatarPath != null &&
+        _avatarPath!.isNotEmpty &&
+        File(_avatarPath!).existsSync();
+
     return Container(
       width: 40,
       height: 40,
       decoration: BoxDecoration(
-        gradient: hasAvatar ? null : LinearGradient(
-          colors: _isGroupChat 
-            ? [Colors.teal.shade400, Colors.cyan.shade500]
-            : [Colors.deepPurple.shade400, Colors.purple.shade500],
-        ),
-        shape: BoxShape.circle,
-        image: hasAvatar ? DecorationImage(
-          image: FileImage(File(_avatarPath!)),
-          fit: BoxFit.cover,
-        ) : null,
-      ),
-      child: hasAvatar ? null : Center(
-        child: _isGroupChat
-          ? const Icon(Icons.group, color: Colors.white, size: 20)
-          : Text(
-              widget.sender.isNotEmpty ? widget.sender.characters.first.toUpperCase() : '?',
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
+        gradient: hasAvatar
+            ? null
+            : LinearGradient(
+                colors: _isGroupChat
+                    ? [Colors.teal.shade400, Colors.cyan.shade500]
+                    : [Colors.deepPurple.shade400, Colors.purple.shade500],
               ),
-            ),
+        shape: BoxShape.circle,
+        image: hasAvatar
+            ? DecorationImage(
+                image: FileImage(File(_avatarPath!)),
+                fit: BoxFit.cover,
+              )
+            : null,
       ),
+      child: hasAvatar
+          ? null
+          : Center(
+              child: _isGroupChat
+                  ? const Icon(Icons.group, color: Colors.white, size: 20)
+                  : Text(
+                      widget.sender.isNotEmpty
+                          ? widget.sender.characters.first.toUpperCase()
+                          : '?',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+            ),
     );
   }
 
@@ -686,14 +1072,19 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   }
 
   Future<void> _copySelected() async {
-    final selectedMsgs = _messages.where((m) => _selectedMessageIds.contains(m.id)).toList();
+    final selectedMsgs = _messages
+        .where((m) => _selectedMessageIds.contains(m.id))
+        .toList();
     selectedMsgs.sort((a, b) => a.timestamp.compareTo(b.timestamp));
 
-    final mediaMsgs = selectedMsgs.where((m) =>
-      m.mediaPath != null &&
-      m.mediaPath!.isNotEmpty &&
-      File(m.mediaPath!).existsSync()
-    ).toList();
+    final mediaMsgs = selectedMsgs
+        .where(
+          (m) =>
+              m.mediaPath != null &&
+              m.mediaPath!.isNotEmpty &&
+              File(m.mediaPath!).existsSync(),
+        )
+        .toList();
 
     if (mediaMsgs.isNotEmpty) {
       final textParts = <String>[];
@@ -720,8 +1111,10 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
           SnackBar(
             content: Text(
               success
-                ? (mediaMsgs.length == 1 ? 'Media copied to clipboard' : '${mediaMsgs.length} media copied to clipboard')
-                : 'Failed to copy media to clipboard',
+                  ? (mediaMsgs.length == 1
+                        ? 'Media copied to clipboard'
+                        : '${mediaMsgs.length} media copied to clipboard')
+                  : 'Failed to copy media to clipboard',
             ),
             backgroundColor: Colors.grey.shade800,
             behavior: SnackBarBehavior.floating,
@@ -744,15 +1137,68 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     }
   }
 
+  Future<void> _toggleSelectedSaved() async {
+    final selectedMessages = _messages
+        .where((message) => _selectedMessageIds.contains(message.id))
+        .toList();
+    if (selectedMessages.isEmpty) return;
+
+    final shouldSave = selectedMessages.any(
+      (message) => message.isSaved != true,
+    );
+    final updated = await DatabaseHelper.instance.setMessagesSaved(
+      selectedMessages.map((message) => message.id!).whereType<int>(),
+      shouldSave,
+    );
+
+    _exitSelectionMode();
+    await _loadMessages(isSilent: true);
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            shouldSave
+                ? '$updated message${updated == 1 ? '' : 's'} saved'
+                : '$updated message${updated == 1 ? '' : 's'} unsaved',
+          ),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
+  Future<void> _toggleMessageSaved(MessageModel message) async {
+    if (message.id == null) return;
+    final shouldSave = message.isSaved != true;
+    await DatabaseHelper.instance.setMessageSaved(message.id!, shouldSave);
+    if (mounted) {
+      Navigator.pop(context);
+      await _loadMessages(isSilent: true);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(shouldSave ? 'Message saved' : 'Message unsaved'),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    }
+  }
+
   void _shareSelected() {
-    final selectedMsgs = _messages.where((m) => _selectedMessageIds.contains(m.id)).toList();
+    final selectedMsgs = _messages
+        .where((m) => _selectedMessageIds.contains(m.id))
+        .toList();
     selectedMsgs.sort((a, b) => a.timestamp.compareTo(b.timestamp));
 
-    final mediaMsgs = selectedMsgs.where((m) =>
-      m.mediaPath != null &&
-      m.mediaPath!.isNotEmpty &&
-      File(m.mediaPath!).existsSync()
-    ).toList();
+    final mediaMsgs = selectedMsgs
+        .where(
+          (m) =>
+              m.mediaPath != null &&
+              m.mediaPath!.isNotEmpty &&
+              File(m.mediaPath!).existsSync(),
+        )
+        .toList();
 
     if (mediaMsgs.isNotEmpty) {
       final xFiles = mediaMsgs.map((m) => XFile(m.mediaPath!)).toList();
@@ -779,106 +1225,139 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        leading: _isSelectionMode 
-            ? IconButton(icon: const Icon(Icons.close), onPressed: _exitSelectionMode) 
+        leading: _isSelectionMode
+            ? IconButton(
+                icon: const Icon(Icons.close),
+                onPressed: _exitSelectionMode,
+              )
             : null,
         elevation: 0,
         flexibleSpace: Container(
           decoration: BoxDecoration(
             gradient: LinearGradient(
-              colors: _isGroupChat 
-                ? [Colors.teal.shade800, Colors.cyan.shade900]
-                : [Colors.deepPurple.shade800, Colors.purple.shade900],
+              colors: _isGroupChat
+                  ? [Colors.teal.shade800, Colors.cyan.shade900]
+                  : [Colors.deepPurple.shade800, Colors.purple.shade900],
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
             ),
           ),
         ),
         title: _isSelectionMode
-            ? Text('${_selectedMessageIds.length} Selected', style: const TextStyle(color: Colors.white))
+            ? Text(
+                '${_selectedMessageIds.length} Selected',
+                style: const TextStyle(color: Colors.white),
+              )
             : _isSearching
-                ? TextField(
-                    controller: _searchController,
-                    autofocus: true,
-                    style: const TextStyle(color: Colors.white),
-                    decoration: InputDecoration(
-                      hintText: 'Search messages...',
-                      hintStyle: TextStyle(color: Colors.white.withValues(alpha: 0.7)),
-                      border: InputBorder.none,
+            ? TextField(
+                controller: _searchController,
+                autofocus: true,
+                style: const TextStyle(color: Colors.white),
+                decoration: InputDecoration(
+                  hintText: 'Search messages...',
+                  hintStyle: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.7),
+                  ),
+                  border: InputBorder.none,
+                ),
+                onChanged: _filterMessages,
+              )
+            : GestureDetector(
+                onTap: () async {
+                  final result = await Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => ChatInfoScreen(
+                        sender: widget.sender,
+                        app: widget.app,
+                        avatarPath: _avatarPath,
+                        isGroupChat: _isGroupChat,
+                        initialSenderFilter: _selectedSenders.length == 1
+                            ? _selectedSenders.first
+                            : null,
+                      ),
                     ),
-                    onChanged: _filterMessages,
-                  )
-                : GestureDetector(
-                    onTap: () async {
-                      final searchWord = await Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (context) => ChatInfoScreen(sender: widget.sender, app: widget.app),
-                        ),
-                      );
-                      
-                      if (searchWord != null && searchWord is String && mounted) {
-                        setState(() {
-                          _isSearching = true;
-                          _searchController.text = searchWord;
-                          _filterMessages(searchWord);
-                        });
-                      }
-                    },
-                    child: Row(
-                      children: [
-                        // Avatar
-                        _buildAvatarWidget(),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
+                  );
+
+                  _handleChatInfoResult(result);
+                },
+                child: Row(
+                  children: [
+                    // Avatar
+                    _buildAvatarWidget(),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            _sanitizeText(widget.sender),
+                            style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 16,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          Row(
                             children: [
+                              _getAppIcon(widget.app, size: 12),
+                              const SizedBox(width: 4),
                               Text(
-                                _sanitizeText(widget.sender),
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 16,
+                                _isGroupChat ? 'Group Chat' : 'Private Chat',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.grey.shade300,
                                 ),
-                                overflow: TextOverflow.ellipsis,
                               ),
-                              Row(
-                                children: [
-                                  _getAppIcon(widget.app, size: 12),
-                                  const SizedBox(width: 4),
-                                  Text(
-                                    _isGroupChat ? 'Group Chat' : 'Private Chat',
+                              if (_messages.isNotEmpty) ...[
+                                Flexible(
+                                  child: Text(
+                                    _selectedSenders.isNotEmpty
+                                        ? ' • $_selectedSendersSum ${_selectedSendersSum == 1 ? 'message' : 'messages'}'
+                                        : ' • $_totalMessageCount ${_totalMessageCount == 1 ? 'message' : 'messages'}',
                                     style: TextStyle(
                                       fontSize: 12,
-                                      color: Colors.grey.shade300,
+                                      color: Colors.grey.shade400,
                                     ),
+                                    overflow: TextOverflow.ellipsis,
                                   ),
-                                  if (_messages.isNotEmpty) ...[
-                                    Flexible(
-                                      child: Text(
-                                        _selectedSenders.isNotEmpty
-                                            ? ' • $_selectedSendersSum ${_selectedSendersSum == 1 ? 'message' : 'messages'}'
-                                            : ' • $_totalMessageCount ${_totalMessageCount == 1 ? 'message' : 'messages'}',
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          color: Colors.grey.shade400,
-                                        ),
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ),
-                                  ],
-                                ],
-                              ),
+                                ),
+                              ],
                             ],
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
-                  ),
+                  ],
+                ),
+              ),
         actions: _isSelectionMode
             ? [
-                IconButton(icon: const Icon(Icons.copy), onPressed: _copySelected),
-                IconButton(icon: const Icon(Icons.share), onPressed: _shareSelected),
+                IconButton(
+                  icon: Icon(
+                    _selectedMessageIds
+                            .map(
+                              (id) =>
+                                  _messages
+                                      .firstWhere((message) => message.id == id)
+                                      .isSaved ==
+                                  true,
+                            )
+                            .every((saved) => saved)
+                        ? Icons.bookmark
+                        : Icons.bookmark_border,
+                  ),
+                  onPressed: _toggleSelectedSaved,
+                  tooltip: 'Save selected messages',
+                ),
+                IconButton(
+                  icon: const Icon(Icons.copy),
+                  onPressed: _copySelected,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.share),
+                  onPressed: _shareSelected,
+                ),
               ]
             : [
                 if (_isSearching && _matchIndices.isNotEmpty) ...[
@@ -890,7 +1369,9 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                   ),
                   IconButton(
                     icon: const Icon(Icons.keyboard_arrow_up),
-                    onPressed: _currentMatchIndex < _matchIndices.length - 1 ? _nextMatch : null,
+                    onPressed: _currentMatchIndex < _matchIndices.length - 1
+                        ? _nextMatch
+                        : null,
                     tooltip: 'Older messages',
                   ),
                   IconButton(
@@ -902,11 +1383,21 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                 if (_isGroupChat)
                   IconButton(
                     icon: Icon(
-                      _selectedSenders.isNotEmpty ? Icons.filter_list_alt : Icons.filter_list,
-                      color: _selectedSenders.isNotEmpty ? Colors.orangeAccent : Colors.white,
+                      _selectedSenders.isNotEmpty
+                          ? Icons.filter_list_alt
+                          : Icons.filter_list,
+                      color: _selectedSenders.isNotEmpty
+                          ? Colors.orangeAccent
+                          : Colors.white,
                     ),
                     onPressed: _showFilterDialog,
                     tooltip: 'Filter by sender',
+                  ),
+                if (_hasSavedMessages)
+                  IconButton(
+                    icon: Icon(Icons.bookmark, color: Colors.amber.shade300),
+                    onPressed: _showSavedMessage,
+                    tooltip: 'Show saved message',
                   ),
                 IconButton(
                   icon: Icon(_isSearching ? Icons.close : Icons.search),
@@ -930,10 +1421,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
       body: Container(
         decoration: BoxDecoration(
           gradient: LinearGradient(
-            colors: [
-              Colors.grey.shade900,
-              Colors.black87,
-            ],
+            colors: [Colors.grey.shade900, Colors.black87],
             begin: Alignment.topCenter,
             end: Alignment.bottomCenter,
           ),
@@ -945,8 +1433,11 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                 ),
               )
             : _messages.isEmpty
-                ? _buildEmptyState('No messages yet', 'Messages from ${_sanitizeText(widget.sender)} will appear here')
-                : _buildMessageList(),
+            ? _buildEmptyState(
+                'No messages yet',
+                'Messages from ${_sanitizeText(widget.sender)} will appear here',
+              )
+            : _buildMessageList(),
       ),
     );
   }
@@ -980,10 +1471,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
           const SizedBox(height: 8),
           Text(
             subtitle,
-            style: TextStyle(
-              fontSize: 14,
-              color: Colors.grey.shade600,
-            ),
+            style: TextStyle(fontSize: 14, color: Colors.grey.shade600),
             textAlign: TextAlign.center,
           ),
         ],
@@ -994,11 +1482,17 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   Widget _buildMessageList() {
     if (_displayItems.isEmpty) {
       if (_isSearching && _searchQuery.isNotEmpty) {
-         return _buildEmptyState('No matches', 'Try searching with a different term');
+        return _buildEmptyState(
+          'No matches',
+          'Try searching with a different term',
+        );
       }
-      return _buildEmptyState('No messages yet', 'Messages from ${_sanitizeText(widget.sender)} will appear here');
+      return _buildEmptyState(
+        'No messages yet',
+        'Messages from ${_sanitizeText(widget.sender)} will appear here',
+      );
     }
-    
+
     return ScrollablePositionedList.builder(
       padding: const EdgeInsets.all(16),
       reverse: true,
@@ -1016,7 +1510,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     if (index < 0 || index >= _displayItems.length) {
       return const SizedBox.shrink();
     }
-    
+
     final item = _displayItems[index];
 
     if (item.isHeader) {
@@ -1028,19 +1522,26 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
       if (index + 1 < _displayItems.length) {
         final prevItem = _displayItems[index + 1];
         if (!prevItem.isHeader && prevItem.message != null) {
-          previousSenderName = _sanitizeText(prevItem.message!.senderName ?? prevItem.message!.sender);
+          previousSenderName = _sanitizeText(
+            prevItem.message!.senderName ?? prevItem.message!.sender,
+          );
         }
       }
-      
+
       final isMatched = _matchIndices.contains(index);
-      final isCurrentMatch = _currentMatchIndex >= 0 && _matchIndices.isNotEmpty && _matchIndices[_currentMatchIndex] == index;
-      
+      final isCurrentMatch =
+          _currentMatchIndex >= 0 &&
+          _matchIndices.isNotEmpty &&
+          _matchIndices[_currentMatchIndex] == index;
+
       return _buildMessageBubble(
         item.message!,
         previousSenderName,
         isMatched: isMatched,
         isCurrentMatch: isCurrentMatch,
-        isSelected: item.message!.id != null && _selectedMessageIds.contains(item.message!.id),
+        isSelected:
+            item.message!.id != null &&
+            _selectedMessageIds.contains(item.message!.id),
       );
     }
   }
@@ -1082,12 +1583,19 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   Widget _buildSenderAvatar(String senderName, Color senderColor) {
     // Try to find sender-specific avatar file saved by native code
     if (_avatarsDir != null) {
-      final appPrefix = widget.app.contains('whatsapp') ? 'wa' :
-                         widget.app.contains('instagram') ? 'ig' : 'other';
+      final appPrefix = widget.app.contains('whatsapp')
+          ? 'wa'
+          : widget.app.contains('instagram')
+          ? 'ig'
+          : 'other';
       final safeName = senderName.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
-      final truncatedName = safeName.length > 50 ? safeName.substring(0, 50) : safeName;
-      final avatarFile = File('$_avatarsDir/${appPrefix}_sender_$truncatedName.png');
-      
+      final truncatedName = safeName.length > 50
+          ? safeName.substring(0, 50)
+          : safeName;
+      final avatarFile = File(
+        '$_avatarsDir/${appPrefix}_sender_$truncatedName.png',
+      );
+
       if (avatarFile.existsSync()) {
         return Container(
           width: 28,
@@ -1106,7 +1614,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
         );
       }
     }
-    
+
     // Fallback: letter initial
     return Container(
       width: 28,
@@ -1114,14 +1622,13 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
       decoration: BoxDecoration(
         color: senderColor.withValues(alpha: 0.2),
         shape: BoxShape.circle,
-        border: Border.all(
-          color: senderColor.withValues(alpha: 0.5),
-          width: 1,
-        ),
+        border: Border.all(color: senderColor.withValues(alpha: 0.5), width: 1),
       ),
       child: Center(
         child: Text(
-          senderName.isNotEmpty ? senderName.characters.first.toUpperCase() : '?',
+          senderName.isNotEmpty
+              ? senderName.characters.first.toUpperCase()
+              : '?',
           style: TextStyle(
             fontSize: 13,
             fontWeight: FontWeight.bold,
@@ -1135,7 +1642,8 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   /// Show options menu when long-pressing a message (copy, view full image, etc.)
   void _showMessageOptions(BuildContext context, MessageModel message) {
     final senderName = _sanitizeText(message.senderName ?? message.sender);
-    final hasImage = message.mediaPath != null &&
+    final hasImage =
+        message.mediaPath != null &&
         message.mediaPath!.isNotEmpty &&
         File(message.mediaPath!).existsSync();
     final isMedia = _isGenericMediaLabel(message.message);
@@ -1164,13 +1672,18 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
               ),
               // Message preview — show icon for media messages
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 8,
+                ),
                 child: isMedia && !hasImage
                     ? Row(
                         children: [
-                          Icon(_mediaTypeInfo(message.message).icon,
-                              color: _mediaTypeInfo(message.message).color,
-                              size: 16),
+                          Icon(
+                            _mediaTypeInfo(message.message).icon,
+                            color: _mediaTypeInfo(message.message).color,
+                            size: 16,
+                          ),
                           const SizedBox(width: 8),
                           Text(
                             _mediaTypeInfo(message.message).label,
@@ -1197,11 +1710,46 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
               ),
               const Divider(height: 1, color: Colors.grey),
 
+              if (message.id != null)
+                ListTile(
+                  leading: Icon(
+                    message.isSaved == true
+                        ? Icons.bookmark
+                        : Icons.bookmark_border,
+                    color: Colors.white70,
+                  ),
+                  title: Text(
+                    message.isSaved == true
+                        ? 'Remove from saved messages'
+                        : 'Save message',
+                    style: const TextStyle(color: Colors.white),
+                  ),
+                  onTap: () => _toggleMessageSaved(message),
+                ),
+
               // ── Document or Media options ──────────────────────────────
-              if (hasImage && ['pdf', 'doc', 'docx', 'csv', 'xls', 'xlsx', 'txt', 'ppt', 'pptx', 'zip', 'rar'].contains(message.mediaPath!.toLowerCase().split('.').last)) ...[
+              if (hasImage &&
+                  [
+                    'pdf',
+                    'doc',
+                    'docx',
+                    'csv',
+                    'xls',
+                    'xlsx',
+                    'txt',
+                    'ppt',
+                    'pptx',
+                    'zip',
+                    'rar',
+                  ].contains(
+                    message.mediaPath!.toLowerCase().split('.').last,
+                  )) ...[
                 ListTile(
                   leading: const Icon(Icons.open_in_new, color: Colors.white70),
-                  title: const Text('Open document', style: TextStyle(color: Colors.white)),
+                  title: const Text(
+                    'Open document',
+                    style: TextStyle(color: Colors.white),
+                  ),
                   onTap: () {
                     Navigator.pop(ctx);
                     _openDocument(message.mediaPath!);
@@ -1209,22 +1757,35 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                 ),
                 ListTile(
                   leading: const Icon(Icons.share, color: Colors.white70),
-                  title: const Text('Share document', style: TextStyle(color: Colors.white)),
+                  title: const Text(
+                    'Share document',
+                    style: TextStyle(color: Colors.white),
+                  ),
                   onTap: () {
                     Navigator.pop(ctx);
-                    SharePlus.instance.share(ShareParams(files: [XFile(message.mediaPath!)]));
+                    SharePlus.instance.share(
+                      ShareParams(files: [XFile(message.mediaPath!)]),
+                    );
                   },
                 ),
                 ListTile(
                   leading: const Icon(Icons.copy, color: Colors.white70),
-                  title: const Text('Copy document to clipboard', style: TextStyle(color: Colors.white)),
+                  title: const Text(
+                    'Copy document to clipboard',
+                    style: TextStyle(color: Colors.white),
+                  ),
                   onTap: () async {
                     Navigator.pop(ctx);
-                    final ok = await NotificationService.instance.copyMediaToClipboard(filePath: message.mediaPath!);
+                    final ok = await NotificationService.instance
+                        .copyMediaToClipboard(filePath: message.mediaPath!);
                     if (!mounted) return;
                     scaffoldMessenger.showSnackBar(
                       SnackBar(
-                        content: Text(ok ? 'Document copied to clipboard' : 'Failed to copy document'),
+                        content: Text(
+                          ok
+                              ? 'Document copied to clipboard'
+                              : 'Failed to copy document',
+                        ),
                         backgroundColor: Colors.grey.shade800,
                         behavior: SnackBarBehavior.floating,
                         duration: const Duration(seconds: 2),
@@ -1235,19 +1796,39 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
               ] else if (hasImage) ...[
                 () {
                   final ext = message.mediaPath!.toLowerCase().split('.').last;
-                  final isVideo = ['mp4', 'mov', 'avi', 'mkv', '3gp'].contains(ext);
-                  final isAudio = ['opus', 'ogg', 'mp3', 'm4a', 'wav', 'aac'].contains(ext);
-                  final mediaName = isVideo ? 'video' : (isAudio ? 'voice message' : 'image');
-                  final heroTag = 'media_${message.id ?? message.mediaPath.hashCode}';
+                  final isVideo = [
+                    'mp4',
+                    'mov',
+                    'avi',
+                    'mkv',
+                    '3gp',
+                  ].contains(ext);
+                  final isAudio = [
+                    'opus',
+                    'ogg',
+                    'mp3',
+                    'm4a',
+                    'wav',
+                    'aac',
+                  ].contains(ext);
+                  final mediaName = isVideo
+                      ? 'video'
+                      : (isAudio ? 'voice message' : 'image');
+                  final heroTag = 'media_${message.id}';
 
                   return Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       if (!isAudio)
                         ListTile(
-                          leading: const Icon(Icons.fullscreen, color: Colors.white70),
-                          title: Text(isVideo ? 'Play video' : 'View full image',
-                              style: const TextStyle(color: Colors.white)),
+                          leading: const Icon(
+                            Icons.fullscreen,
+                            color: Colors.white70,
+                          ),
+                          title: Text(
+                            isVideo ? 'Play video' : 'View full image',
+                            style: const TextStyle(color: Colors.white),
+                          ),
                           onTap: () {
                             Navigator.pop(ctx);
                             _openFullScreenImage(message.mediaPath!, heroTag);
@@ -1255,29 +1836,49 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                         ),
                       ListTile(
                         leading: const Icon(Icons.share, color: Colors.white70),
-                        title: Text('Share $mediaName',
-                            style: const TextStyle(color: Colors.white)),
+                        title: Text(
+                          'Share $mediaName',
+                          style: const TextStyle(color: Colors.white),
+                        ),
                         onTap: () {
                           Navigator.pop(ctx);
-                          final caption = (!isMedia && message.message.trim().isNotEmpty) ? message.message.trim() : null;
-                          SharePlus.instance.share(ShareParams(files: [XFile(message.mediaPath!)], text: caption));
+                          final caption =
+                              (!isMedia && message.message.trim().isNotEmpty)
+                              ? message.message.trim()
+                              : null;
+                          SharePlus.instance.share(
+                            ShareParams(
+                              files: [XFile(message.mediaPath!)],
+                              text: caption,
+                            ),
+                          );
                         },
                       ),
                       ListTile(
                         leading: const Icon(Icons.copy, color: Colors.white70),
-                        title: Text('Copy $mediaName to clipboard',
-                            style: const TextStyle(color: Colors.white)),
+                        title: Text(
+                          'Copy $mediaName to clipboard',
+                          style: const TextStyle(color: Colors.white),
+                        ),
                         onTap: () async {
                           Navigator.pop(ctx);
-                          final caption = (!isMedia && message.message.trim().isNotEmpty) ? message.message.trim() : null;
-                          final ok = await NotificationService.instance.copyMediaToClipboard(
-                            filePath: message.mediaPath!,
-                            text: caption,
-                          );
+                          final caption =
+                              (!isMedia && message.message.trim().isNotEmpty)
+                              ? message.message.trim()
+                              : null;
+                          final ok = await NotificationService.instance
+                              .copyMediaToClipboard(
+                                filePath: message.mediaPath!,
+                                text: caption,
+                              );
                           if (!mounted) return;
                           scaffoldMessenger.showSnackBar(
                             SnackBar(
-                              content: Text(ok ? '${mediaName[0].toUpperCase()}${mediaName.substring(1)} copied to clipboard' : 'Failed to copy'),
+                              content: Text(
+                                ok
+                                    ? '${mediaName[0].toUpperCase()}${mediaName.substring(1)} copied to clipboard'
+                                    : 'Failed to copy',
+                              ),
                               backgroundColor: Colors.grey.shade800,
                               behavior: SnackBarBehavior.floating,
                               duration: const Duration(seconds: 2),
@@ -1286,9 +1887,14 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                         },
                       ),
                       ListTile(
-                        leading: const Icon(Icons.download, color: Colors.white70),
-                        title: Text(isAudio ? 'Save to Downloads' : 'Save to Gallery',
-                            style: const TextStyle(color: Colors.white)),
+                        leading: const Icon(
+                          Icons.download,
+                          color: Colors.white70,
+                        ),
+                        title: Text(
+                          isAudio ? 'Save to Downloads' : 'Save to Gallery',
+                          style: const TextStyle(color: Colors.white),
+                        ),
                         onTap: () {
                           Navigator.pop(ctx);
                           _saveMediaFile(message.mediaPath!);
@@ -1303,11 +1909,12 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
               if (!isMedia && message.message.trim().isNotEmpty) ...[
                 ListTile(
                   leading: const Icon(Icons.text_fields, color: Colors.white70),
-                  title: const Text('Copy message text',
-                      style: TextStyle(color: Colors.white)),
+                  title: const Text(
+                    'Copy message text',
+                    style: TextStyle(color: Colors.white),
+                  ),
                   onTap: () {
-                    Clipboard.setData(
-                        ClipboardData(text: message.message));
+                    Clipboard.setData(ClipboardData(text: message.message));
                     Navigator.pop(ctx);
                     ScaffoldMessenger.of(context).showSnackBar(
                       SnackBar(
@@ -1321,21 +1928,27 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                 ),
                 if (_isGroupChat)
                   ListTile(
-                    leading:
-                        const Icon(Icons.content_copy, color: Colors.white70),
-                    title: const Text('Copy with sender info',
-                        style: TextStyle(color: Colors.white)),
+                    leading: const Icon(
+                      Icons.content_copy,
+                      color: Colors.white70,
+                    ),
+                    title: const Text(
+                      'Copy with sender info',
+                      style: TextStyle(color: Colors.white),
+                    ),
                     onTap: () {
-                      final formattedTime =
-                          _formatMessageTime(message.timestamp);
+                      final formattedTime = _formatMessageTime(
+                        message.timestamp,
+                      );
                       final textToCopy =
                           '[$formattedTime] $senderName: ${message.message}';
                       Clipboard.setData(ClipboardData(text: textToCopy));
                       Navigator.pop(ctx);
                       ScaffoldMessenger.of(context).showSnackBar(
                         SnackBar(
-                          content:
-                              const Text('Message with sender info copied'),
+                          content: const Text(
+                            'Message with sender info copied',
+                          ),
                           backgroundColor: Colors.grey.shade800,
                           behavior: SnackBarBehavior.floating,
                           duration: const Duration(seconds: 2),
@@ -1354,36 +1967,44 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   }
 
   Widget _buildHighlightText(String text, bool isCurrentMatch) {
-    if (_searchQuery.isEmpty) return Text(text, style: const TextStyle(fontSize: 15, color: Colors.white, height: 1.4));
-    
+    if (_searchQuery.isEmpty)
+      return Text(
+        text,
+        style: const TextStyle(fontSize: 15, color: Colors.white, height: 1.4),
+      );
+
     final queryStr = _searchQuery.toLowerCase();
     final lowerText = text.toLowerCase();
     final spans = <TextSpan>[];
     int start = 0;
-    
+
     while (true) {
       final index = lowerText.indexOf(queryStr, start);
       if (index == -1) {
         spans.add(TextSpan(text: text.substring(start)));
         break;
       }
-      
+
       if (index > start) {
         spans.add(TextSpan(text: text.substring(start, index)));
       }
-      
-      spans.add(TextSpan(
-        text: text.substring(index, index + queryStr.length),
-        style: TextStyle(
-          backgroundColor: isCurrentMatch ? Colors.orange : Colors.yellow.withValues(alpha: 0.5),
-          color: isCurrentMatch ? Colors.black : Colors.white,
-          fontWeight: FontWeight.bold,
+
+      spans.add(
+        TextSpan(
+          text: text.substring(index, index + queryStr.length),
+          style: TextStyle(
+            backgroundColor: isCurrentMatch
+                ? Colors.orange
+                : Colors.yellow.withValues(alpha: 0.5),
+            color: isCurrentMatch ? Colors.black : Colors.white,
+            fontWeight: FontWeight.bold,
+          ),
         ),
-      ));
-      
+      );
+
       start = index + queryStr.length;
     }
-    
+
     return RichText(
       text: TextSpan(
         style: const TextStyle(fontSize: 15, color: Colors.white, height: 1.4),
@@ -1393,7 +2014,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   }
 
   Widget _buildMessageBubble(
-    MessageModel message, 
+    MessageModel message,
     String? previousSenderName, {
     bool isMatched = false,
     bool isCurrentMatch = false,
@@ -1404,15 +2025,12 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     // Determine if we should show the sender name header
     // Show it in group chats when the sender changes from the previous message
     bool showSenderHeader = _isGroupChat && senderName != previousSenderName;
-    
+
     // Get sender color for group chats
     final senderColor = _getSenderColor(senderName);
-    
+
     return Padding(
-      padding: EdgeInsets.only(
-        bottom: 4,
-        top: showSenderHeader ? 12 : 0,
-      ),
+      padding: EdgeInsets.only(bottom: 4, top: showSenderHeader ? 12 : 0),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -1462,32 +2080,46 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
               decoration: BoxDecoration(
                 gradient: isSelected
                     ? LinearGradient(
-                        colors: [Colors.blue.shade800.withValues(alpha: 0.8), Colors.blue.shade900.withValues(alpha: 0.6)],
+                        colors: [
+                          Colors.blue.shade800.withValues(alpha: 0.8),
+                          Colors.blue.shade900.withValues(alpha: 0.6),
+                        ],
                         begin: Alignment.topLeft,
                         end: Alignment.bottomRight,
                       )
                     : isCurrentMatch
-                        ? LinearGradient(
-                            colors: [Colors.orange.shade800.withValues(alpha: 0.9), Colors.deepOrange.shade900.withValues(alpha: 0.8)],
-                            begin: Alignment.topLeft,
-                            end: Alignment.bottomRight,
-                          )
-                        : LinearGradient(
-                            colors: _isGroupChat
-                                ? [senderColor.withValues(alpha: 0.15), senderColor.withValues(alpha: 0.08)]
-                                : [Colors.deepPurple.shade800.withValues(alpha: 0.5), Colors.purple.shade900.withValues(alpha: 0.3)],
-                            begin: Alignment.topLeft,
-                            end: Alignment.bottomRight,
-                          ),
+                    ? LinearGradient(
+                        colors: [
+                          Colors.orange.shade800.withValues(alpha: 0.9),
+                          Colors.deepOrange.shade900.withValues(alpha: 0.8),
+                        ],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      )
+                    : LinearGradient(
+                        colors: _isGroupChat
+                            ? [
+                                senderColor.withValues(alpha: 0.15),
+                                senderColor.withValues(alpha: 0.08),
+                              ]
+                            : [
+                                Colors.deepPurple.shade800.withValues(
+                                  alpha: 0.5,
+                                ),
+                                Colors.purple.shade900.withValues(alpha: 0.3),
+                              ],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
                 borderRadius: BorderRadius.circular(16),
                 border: Border.all(
                   color: isSelected
                       ? Colors.blueAccent
                       : isCurrentMatch
-                          ? Colors.orangeAccent
-                          : _isGroupChat 
-                              ? senderColor.withValues(alpha: 0.3) 
-                              : Colors.deepPurple.shade600.withValues(alpha: 0.3),
+                      ? Colors.orangeAccent
+                      : _isGroupChat
+                      ? senderColor.withValues(alpha: 0.3)
+                      : Colors.deepPurple.shade600.withValues(alpha: 0.3),
                   width: (isCurrentMatch || isSelected) ? 2 : 1,
                 ),
               ),
@@ -1515,6 +2147,14 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                             ? Colors.blue.shade300
                             : Colors.grey.shade600,
                       ),
+                      if (message.isSaved == true) ...[
+                        const SizedBox(width: 5),
+                        Icon(
+                          Icons.bookmark,
+                          size: 14,
+                          color: Colors.amber.shade300,
+                        ),
+                      ],
                     ],
                   ),
                 ],
@@ -1541,20 +2181,38 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     final isWhatsApp = message.app.toLowerCase().contains('whatsapp');
     final mediaPath = message.mediaPath;
     final lowerMsg = message.message.trim().toLowerCase();
-    final isCallNotif = (lowerMsg.contains('call') && (
-      lowerMsg.contains('missed') || lowerMsg.contains('incoming') ||
-      lowerMsg.contains('ongoing') || lowerMsg.contains('ringing') || lowerMsg.contains('ended')
-    )) || lowerMsg == 'voice call' || lowerMsg == 'video call' || lowerMsg == 'group call';
+    final isCallNotif =
+        (lowerMsg.contains('call') &&
+            (lowerMsg.contains('missed') ||
+                lowerMsg.contains('incoming') ||
+                lowerMsg.contains('ongoing') ||
+                lowerMsg.contains('ringing') ||
+                lowerMsg.contains('ended'))) ||
+        lowerMsg == 'voice call' ||
+        lowerMsg == 'video call' ||
+        lowerMsg == 'group call';
 
-    final hasFile = !isCallNotif &&
+    // Strictly verify that the message belongs to the current conversation
+    final msgSender = message.sender.trim().toLowerCase();
+    final currentChat = widget.sender.trim().toLowerCase();
+    final msgSenderName = (message.senderName ?? '').trim().toLowerCase();
+    final isMatchingChat = msgSender == currentChat ||
+        (msgSenderName.isNotEmpty && msgSenderName == currentChat) ||
+        (message.isGroupChat == true);
+
+    final hasFile =
+        isMatchingChat &&
+        !isCallNotif &&
         mediaPath != null &&
         mediaPath.isNotEmpty &&
         File(mediaPath).existsSync();
-    final isMedia = !isCallNotif && isWhatsApp && (
-      _isGenericMediaLabel(message.message) ||
-      message.message.startsWith('📄') ||
-      message.message.startsWith('📎')
-    );
+    final isMedia =
+        isMatchingChat &&
+        !isCallNotif &&
+        isWhatsApp &&
+        (_isGenericMediaLabel(message.message) ||
+            message.message.startsWith('📄') ||
+            message.message.startsWith('📎'));
 
     if (hasFile) {
       // ── Case 1: We have the actual captured image ─────────────────────
@@ -1567,7 +2225,10 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
           _buildRealImage(message, mediaPath),
           if (hasCaption) ...[
             const SizedBox(height: 6),
-            _buildHighlightText(_sanitizeText(_cleanDocumentCaption(message.message)), isCurrentMatch),
+            _buildHighlightText(
+              _sanitizeText(_cleanDocumentCaption(message.message)),
+              isCurrentMatch,
+            ),
           ],
           const SizedBox(height: 8),
         ],
@@ -1599,12 +2260,26 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
 
   /// Renders the captured image, video/audio placeholder, or document card.
   Widget _buildRealImage(MessageModel message, String path) {
-    final heroTag = 'media_${message.id ?? path.hashCode}';
+    final heroTag = 'media_${message.id}';
     final ext = path.toLowerCase().split('.').last;
     final isVideo = ['mp4', 'mov', 'avi', 'mkv'].contains(ext);
     final isAudio = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext);
-    final isDoc = ['pdf', 'doc', 'docx', 'csv', 'xls', 'xlsx', 'txt', 'ppt', 'pptx', 'zip', 'rar'].contains(ext);
-    final mediaType = isVideo ? 'video' : (isAudio ? 'audio' : (isDoc ? 'document' : 'image'));
+    final isDoc = [
+      'pdf',
+      'doc',
+      'docx',
+      'csv',
+      'xls',
+      'xlsx',
+      'txt',
+      'ppt',
+      'pptx',
+      'zip',
+      'rar',
+    ].contains(ext);
+    final mediaType = isVideo
+        ? 'video'
+        : (isAudio ? 'audio' : (isDoc ? 'document' : 'image'));
 
     if (isDoc) {
       return _buildDocumentCard(message, path, ext);
@@ -1617,89 +2292,93 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
         child: ClipRRect(
           borderRadius: BorderRadius.circular(12),
           child: (isVideo || isAudio)
-            ? Stack(
-                alignment: Alignment.center,
-                children: [
-                  if (isVideo)
-                    SizedBox(
-                      width: double.infinity,
-                      height: 220,
-                      child: VideoThumbnailWidget(videoPath: path),
-                    )
-                  else
-                    Container(
-                      width: double.infinity,
-                      height: 220,
-                      decoration: BoxDecoration(
-                        color: Colors.orange.withValues(alpha: 0.15),
-                        border: Border.all(
-                          color: Colors.orange.withValues(alpha: 0.3),
+              ? Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    if (isVideo)
+                      SizedBox(
+                        width: double.infinity,
+                        height: 220,
+                        child: VideoThumbnailWidget(videoPath: path),
+                      )
+                    else
+                      Container(
+                        width: double.infinity,
+                        height: 220,
+                        decoration: BoxDecoration(
+                          color: Colors.orange.withValues(alpha: 0.15),
+                          border: Border.all(
+                            color: Colors.orange.withValues(alpha: 0.3),
+                          ),
+                        ),
+                        child: const Center(
+                          child: Icon(
+                            Icons.mic,
+                            color: Colors.orange,
+                            size: 64,
+                          ),
                         ),
                       ),
-                      child: const Center(
-                        child: Icon(Icons.mic, color: Colors.orange, size: 64),
-                      ),
-                    ),
-                  
-                  // Play overlay for both video and audio
-                  Container(
-                    width: 56,
-                    height: 56,
-                    decoration: BoxDecoration(
-                      color: Colors.black.withValues(alpha: 0.5),
-                      shape: BoxShape.circle,
-                    ),
-                    child: const Icon(
-                      Icons.play_arrow_rounded,
-                      color: Colors.white,
-                      size: 38,
-                    ),
-                  ),
 
-                  // Optional label for Audio
-                  if (isAudio)
-                    Positioned(
-                      bottom: 24,
-                      child: Text(
-                        'Voice Note',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w600,
-                          color: Colors.white.withValues(alpha: 0.9),
-                          decoration: TextDecoration.none,
-                        ),
-                      ),
-                    ),
-                ],
-              )
-            : Stack(
-                children: [
-                  Image.file(
-                    File(path),
-                    fit: BoxFit.cover,
-                    width: double.infinity,
-                    height: 220,
-                    errorBuilder: (_, __, ___) => _buildImageError(),
-                  ),
-                  // Tap-to-expand affordance
-                  Positioned(
-                    bottom: 8,
-                    right: 8,
-                    child: Container(
-                      padding: const EdgeInsets.all(4),
+                    // Play overlay for both video and audio
+                    Container(
+                      width: 56,
+                      height: 56,
                       decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.55),
-                        borderRadius: BorderRadius.circular(6),
+                        color: Colors.black.withValues(alpha: 0.5),
+                        shape: BoxShape.circle,
                       ),
                       child: const Icon(
-                        Icons.fullscreen,
+                        Icons.play_arrow_rounded,
                         color: Colors.white,
-                        size: 18,
+                        size: 38,
                       ),
                     ),
-                  ),
-                ],
-              ),
+
+                    // Optional label for Audio
+                    if (isAudio)
+                      Positioned(
+                        bottom: 24,
+                        child: Text(
+                          'Voice Note',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.white.withValues(alpha: 0.9),
+                            decoration: TextDecoration.none,
+                          ),
+                        ),
+                      ),
+                  ],
+                )
+              : Stack(
+                  children: [
+                    Image.file(
+                      File(path),
+                      fit: BoxFit.cover,
+                      width: double.infinity,
+                      height: 220,
+                      errorBuilder: (_, __, ___) => _buildImageError(),
+                    ),
+                    // Tap-to-expand affordance
+                    Positioned(
+                      bottom: 8,
+                      right: 8,
+                      child: Container(
+                        padding: const EdgeInsets.all(4),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.55),
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: const Icon(
+                          Icons.fullscreen,
+                          color: Colors.white,
+                          size: 18,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
         ),
       ),
     );
@@ -1724,11 +2403,28 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     } catch (_) {}
 
     final (docIcon, docColor, docLabel) = switch (ext) {
-      'pdf' => (Icons.picture_as_pdf_rounded, Colors.red.shade400, 'PDF Document'),
-      'doc' || 'docx' => (Icons.description_rounded, Colors.blue.shade400, 'Word Document'),
-      'csv' || 'xls' || 'xlsx' => (Icons.table_chart_rounded, Colors.green.shade400, 'Spreadsheet / CSV'),
-      'ppt' || 'pptx' => (Icons.slideshow_rounded, Colors.orange.shade400, 'Presentation'),
-      'zip' || 'rar' => (Icons.folder_zip_rounded, Colors.amber.shade400, 'Archive'),
+      'pdf' => (
+        Icons.picture_as_pdf_rounded,
+        Colors.red.shade400,
+        'PDF Document',
+      ),
+      'doc' || 'docx' => (
+        Icons.description_rounded,
+        Colors.blue.shade400,
+        'Word Document',
+      ),
+      'csv' || 'xls' || 'xlsx' => (
+        Icons.table_chart_rounded,
+        Colors.green.shade400,
+        'Spreadsheet / CSV',
+      ),
+      'ppt' || 'pptx' => (
+        Icons.slideshow_rounded,
+        Colors.orange.shade400,
+        'Presentation',
+      ),
+      'zip' ||
+      'rar' => (Icons.folder_zip_rounded, Colors.amber.shade400, 'Archive'),
       _ => (Icons.insert_drive_file_rounded, Colors.teal.shade300, 'Document'),
     };
 
@@ -1772,7 +2468,10 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                   Row(
                     children: [
                       Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 5,
+                          vertical: 1,
+                        ),
                         decoration: BoxDecoration(
                           color: docColor.withValues(alpha: 0.25),
                           borderRadius: BorderRadius.circular(4),
@@ -1790,7 +2489,10 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                         const SizedBox(width: 6),
                         Text(
                           fileSizeStr,
-                          style: TextStyle(fontSize: 11, color: Colors.grey.shade400),
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: Colors.grey.shade400,
+                          ),
                         ),
                       ],
                     ],
@@ -1805,7 +2507,11 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                 color: Colors.white.withValues(alpha: 0.1),
                 shape: BoxShape.circle,
               ),
-              child: const Icon(Icons.open_in_new_rounded, color: Colors.white70, size: 18),
+              child: const Icon(
+                Icons.open_in_new_rounded,
+                color: Colors.white70,
+                size: 18,
+              ),
             ),
           ],
         ),
@@ -1903,13 +2609,14 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     final info = _mediaTypeInfo(rawLabel);
     return GestureDetector(
       onTap: () async {
-        final hasSaf = await NotificationService.instance.getSafPermissionStatus();
-        final text = hasSaf 
+        final hasSaf = await NotificationService.instance
+            .getSafPermissionStatus();
+        final text = hasSaf
             ? 'Media not found on device. It may have been deleted before downloading, or Auto-Download is disabled in WhatsApp.'
             : 'Full media capture coming — grant WhatsApp folder access in Settings.';
-            
+
         if (!mounted) return;
-        
+
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Row(
@@ -1975,10 +2682,7 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
                   const SizedBox(height: 3),
                   Text(
                     'Tap to learn more',
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: Colors.grey.shade500,
-                    ),
+                    style: TextStyle(fontSize: 11, color: Colors.grey.shade500),
                   ),
                 ],
               ),
@@ -1999,20 +2703,31 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
       height: 80,
       color: Colors.grey.shade900,
       child: Center(
-        child: Icon(Icons.broken_image_outlined,
-            color: Colors.grey.shade600, size: 32),
+        child: Icon(
+          Icons.broken_image_outlined,
+          color: Colors.grey.shade600,
+          size: 32,
+        ),
       ),
     );
   }
 
-  Future<void> _openFullScreenImage(String path, String heroTag, {String? type}) async {
-    final allMedia = await DatabaseHelper.instance.getMediaMessagesBySender(widget.sender);
+  Future<void> _openFullScreenImage(
+    String path,
+    String heroTag, {
+    String? type,
+  }) async {
+    final allMedia = await DatabaseHelper.instance.getMediaMessagesBySender(
+      widget.sender,
+    );
     int index = allMedia.indexWhere((m) => m.mediaPath == path);
     if (index == -1) index = 0;
-    
+
     List<String> paths = allMedia.map((m) => m.mediaPath!).toList();
-    List<String> heroTags = allMedia.map((m) => 'media_${m.id ?? m.timestamp}').toList();
-    
+    List<String> heroTags = allMedia
+        .map((m) => 'media_${m.id}')
+        .toList();
+
     if (paths.isEmpty) {
       paths = [path];
       heroTags = [heroTag];
@@ -2029,7 +2744,13 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
           pageBuilder: (ctx, animation, _) {
             return FadeTransition(
               opacity: animation,
-              child: FullScreenMediaViewer(paths: paths, heroTags: heroTags, initialIndex: index, type: type, reverseOrder: true),
+              child: FullScreenMediaViewer(
+                paths: paths,
+                heroTags: heroTags,
+                initialIndex: index,
+                type: type,
+                reverseOrder: true,
+              ),
             );
           },
         ),
@@ -2047,25 +2768,54 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
   bool _isGenericMediaLabel(String text, [String? mediaPath]) {
     final lower = text.trim().toLowerCase();
     // Call notifications are NOT media labels
-    if (lower.contains('call') && (lower.contains('missed') || lower.contains('incoming') ||
-        lower.contains('ongoing') || lower.contains('ringing') || lower.contains('ended'))) {
+    if (lower.contains('call') &&
+        (lower.contains('missed') ||
+            lower.contains('incoming') ||
+            lower.contains('ongoing') ||
+            lower.contains('ringing') ||
+            lower.contains('ended'))) {
       return false;
     }
-    if (lower == 'voice call' || lower == 'video call' || lower == 'group call') return false;
+    if (lower == 'voice call' || lower == 'video call' || lower == 'group call')
+      return false;
 
     // Exact label matches (WhatsApp notification text)
     const labels = {
-      'photo', 'image', 'video', 'sticker', 'gif',
-      'image omitted', 'video omitted', 'audio omitted', 'sticker omitted',
-      'voice message', 'voice message omitted', 'audio',
-      'contact card', 'location', 'live location',
-      'document', 'document omitted', 'file',
+      'photo',
+      'image',
+      'video',
+      'sticker',
+      'gif',
+      'image omitted',
+      'video omitted',
+      'audio omitted',
+      'sticker omitted',
+      'voice message',
+      'voice message omitted',
+      'audio',
+      'contact card',
+      'location',
+      'live location',
+      'document',
+      'document omitted',
+      'file',
     };
     if (labels.contains(lower)) return true;
 
     // Emoji-prefixed labels WhatsApp uses in BigText
-    const emojiPrefixes = ['📷', '📹', '🎤', '🎵', '🎞',
-                           '🗺', '📍', '👤', '🎥', '🖼', '🎙'];
+    const emojiPrefixes = [
+      '📷',
+      '📹',
+      '🎤',
+      '🎵',
+      '🎞',
+      '🗺',
+      '📍',
+      '👤',
+      '🎥',
+      '🖼',
+      '🎙',
+    ];
     for (final p in emojiPrefixes) {
       if (lower.startsWith(p)) return true;
     }
@@ -2073,15 +2823,26 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
     // Document file summary patterns like "📄 filename.pdf (1 page)" or "📄 Document"
     if (lower.startsWith('📄') || lower.startsWith('📎')) {
       final withoutEmoji = lower.replaceFirst(RegExp(r'^[📄📎]\s*'), '').trim();
-      if (withoutEmoji.isEmpty || withoutEmoji == 'document' || withoutEmoji == 'file') return true;
+      if (withoutEmoji.isEmpty ||
+          withoutEmoji == 'document' ||
+          withoutEmoji == 'file')
+        return true;
       // Ends with (N page) or (N pages)
       if (RegExp(r'\([^)]*page[s]?\)$').hasMatch(withoutEmoji)) return true;
       // If a media file is attached, check if withoutEmoji is just the file's name
       if (mediaPath != null) {
-        final fName = mediaPath.split(Platform.pathSeparator).last.toLowerCase();
-        final fBase = fName.contains('.') ? fName.substring(0, fName.lastIndexOf('.')) : fName;
+        final fName = mediaPath
+            .split(Platform.pathSeparator)
+            .last
+            .toLowerCase();
+        final fBase = fName.contains('.')
+            ? fName.substring(0, fName.lastIndexOf('.'))
+            : fName;
         final fBaseNorm = fBase.replaceAll('_', ' ');
-        if (withoutEmoji == fName || withoutEmoji == fBase || withoutEmoji == fBaseNorm) return true;
+        if (withoutEmoji == fName ||
+            withoutEmoji == fBase ||
+            withoutEmoji == fBaseNorm)
+          return true;
       }
     }
 
@@ -2117,15 +2878,20 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
         label: isVideo ? 'Missed Video Call' : 'Missed Call',
       );
     }
-    if (lower.contains('voice') || lower.contains('audio') ||
-        lower.contains('🎤') || lower.contains('🎵') || lower.contains('🎙')) {
+    if (lower.contains('voice') ||
+        lower.contains('audio') ||
+        lower.contains('🎤') ||
+        lower.contains('🎵') ||
+        lower.contains('🎙')) {
       return _MediaTypeInfo(
         icon: Icons.mic_rounded,
         color: Colors.deepPurple.shade300,
         label: 'Voice Message',
       );
     }
-    if (lower.contains('video') || lower.contains('📹') || lower.contains('🎥')) {
+    if (lower.contains('video') ||
+        lower.contains('📹') ||
+        lower.contains('🎥')) {
       return _MediaTypeInfo(
         icon: Icons.videocam_rounded,
         color: Colors.blue.shade300,
@@ -2139,16 +2905,26 @@ class _ConversationScreenState extends State<ConversationScreen> with WidgetsBin
         label: 'Sticker / GIF',
       );
     }
-    if (lower.contains('document') || lower.contains('file') || lower.contains('📄') || lower.contains('📎') ||
-        lower.contains('.pdf') || lower.contains('.doc') || lower.contains('.xls') || lower.contains('.csv')) {
+    if (lower.contains('document') ||
+        lower.contains('file') ||
+        lower.contains('📄') ||
+        lower.contains('📎') ||
+        lower.contains('.pdf') ||
+        lower.contains('.doc') ||
+        lower.contains('.xls') ||
+        lower.contains('.csv')) {
       final isPdf = lower.contains('.pdf');
       return _MediaTypeInfo(
-        icon: isPdf ? Icons.picture_as_pdf_rounded : Icons.insert_drive_file_rounded,
+        icon: isPdf
+            ? Icons.picture_as_pdf_rounded
+            : Icons.insert_drive_file_rounded,
         color: isPdf ? Colors.red.shade400 : Colors.teal.shade300,
         label: isPdf ? 'PDF Document' : 'Document',
       );
     }
-    if (lower.contains('location') || lower.contains('🗺') || lower.contains('📍')) {
+    if (lower.contains('location') ||
+        lower.contains('🗺') ||
+        lower.contains('📍')) {
       return _MediaTypeInfo(
         icon: Icons.location_on_rounded,
         color: Colors.red.shade300,

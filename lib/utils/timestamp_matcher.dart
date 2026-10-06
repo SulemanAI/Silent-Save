@@ -2,19 +2,53 @@ import '../services/database_helper.dart';
 
 class TimestampMatcher {
   /// Match result wrapper
+  ///
+  /// [requireUnambiguous]: when true, returns [MatchResult.ambiguous] instead of
+  /// picking the closest candidate whenever multiple messages qualify. Used by
+  /// [reconcileNoSenderMedia] to avoid coin-flip attribution for sender-unknown files.
   static Future<MatchResult> matchMediaToNotification(
-      Map<String, dynamic> mediaEvent, int windowMs) async {
+      Map<String, dynamic> mediaEvent, int windowMs, {bool requireUnambiguous = false}) async {
     final int fileTimestampMs = mediaEvent['fileTimestampMs'] as int? ?? 0;
     if (fileTimestampMs == 0) return MatchResult.unmatched();
 
+    final targetSender = mediaEvent['targetSender'] as String?;
+    final mediaType = mediaEvent['mediaType'] as String? ?? 'unknown';
+
+    // ── PRIORITY: Direct messageId link ───────────────────────────────────
+    final messageId = mediaEvent['messageId'] as int?;
+    if (messageId != null && messageId > 0) {
+      final msg = await DatabaseHelper.instance.getMessageById(messageId);
+      if (msg != null && (msg.mediaPath == null || msg.mediaPath!.isEmpty)) {
+        if (targetSender != null && targetSender.trim().isNotEmpty) {
+          final ts = targetSender.toLowerCase().trim();
+          final s = msg.sender.toLowerCase().trim();
+          final sn = (msg.senderName ?? '').toLowerCase().trim();
+          if (s == ts || sn == ts) {
+            return MatchResult.matched(msg.toMap());
+          }
+        } else {
+          return MatchResult.matched(msg.toMap());
+        }
+      }
+    }
+
+    // Audio files (voice notes) arrive within seconds. Restrict audio to max 60s window.
+    final effectiveWindowMs = mediaType == 'audio'
+        ? (windowMs > 60000 ? 60000 : windowMs)
+        : windowMs;
+
+    // Strict sender enforcement: Audio/voice notes must NEVER be linked without a verified sender!
+    if (mediaType == 'audio' && (targetSender == null || targetSender.trim().isEmpty)) {
+      return MatchResult.unmatched();
+    }
+
     // Fetch candidate WhatsApp messages within window
-    final candidates = await DatabaseHelper.instance.getRecentWhatsAppMessages(windowMs, fileTimestampMs);
+    final candidates = await DatabaseHelper.instance.getRecentWhatsAppMessages(effectiveWindowMs, fileTimestampMs);
     if (candidates.isEmpty) {
       return MatchResult.unmatched();
     }
 
     // Filter by targetSender if specified
-    final targetSender = mediaEvent['targetSender'] as String?;
     var effectiveCandidates = candidates;
     if (targetSender != null && targetSender.trim().isNotEmpty) {
       final ts = targetSender.toLowerCase().trim();
@@ -32,7 +66,6 @@ class TimestampMatcher {
     }
 
     // FIRST FILTER: Only consider messages that are actually of this media type or blank placeholders!
-    final mediaType = mediaEvent['mediaType'] as String? ?? 'unknown';
     final displayName = (mediaEvent['displayName'] as String? ?? '').toLowerCase();
     final cleanBase = displayName.contains('.') ? displayName.substring(0, displayName.lastIndexOf('.')) : displayName;
     final cleanBaseNorm = cleanBase.replaceAll('_', ' ');
@@ -88,8 +121,14 @@ class TimestampMatcher {
     }
 
     // Multiple candidates found:
-    // Tier 1: Candidate message contains the specific filename/cleanBase
-    // Tier 2: Absolute timestamp delta proximity
+    // If no sender is attached, or the reconciler explicitly requires unambiguous matches,
+    // never guess across multiple candidates. A single valid candidate is the only safe
+    // zero-touch path; more than one candidate must remain ambiguous.
+    if (requireUnambiguous || (targetSender == null || targetSender.trim().isEmpty)) {
+      return MatchResult.ambiguous(targetCandidates);
+    }
+
+    // Sender-confirmed path: Tier 1 — filename match; Tier 2 — timestamp proximity
     final sortedCandidates = List<Map<String, dynamic>>.from(targetCandidates);
     sortedCandidates.sort((a, b) {
       final msgA = (a['message'] as String? ?? '').toLowerCase();

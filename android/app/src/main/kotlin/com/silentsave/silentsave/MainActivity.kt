@@ -80,6 +80,9 @@ class MainActivity : FlutterFragmentActivity() {
                     Log.d(TAG, "Permission: $granted")
                     result.success(granted)
                 }
+                "isNlsConnected" -> {
+                    result.success(NotificationListener.isConnected)
+                }
                 "openNotificationSettings" -> {
                     openNotificationSettings()
                     result.success(null)

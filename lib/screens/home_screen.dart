@@ -7,6 +7,7 @@ import '../services/database_helper.dart';
 import '../services/notification_service.dart';
 import '../services/encryption_service.dart';
 import '../models/message_model.dart';
+import '../utils/text_sanitizer.dart';
 import '../widgets/full_screen_media_viewer.dart';
 import 'conversation_screen.dart';
 import 'capture_screen.dart';
@@ -23,7 +24,8 @@ class HomeScreen extends StatefulWidget {
 
 enum SortOption { recent, mostMessages, leastMessages }
 
-class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+class _HomeScreenState extends State<HomeScreen>
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   final TextEditingController _searchController = TextEditingController();
   final FocusNode _searchFocusNode = FocusNode();
   List<Map<String, dynamic>> _conversations = [];
@@ -31,12 +33,13 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   List<MessageModel> _searchResults = [];
   bool _isLoading = true;
   bool _hasPermission = false;
+  bool _isNlsConnected = false;
   bool _hasSafPermission = true; // Default true to avoid flash before check
   bool _encryptionEnabled = false;
   SortOption _sortOption = SortOption.recent;
   String? _highlightedConversationKey;
   late TabController _tabController;
-  
+
   // Variables for custom swipe-to-switch tabs gesture detection
   double _horizontalDragTotal = 0;
   bool _isDraggingVertically = false;
@@ -63,7 +66,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
   @override
   void dispose() {
-    NotificationService.instance.newMessageNotifier.removeListener(_onNewMessage);
+    NotificationService.instance.newMessageNotifier.removeListener(
+      _onNewMessage,
+    );
     WidgetsBinding.instance.removeObserver(this);
     _searchController.dispose();
     _searchFocusNode.dispose();
@@ -73,13 +78,16 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   }
 
   void _handleTabSelection() async {
-    if (_tabController.indexIsChanging) return; // Wait for animation to finish or only trigger on definitive changes
-    
+    if (_tabController.indexIsChanging)
+      return; // Wait for animation to finish or only trigger on definitive changes
+
     if (_tabController.index == 2) {
       if (!_isCapturesAuthenticated) {
         bool authenticated = false;
         try {
-          final isAvailable = await _localAuth.canCheckBiometrics || await _localAuth.isDeviceSupported();
+          final isAvailable =
+              await _localAuth.canCheckBiometrics ||
+              await _localAuth.isDeviceSupported();
           if (isAvailable) {
             authenticated = await _localAuth.authenticate(
               localizedReason: 'Please authenticate to view your captures',
@@ -88,7 +96,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             );
           } else {
             // If device doesn't support biometrics, allow access (or show a password prompt)
-            authenticated = true; 
+            authenticated = true;
           }
         } catch (e) {
           debugPrint('Authentication error: \$e');
@@ -106,7 +114,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     } else {
       _previousTabIndex = _tabController.index;
       // Optional: reset authentication when navigating away from Captures tab
-      // _isCapturesAuthenticated = false; 
+      // _isCapturesAuthenticated = false;
     }
   }
 
@@ -126,7 +134,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       _applySortAndFilter();
     } else {
       // 1. Search all messages in DB for this query
-      final allMatchingMessages = await DatabaseHelper.instance.searchMessages(query);
+      final allMatchingMessages = await DatabaseHelper.instance.searchMessages(
+        query,
+      );
 
       if (!mounted) return;
       setState(() {
@@ -138,18 +148,27 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   void _applySortAndFilter() {
     if (_searchController.text.isNotEmpty) {
       // We don't apply conversation sorting logic to the purely query-based search results list in this version
-      return; 
+      return;
     }
-    
+
     // When no search is active, we filter from the base conversations list
     List<Map<String, dynamic>> filtered = List.from(_conversations);
 
     if (_sortOption == SortOption.mostMessages) {
-      filtered.sort((a, b) => (b['messageCount'] as int).compareTo(a['messageCount'] as int));
+      filtered.sort(
+        (a, b) =>
+            (b['messageCount'] as int).compareTo(a['messageCount'] as int),
+      );
     } else if (_sortOption == SortOption.leastMessages) {
-      filtered.sort((a, b) => (a['messageCount'] as int).compareTo(b['messageCount'] as int));
+      filtered.sort(
+        (a, b) =>
+            (a['messageCount'] as int).compareTo(b['messageCount'] as int),
+      );
     } else {
-      filtered.sort((a, b) => (b['lastTimestamp'] as int).compareTo(a['lastTimestamp'] as int));
+      filtered.sort(
+        (a, b) =>
+            (b['lastTimestamp'] as int).compareTo(a['lastTimestamp'] as int),
+      );
     }
 
     if (mounted) {
@@ -162,10 +181,14 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   /// Reload conversations from DB only (no notification refresh), to avoid loops.
   Future<void> _reloadConversationsFromDB() async {
     try {
-      final conversations = await DatabaseHelper.instance.getConversations()
-          .timeout(const Duration(seconds: 10), onTimeout: () {
-        return <Map<String, dynamic>>[];
-      });
+      final conversations = await DatabaseHelper.instance
+          .getConversations()
+          .timeout(
+            const Duration(seconds: 10),
+            onTimeout: () {
+              return <Map<String, dynamic>>[];
+            },
+          );
       if (mounted) {
         setState(() {
           _conversations = conversations.toList();
@@ -195,8 +218,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       final alreadyShown = prefs.getBool('oem_battery_guide_shown') ?? false;
       if (alreadyShown) return;
 
-      final manufacturer =
-          await NotificationService.instance.getManufacturer();
+      final manufacturer = await NotificationService.instance.getManufacturer();
       final lower = manufacturer.toLowerCase();
 
       String? package;
@@ -211,7 +233,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       }
 
       if (package == null) return;
-      
+
       await prefs.setBool('oem_battery_guide_shown', true);
 
       if (!mounted) return;
@@ -233,8 +255,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             TextButton(
               onPressed: () {
                 Navigator.of(ctx).pop();
-                NotificationService.instance
-                    .openOemBatterySettings(oemPackage);
+                NotificationService.instance.openOemBatterySettings(oemPackage);
               },
               child: const Text('Open Settings'),
             ),
@@ -247,11 +268,33 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   }
 
   Future<void> _checkPermission() async {
-    final hasPermission = await NotificationService.instance.isNotificationPermissionGranted();
-    debugPrint('[HomeScreen] Notification permission status: $hasPermission');
-    setState(() {
-      _hasPermission = hasPermission;
-    });
+    final hasPermission = await NotificationService.instance
+        .isNotificationPermissionGranted();
+    final isConnected = await NotificationService.instance.isNlsConnected();
+    debugPrint(
+      '[HomeScreen] Notification permission status: $hasPermission, Connected: $isConnected',
+    );
+    if (mounted) {
+      setState(() {
+        _hasPermission = hasPermission;
+        _isNlsConnected = isConnected;
+      });
+    }
+
+    // Timing fix: NLS may not have fired onListenerConnected yet when MainActivity
+    // first starts. If permission is granted but the flag is still false, request
+    // a rebind and re-check after a short delay so the flag catches up.
+    if (hasPermission && !isConnected) {
+      await Future.delayed(const Duration(seconds: 2));
+      if (!mounted) return;
+      final isConnectedRetry = await NotificationService.instance
+          .isNlsConnected();
+      if (mounted) {
+        setState(() {
+          _isNlsConnected = isConnectedRetry;
+        });
+      }
+    }
   }
 
   Future<void> _checkSafPermission() async {
@@ -260,8 +303,6 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       _hasSafPermission = hasSaf;
     });
   }
-
-
 
   Future<void> _checkEncryption() async {
     final enabled = await EncryptionService.instance.isEncryptionEnabled();
@@ -286,11 +327,15 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     }
 
     try {
-      final conversations = await DatabaseHelper.instance.getConversations()
-          .timeout(const Duration(seconds: 10), onTimeout: () {
-        debugPrint('[HomeScreen] getConversations timed out');
-        return <Map<String, dynamic>>[];
-      });
+      final conversations = await DatabaseHelper.instance
+          .getConversations()
+          .timeout(
+            const Duration(seconds: 10),
+            onTimeout: () {
+              debugPrint('[HomeScreen] getConversations timed out');
+              return <Map<String, dynamic>>[];
+            },
+          );
       setState(() {
         _conversations = conversations.toList();
         _isLoading = false;
@@ -306,9 +351,14 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     }
   }
 
-  Future<void> _handleDeleteConversation(String sender, String appPackage) async {
+  Future<void> _handleDeleteConversation(
+    String sender,
+    String appPackage,
+  ) async {
     // Save the conversation locally before removing
-    final deletedIndex = _conversations.indexWhere((c) => c['sender'] == sender && c['app'] == appPackage);
+    final deletedIndex = _conversations.indexWhere(
+      (c) => c['sender'] == sender && c['app'] == appPackage,
+    );
     Map<String, dynamic>? deletedConversation;
     if (deletedIndex != -1) {
       deletedConversation = _conversations[deletedIndex];
@@ -316,7 +366,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
     // Delete from DB immediately
     await DatabaseHelper.instance.deleteConversation(sender, appPackage);
-    
+
     // Remove from list locally for immediate feedback without full reload
     setState(() {
       if (deletedIndex != -1) {
@@ -334,18 +384,22 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           action: SnackBarAction(
             label: 'UNDO',
             onPressed: () async {
-              await DatabaseHelper.instance.undoDeleteConversation(sender, appPackage);
+              await DatabaseHelper.instance.undoDeleteConversation(
+                sender,
+                appPackage,
+              );
               if (deletedConversation != null && mounted) {
                 setState(() {
                   _conversations.add(deletedConversation!);
                   _applySortAndFilter();
                   _highlightedConversationKey = 'conv_${sender}_$appPackage';
                 });
-                
+
                 Future.delayed(const Duration(seconds: 2), () {
                   if (mounted) {
                     setState(() {
-                      if (_highlightedConversationKey == 'conv_${sender}_$appPackage') {
+                      if (_highlightedConversationKey ==
+                          'conv_${sender}_$appPackage') {
                         _highlightedConversationKey = null;
                       }
                     });
@@ -365,9 +419,17 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
   Widget _getAppIcon(String packageName, {double size = 12, Color? color}) {
     if (packageName.contains('whatsapp')) {
-      return FaIcon(FontAwesomeIcons.whatsapp, size: size, color: color ?? Colors.green);
+      return FaIcon(
+        FontAwesomeIcons.whatsapp,
+        size: size,
+        color: color ?? Colors.green,
+      );
     } else if (packageName.contains('instagram')) {
-      return FaIcon(FontAwesomeIcons.instagram, size: size, color: color ?? Colors.pinkAccent);
+      return FaIcon(
+        FontAwesomeIcons.instagram,
+        size: size,
+        color: color ?? Colors.pinkAccent,
+      );
     }
     return Icon(Icons.notifications, size: size, color: color ?? Colors.grey);
   }
@@ -389,20 +451,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   }
 
   // Sanitize text to remove invalid UTF-16 characters that could crash the app
-  String _sanitizeText(String? text) {
-    if (text == null || text.isEmpty) return '';
-    try {
-      // Dart's Runes iterator naturally handles surrogate pairs correctly 
-      // and replaces isolated surrogates with the replacement character U+FFFD.
-      return String.fromCharCodes(text.runes);
-    } catch (e) {
-      return text.replaceAll(RegExp(r'[\uD800-\uDFFF]'), '\uFFFD');
-    }
-  }
+  String _sanitizeText(String? text) => sanitizeText(text);
 
   void _toggleEncryption() async {
     final newValue = !_encryptionEnabled;
-    
+
     if (newValue) {
       // Show warning before enabling
       final confirm = await showDialog<bool>(
@@ -438,9 +491,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            newValue 
-              ? 'Encryption enabled for future messages' 
-              : 'Encryption disabled',
+            newValue
+                ? 'Encryption enabled for future messages'
+                : 'Encryption disabled',
           ),
         ),
       );
@@ -477,8 +530,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                       const SizedBox(height: 4),
                       Text(
                         _encryptionEnabled
-                          ? 'Messages are encrypted'
-                          : 'Messages are not encrypted',
+                            ? 'Messages are encrypted'
+                            : 'Messages are not encrypted',
                         style: TextStyle(
                           fontSize: 14,
                           color: Colors.grey.shade400,
@@ -500,10 +553,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             const SizedBox(height: 16),
             Text(
               'Long-press the refresh button to access encryption settings',
-              style: TextStyle(
-                fontSize: 12,
-                color: Colors.grey.shade600,
-              ),
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
               textAlign: TextAlign.center,
             ),
           ],
@@ -526,7 +576,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   }
 
   Future<void> _markCurrentTabAsRead() async {
-    final app = _tabController.index == 0 ? 'com.whatsapp' : 'com.instagram.android';
+    final app = _tabController.index == 0
+        ? 'com.whatsapp'
+        : 'com.instagram.android';
     final count = await DatabaseHelper.instance.markAllMessagesAsReadByApp(app);
     final appName = _tabController.index == 0 ? 'WhatsApp' : 'Instagram';
     if (mounted) {
@@ -544,9 +596,22 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text(
-          'SilentSave',
-          style: TextStyle(fontWeight: FontWeight.bold),
+        title: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'SilentSave',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              _isNlsConnected ? '(C)' : '(K)',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                color: _isNlsConnected ? Colors.green : Colors.red,
+              ),
+            ),
+          ],
         ),
         actions: [
           IconButton(
@@ -607,15 +672,27 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           controller: _tabController,
           tabs: const [
             Tab(
-              icon: FaIcon(FontAwesomeIcons.whatsapp, size: 24, color: Colors.green),
+              icon: FaIcon(
+                FontAwesomeIcons.whatsapp,
+                size: 24,
+                color: Colors.green,
+              ),
               text: 'WhatsApp',
             ),
             Tab(
-              icon: FaIcon(FontAwesomeIcons.instagram, size: 24, color: Colors.pinkAccent),
+              icon: FaIcon(
+                FontAwesomeIcons.instagram,
+                size: 24,
+                color: Colors.pinkAccent,
+              ),
               text: 'Instagram',
             ),
             Tab(
-              icon: Icon(Icons.camera_alt, size: 24, color: Colors.deepPurpleAccent),
+              icon: Icon(
+                Icons.camera_alt,
+                size: 24,
+                color: Colors.deepPurpleAccent,
+              ),
               text: 'Captures',
             ),
           ],
@@ -624,47 +701,51 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       body: Column(
         children: [
           if (!_hasPermission) _buildPermissionWarning(),
-          if (_hasPermission && !_hasSafPermission && _tabController.index == 0) _buildSafPermissionWarning(),
+          if (_hasPermission && !_hasSafPermission && _tabController.index == 0)
+            _buildSafPermissionWarning(),
           _buildSearchBar(),
           Expanded(
             child: _isLoading
                 ? const Center(child: CircularProgressIndicator())
                 : _searchController.text.isNotEmpty
-                    ? _buildSearchResultsList()
-                    : Listener(
-                        onPointerDown: (_) {
-                          _horizontalDragTotal = 0;
-                          _isDraggingVertically = false;
-                        },
-                        onPointerMove: (event) {
-                          if (_isDraggingVertically) return;
-                          
-                          // If moving vertically, ignore horizontal swipe
-                          if (event.delta.dy.abs() > 5 && _horizontalDragTotal.abs() < 10) {
-                            _isDraggingVertically = true;
-                            return;
-                          }
-                          
-                          _horizontalDragTotal += event.delta.dx;
-                          
-                          // Custom threshold to switch tabs
-                          if (_tabController.index == 0 && _horizontalDragTotal < -60) {
-                            _tabController.animateTo(1);
-                            _horizontalDragTotal = 0;
-                          } else if (_tabController.index == 1 && _horizontalDragTotal > 60) {
-                            _tabController.animateTo(0);
-                            _horizontalDragTotal = 0;
-                          }
-                        },
-                        child: TabBarView(
-                          controller: _tabController,
-                          children: [
-                            _buildConversationList('com.whatsapp'),
-                            _buildConversationList('com.instagram.android'),
-                            const CaptureScreen(),
-                          ],
-                        ),
-                      ),
+                ? _buildSearchResultsList()
+                : Listener(
+                    onPointerDown: (_) {
+                      _horizontalDragTotal = 0;
+                      _isDraggingVertically = false;
+                    },
+                    onPointerMove: (event) {
+                      if (_isDraggingVertically) return;
+
+                      // If moving vertically, ignore horizontal swipe
+                      if (event.delta.dy.abs() > 5 &&
+                          _horizontalDragTotal.abs() < 10) {
+                        _isDraggingVertically = true;
+                        return;
+                      }
+
+                      _horizontalDragTotal += event.delta.dx;
+
+                      // Custom threshold to switch tabs
+                      if (_tabController.index == 0 &&
+                          _horizontalDragTotal < -60) {
+                        _tabController.animateTo(1);
+                        _horizontalDragTotal = 0;
+                      } else if (_tabController.index == 1 &&
+                          _horizontalDragTotal > 60) {
+                        _tabController.animateTo(0);
+                        _horizontalDragTotal = 0;
+                      }
+                    },
+                    child: TabBarView(
+                      controller: _tabController,
+                      children: [
+                        _buildConversationList('com.whatsapp'),
+                        _buildConversationList('com.instagram.android'),
+                        const CaptureScreen(),
+                      ],
+                    ),
+                  ),
           ),
         ],
       ),
@@ -690,10 +771,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
               children: [
                 const Text(
                   'Notification Access Required',
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 16,
-                  ),
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
                 ),
                 const SizedBox(height: 4),
                 const Text(
@@ -709,17 +787,13 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
               // Recheck permission after a delay
               Future.delayed(const Duration(seconds: 2), _checkPermission);
             },
-            style: FilledButton.styleFrom(
-              backgroundColor: Colors.orange,
-            ),
+            style: FilledButton.styleFrom(backgroundColor: Colors.orange),
             child: const Text('Enable'),
           ),
         ],
       ),
     );
   }
-
-
 
   Widget _buildSafPermissionWarning() {
     return Container(
@@ -740,10 +814,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
               children: [
                 const Text(
                   'Media Capture setup',
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 16,
-                  ),
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
                 ),
                 const SizedBox(height: 4),
                 Text(
@@ -755,7 +826,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           ),
           FilledButton(
             onPressed: () async {
-              final granted = await NotificationService.instance.requestWhatsAppSafPermission();
+              final granted = await NotificationService.instance
+                  .requestWhatsAppSafPermission();
               if (granted) {
                 _checkSafPermission();
               }
@@ -811,14 +883,17 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                   selected: _sortOption == SortOption.recent,
 
                   shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(20), 
+                    borderRadius: BorderRadius.circular(20),
                   ),
 
-                  visualDensity: VisualDensity.compact, 
+                  visualDensity: VisualDensity.compact,
                   // Reduces the padding around the text inside the chip
-                  labelPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 0), 
+                  labelPadding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 0,
+                  ),
                   // Reduces the internal padding of the chip itself
-                  padding: EdgeInsets.zero, 
+                  padding: EdgeInsets.zero,
 
                   onSelected: (selected) {
                     if (selected) {
@@ -835,12 +910,15 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                   selected: _sortOption == SortOption.mostMessages,
 
                   shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(20), 
+                    borderRadius: BorderRadius.circular(20),
                   ),
 
-                  visualDensity: VisualDensity.compact, 
+                  visualDensity: VisualDensity.compact,
                   // Reduces the padding around the text inside the chip
-                  labelPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 0), 
+                  labelPadding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 0,
+                  ),
                   // Reduces the internal padding of the chip itself
                   padding: EdgeInsets.zero,
 
@@ -859,12 +937,15 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                   selected: _sortOption == SortOption.leastMessages,
 
                   shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(20), 
+                    borderRadius: BorderRadius.circular(20),
                   ),
 
-                  visualDensity: VisualDensity.compact, 
+                  visualDensity: VisualDensity.compact,
                   // Reduces the padding around the text inside the chip
-                  labelPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 0), 
+                  labelPadding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 0,
+                  ),
                   // Reduces the internal padding of the chip itself
                   padding: EdgeInsets.zero,
 
@@ -887,7 +968,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
   Widget _buildEmptyState(String appPackage) {
     final appName = appPackage.contains('whatsapp') ? 'WhatsApp' : 'Instagram';
-    
+
     return Center(
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
@@ -898,20 +979,14 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             _hasPermission
                 ? 'No $appName messages yet'
                 : 'Enable notification access to start',
-            style: TextStyle(
-              fontSize: 18,
-              color: Colors.grey.shade600,
-            ),
+            style: TextStyle(fontSize: 18, color: Colors.grey.shade600),
           ),
           const SizedBox(height: 8),
           Text(
             _hasPermission
                 ? 'Messages from $appName will appear here'
                 : 'Tap the button above to grant permission',
-            style: TextStyle(
-              fontSize: 14,
-              color: Colors.grey.shade700,
-            ),
+            style: TextStyle(fontSize: 14, color: Colors.grey.shade700),
             textAlign: TextAlign.center,
           ),
         ],
@@ -931,7 +1006,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       }
       return const SizedBox.shrink();
     }
-    
+
     return ListView.builder(
       padding: const EdgeInsets.symmetric(horizontal: 16),
       itemCount: _searchResults.length,
@@ -939,9 +1014,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         final message = _searchResults[index];
         final String rawSender = _sanitizeText(message.sender);
         final String sender = rawSender.isNotEmpty ? rawSender : 'Unknown';
-        final String displaySenderName = _sanitizeText(message.senderName ?? message.sender);
+        final String displaySenderName = _sanitizeText(
+          message.senderName ?? message.sender,
+        );
         final String appPackage = message.app;
-        
+
         // Find avatar from active conversation base if possible
         String? avatarPath;
         try {
@@ -950,8 +1027,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           );
           avatarPath = convBase['latestAvatarPath']?.toString();
         } catch (_) {}
-        
-        final bool hasAvatar = avatarPath != null && avatarPath.isNotEmpty && File(avatarPath).existsSync();
+
+        final bool hasAvatar =
+            avatarPath != null &&
+            avatarPath.isNotEmpty &&
+            File(avatarPath).existsSync();
 
         return _buildSearchResultCard(
           message: message,
@@ -1011,10 +1091,14 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                 CircleAvatar(
                   radius: 20,
                   backgroundColor: Colors.deepPurple.shade800,
-                  backgroundImage: avatarPath != null ? FileImage(File(avatarPath)) : null,
+                  backgroundImage: avatarPath != null
+                      ? FileImage(File(avatarPath))
+                      : null,
                   child: avatarPath == null
                       ? Text(
-                          senderText.isNotEmpty ? senderText.characters.first.toUpperCase() : '?',
+                          senderText.isNotEmpty
+                              ? senderText.characters.first.toUpperCase()
+                              : '?',
                           style: const TextStyle(
                             color: Colors.white,
                             fontWeight: FontWeight.bold,
@@ -1052,7 +1136,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                           ),
                           const SizedBox(width: 8),
                           Text(
-                            _formatTimestamp(message.timestamp.millisecondsSinceEpoch),
+                            _formatTimestamp(
+                              message.timestamp.millisecondsSinceEpoch,
+                            ),
                             style: TextStyle(
                               color: Colors.grey.shade500,
                               fontSize: 12,
@@ -1062,7 +1148,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                       ),
                       const SizedBox(height: 6),
                       // Provide highlight logic
-                      _buildHighlightText(message.message, _searchController.text),
+                      _buildHighlightText(
+                        message.message,
+                        _searchController.text,
+                      ),
                     ],
                   ),
                 ),
@@ -1093,31 +1182,37 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
     while (indexOfMatch != -1) {
       if (indexOfMatch > start) {
-        spans.add(TextSpan(
-          text: text.substring(start, indexOfMatch),
-          style: TextStyle(color: Colors.grey.shade400, fontSize: 14),
-        ));
+        spans.add(
+          TextSpan(
+            text: text.substring(start, indexOfMatch),
+            style: TextStyle(color: Colors.grey.shade400, fontSize: 14),
+          ),
+        );
       }
 
-      spans.add(TextSpan(
-        text: text.substring(indexOfMatch, indexOfMatch + query.length),
-        style: TextStyle(
-          color: Colors.black,
-          backgroundColor: Colors.orange.shade300,
-          fontWeight: FontWeight.bold,
-          fontSize: 14,
+      spans.add(
+        TextSpan(
+          text: text.substring(indexOfMatch, indexOfMatch + query.length),
+          style: TextStyle(
+            color: Colors.black,
+            backgroundColor: Colors.orange.shade300,
+            fontWeight: FontWeight.bold,
+            fontSize: 14,
+          ),
         ),
-      ));
+      );
 
       start = indexOfMatch + query.length;
       indexOfMatch = lowerText.indexOf(lowerQuery, start);
     }
 
     if (start < text.length) {
-      spans.add(TextSpan(
-        text: text.substring(start),
-        style: TextStyle(color: Colors.grey.shade400, fontSize: 14),
-      ));
+      spans.add(
+        TextSpan(
+          text: text.substring(start),
+          style: TextStyle(color: Colors.grey.shade400, fontSize: 14),
+        ),
+      );
     }
 
     return RichText(
@@ -1132,11 +1227,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     final appConversations = _filteredConversations
         .where((conv) => conv['app'].toString().contains(appPackage))
         .toList();
-    
+
     if (appConversations.isEmpty) {
       return _buildEmptyState(appPackage);
     }
-    
+
     return RefreshIndicator(
       onRefresh: _loadConversations,
       child: ListView.builder(
@@ -1153,14 +1248,19 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   Widget _buildConversationCard(Map<String, dynamic> conversation) {
     final bool isGroupChat = conversation['isGroupChat'] == 1;
     final int unreadCount = (conversation['unreadCount'] as int?) ?? 0;
-    final String lastMessage = _sanitizeText(conversation['lastMessage']?.toString());
-    final String lastSenderName = _sanitizeText(conversation['lastSenderName']?.toString());
+    final String lastMessage = _sanitizeText(
+      conversation['lastMessage']?.toString(),
+    );
+    final String lastSenderName = _sanitizeText(
+      conversation['lastSenderName']?.toString(),
+    );
     final String rawSender = _sanitizeText(conversation['sender']?.toString());
     final String sender = rawSender.isNotEmpty ? rawSender : 'Unknown';
     final String? avatarPath = conversation['latestAvatarPath']?.toString();
-    final bool hasAvatar = avatarPath != null &&
-                           avatarPath.isNotEmpty &&
-                           File(avatarPath).existsSync();
+    final bool hasAvatar =
+        avatarPath != null &&
+        avatarPath.isNotEmpty &&
+        File(avatarPath).existsSync();
 
     // Build preview text with sender name for group chats
     String previewText = lastMessage;
@@ -1172,10 +1272,13 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     if (previewText.length > 50) {
       previewText = '${previewText.substring(0, 47)}...';
     }
-    
+
     final String? lastMediaPath = conversation['lastMediaPath']?.toString();
-    final bool hasMediaFile = lastMediaPath != null && lastMediaPath.isNotEmpty && File(lastMediaPath).existsSync();
-    
+    final bool hasMediaFile =
+        lastMediaPath != null &&
+        lastMediaPath.isNotEmpty &&
+        File(lastMediaPath).existsSync();
+
     bool isAudio = false;
     bool isVideo = false;
     bool isImage = false;
@@ -1185,40 +1288,57 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       isVideo = ['mp4', 'mov', 'avi', 'mkv'].contains(ext);
       isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].contains(ext);
     }
-    
+
     final String appPackage = conversation['app']?.toString() ?? '';
     final bool isWhatsApp = appPackage.contains('whatsapp');
-    
+
     return Slidable(
       key: Key('conv_${sender}_$appPackage'),
-      startActionPane: isWhatsApp ? ActionPane(
-        motion: const ScrollMotion(),
-        dismissible: DismissiblePane(onDismissed: () => _handleDeleteConversation(sender, appPackage)),
-        children: [
-          SlidableAction(
-            onPressed: (context) => _handleDeleteConversation(sender, appPackage),
-            backgroundColor: Colors.red.shade800,
-            foregroundColor: Colors.white,
-            icon: Icons.delete,
-            borderRadius: BorderRadius.circular(16),
-          ),
-        ],
-      ) : null,
-      endActionPane: !isWhatsApp ? ActionPane(
-        motion: const ScrollMotion(),
-        dismissible: DismissiblePane(onDismissed: () => _handleDeleteConversation(sender, appPackage)),
-        children: [
-          SlidableAction(
-            onPressed: (context) => _handleDeleteConversation(sender, appPackage),
-            backgroundColor: Colors.red.shade800,
-            foregroundColor: Colors.white,
-            icon: Icons.delete,
-            borderRadius: BorderRadius.circular(16),
-          ),
-        ],
-      ) : null,
+      startActionPane: isWhatsApp
+          ? ActionPane(
+              motion: const ScrollMotion(),
+              dismissible: DismissiblePane(
+                onDismissed: () =>
+                    _handleDeleteConversation(sender, appPackage),
+              ),
+              children: [
+                SlidableAction(
+                  onPressed: (context) =>
+                      _handleDeleteConversation(sender, appPackage),
+                  backgroundColor: Colors.red.shade800,
+                  foregroundColor: Colors.white,
+                  icon: Icons.delete,
+                  borderRadius: BorderRadius.circular(16),
+                ),
+              ],
+            )
+          : null,
+      endActionPane: !isWhatsApp
+          ? ActionPane(
+              motion: const ScrollMotion(),
+              dismissible: DismissiblePane(
+                onDismissed: () =>
+                    _handleDeleteConversation(sender, appPackage),
+              ),
+              children: [
+                SlidableAction(
+                  onPressed: (context) =>
+                      _handleDeleteConversation(sender, appPackage),
+                  backgroundColor: Colors.red.shade800,
+                  foregroundColor: Colors.white,
+                  icon: Icons.delete,
+                  borderRadius: BorderRadius.circular(16),
+                ),
+              ],
+            )
+          : null,
       child: TweenAnimationBuilder<double>(
-        tween: Tween(begin: _highlightedConversationKey == 'conv_${sender}_$appPackage' ? 1.0 : 0.0, end: 0.0),
+        tween: Tween(
+          begin: _highlightedConversationKey == 'conv_${sender}_$appPackage'
+              ? 1.0
+              : 0.0,
+          end: 0.0,
+        ),
         duration: const Duration(milliseconds: 1500),
         curve: Curves.easeOut,
         builder: (context, value, child) {
@@ -1228,16 +1348,16 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
               gradient: LinearGradient(
                 colors: [
                   Color.lerp(
-                    unreadCount > 0 
-                      ? Colors.deepPurple.shade900.withValues(alpha: 0.4) 
-                      : Colors.grey.shade900.withValues(alpha: 0.5),
+                    unreadCount > 0
+                        ? Colors.deepPurple.shade900.withValues(alpha: 0.4)
+                        : Colors.grey.shade900.withValues(alpha: 0.5),
                     Colors.green.shade800.withValues(alpha: 0.6),
                     value,
                   )!,
                   Color.lerp(
-                    unreadCount > 0 
-                      ? Colors.purple.shade900.withValues(alpha: 0.2) 
-                      : Colors.grey.shade800.withValues(alpha: 0.3),
+                    unreadCount > 0
+                        ? Colors.purple.shade900.withValues(alpha: 0.2)
+                        : Colors.grey.shade800.withValues(alpha: 0.3),
                     Colors.green.shade900.withValues(alpha: 0.3),
                     value,
                   )!,
@@ -1248,9 +1368,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
               borderRadius: BorderRadius.circular(16),
               border: Border.all(
                 color: Color.lerp(
-                  unreadCount > 0 
-                    ? Colors.deepPurple.shade400.withValues(alpha: 0.5) 
-                    : Colors.grey.shade700.withValues(alpha: 0.3),
+                  unreadCount > 0
+                      ? Colors.deepPurple.shade400.withValues(alpha: 0.5)
+                      : Colors.grey.shade700.withValues(alpha: 0.3),
                   Colors.greenAccent.withValues(alpha: 0.8),
                   value,
                 )!,
@@ -1262,268 +1382,346 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         },
         child: Material(
           color: Colors.transparent,
-        child: InkWell(
-          borderRadius: BorderRadius.circular(16),
-          splashColor: Colors.deepPurple.shade300.withValues(alpha: 0.2),
-          highlightColor: Colors.deepPurple.shade200.withValues(alpha: 0.1),
-          onTap: () {
-            _searchFocusNode.unfocus();
-            Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (context) => ConversationScreen(
-                  sender: sender,
-                  app: conversation['app']?.toString() ?? '',
-                  initialAvatarPath: hasAvatar ? avatarPath : null,
-                ),
-              ),
-            ).then((_) {
+          child: InkWell(
+            borderRadius: BorderRadius.circular(16),
+            splashColor: Colors.deepPurple.shade300.withValues(alpha: 0.2),
+            highlightColor: Colors.deepPurple.shade200.withValues(alpha: 0.1),
+            onTap: () {
               _searchFocusNode.unfocus();
-              _loadConversations();
-            });
-          },
-          child: Padding(
-            padding: const EdgeInsets.all(14),
-            child: Row(
-              children: [
-                // Avatar with group indicator
-                GestureDetector(
-                  onTap: () {
-                    if (hasAvatar) {
-                      _searchFocusNode.unfocus();
-                      Navigator.push(
-                        context,
-                        PageRouteBuilder(
-                          opaque: false,
-                          barrierColor: Colors.black.withValues(alpha: 0.92),
-                          pageBuilder: (ctx, animation, _) {
-                            return FadeTransition(
-                              opacity: animation,
-                              child: FullScreenMediaViewer(
-                                paths: [avatarPath],
-                                heroTags: ['avatar_${sender}_$appPackage'],
-                                type: 'image',
-                                reverseOrder: true,
-                              ),
-                            );
-                          },
-                        ),
-                      );
-                    }
-                  },
-                  child: Hero(
-                    tag: 'avatar_${sender}_$appPackage',
-                    child: Stack(
-                      children: [
-                        Container(
-                          width: 56,
-                          height: 56,
-                          decoration: BoxDecoration(
-                            gradient: hasAvatar ? null : LinearGradient(
-                              colors: isGroupChat 
-                                ? [Colors.teal.shade400, Colors.cyan.shade600]
-                                : [Colors.deepPurple.shade400, Colors.purple.shade600],
-                              begin: Alignment.topLeft,
-                              end: Alignment.bottomRight,
-                            ),
-                            shape: BoxShape.circle,
-                            image: hasAvatar ? DecorationImage(
-                              image: FileImage(File(avatarPath)),
-                              fit: BoxFit.cover,
-                            ) : null,
-                            boxShadow: [
-                              BoxShadow(
-                                color: (isGroupChat ? Colors.teal : Colors.deepPurple).withValues(alpha: 0.3),
-                                blurRadius: 8,
-                                offset: const Offset(0, 2),
-                              ),
-                            ],
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => ConversationScreen(
+                    sender: sender,
+                    app: conversation['app']?.toString() ?? '',
+                    initialAvatarPath: hasAvatar ? avatarPath : null,
+                  ),
+                ),
+              ).then((_) {
+                _searchFocusNode.unfocus();
+                _loadConversations();
+              });
+            },
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Row(
+                children: [
+                  // Avatar with group indicator
+                  GestureDetector(
+                    onTap: () {
+                      if (hasAvatar) {
+                        _searchFocusNode.unfocus();
+                        Navigator.push(
+                          context,
+                          PageRouteBuilder(
+                            opaque: false,
+                            barrierColor: Colors.black.withValues(alpha: 0.92),
+                            pageBuilder: (ctx, animation, _) {
+                              return FadeTransition(
+                                opacity: animation,
+                                child: FullScreenMediaViewer(
+                                  paths: [avatarPath],
+                                  heroTags: ['avatar_${sender}_$appPackage'],
+                                  type: 'image',
+                                  reverseOrder: true,
+                                ),
+                              );
+                            },
                           ),
-                          child: hasAvatar ? null : Center(
-                            child: isGroupChat
-                              ? const Icon(Icons.group, color: Colors.white, size: 28)
-                              : Text(
-                                  sender.isNotEmpty ? sender.characters.first.toUpperCase() : '?',
+                        );
+                      }
+                    },
+                    child: Hero(
+                      tag: 'avatar_${sender}_$appPackage',
+                      child: Stack(
+                        children: [
+                          Container(
+                            width: 56,
+                            height: 56,
+                            decoration: BoxDecoration(
+                              gradient: hasAvatar
+                                  ? null
+                                  : LinearGradient(
+                                      colors: isGroupChat
+                                          ? [
+                                              Colors.teal.shade400,
+                                              Colors.cyan.shade600,
+                                            ]
+                                          : [
+                                              Colors.deepPurple.shade400,
+                                              Colors.purple.shade600,
+                                            ],
+                                      begin: Alignment.topLeft,
+                                      end: Alignment.bottomRight,
+                                    ),
+                              shape: BoxShape.circle,
+                              image: hasAvatar
+                                  ? DecorationImage(
+                                      image: FileImage(File(avatarPath)),
+                                      fit: BoxFit.cover,
+                                    )
+                                  : null,
+                              boxShadow: [
+                                BoxShadow(
+                                  color:
+                                      (isGroupChat
+                                              ? Colors.teal
+                                              : Colors.deepPurple)
+                                          .withValues(alpha: 0.3),
+                                  blurRadius: 8,
+                                  offset: const Offset(0, 2),
+                                ),
+                              ],
+                            ),
+                            child: hasAvatar
+                                ? null
+                                : Center(
+                                    child: isGroupChat
+                                        ? const Icon(
+                                            Icons.group,
+                                            color: Colors.white,
+                                            size: 28,
+                                          )
+                                        : Text(
+                                            sender.isNotEmpty
+                                                ? sender.characters.first
+                                                      .toUpperCase()
+                                                : '?',
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 22,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                  ),
+                          ),
+                          // App badge (WhatsApp/Instagram)
+                          Positioned(
+                            right: 0,
+                            bottom: 0,
+                            child: Container(
+                              width: 20,
+                              height: 20,
+                              decoration: BoxDecoration(
+                                color: Colors.black87,
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: Colors.grey.shade800,
+                                  width: 2,
+                                ),
+                              ),
+                              child: Center(
+                                child: _getAppIcon(
+                                  conversation['app']?.toString() ?? '',
+                                  size: 10,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 14),
+                  // Content
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        // Header row with name and timestamp
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Row(
+                                children: [
+                                  Flexible(
+                                    child: Text(
+                                      sender,
+                                      style: TextStyle(
+                                        fontWeight: unreadCount > 0
+                                            ? FontWeight.bold
+                                            : FontWeight.w600,
+                                        fontSize: 16,
+                                        color: unreadCount > 0
+                                            ? Colors.white
+                                            : Colors.grey.shade300,
+                                      ),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                  if (isGroupChat) ...[
+                                    const SizedBox(width: 6),
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 6,
+                                        vertical: 2,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: Colors.teal.shade700.withValues(
+                                          alpha: 0.7,
+                                        ),
+                                        borderRadius: BorderRadius.circular(8),
+                                      ),
+                                      child: const Text(
+                                        'GROUP',
+                                        style: TextStyle(
+                                          fontSize: 9,
+                                          fontWeight: FontWeight.bold,
+                                          color: Colors.white70,
+                                          letterSpacing: 0.5,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                            ),
+                            Text(
+                              _formatTimestamp(
+                                conversation['lastTimestamp'] as int? ?? 0,
+                              ),
+                              style: TextStyle(
+                                color: unreadCount > 0
+                                    ? Colors.deepPurple.shade200
+                                    : Colors.grey.shade500,
+                                fontSize: 12,
+                                fontWeight: unreadCount > 0
+                                    ? FontWeight.w600
+                                    : FontWeight.normal,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        // Message preview row
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Row(
+                                children: [
+                                  if (hasMediaFile)
+                                    Container(
+                                      margin: const EdgeInsets.only(right: 6),
+                                      width: 20,
+                                      height: 20,
+                                      decoration: !isImage
+                                          ? null
+                                          : BoxDecoration(
+                                              borderRadius:
+                                                  BorderRadius.circular(4),
+                                              image: DecorationImage(
+                                                image: FileImage(
+                                                  File(lastMediaPath),
+                                                ),
+                                                fit: BoxFit.cover,
+                                              ),
+                                            ),
+                                      child: isVideo
+                                          ? Icon(
+                                              Icons.videocam,
+                                              size: 18,
+                                              color: Colors.grey.shade400,
+                                            )
+                                          : isAudio
+                                          ? Icon(
+                                              Icons.mic,
+                                              size: 18,
+                                              color: Colors.grey.shade400,
+                                            )
+                                          : !isImage
+                                          ? Icon(
+                                              Icons.insert_drive_file,
+                                              size: 18,
+                                              color: Colors.grey.shade400,
+                                            )
+                                          : null,
+                                    ),
+                                  Expanded(
+                                    child: Text(
+                                      previewText.isEmpty && hasMediaFile
+                                          ? (isVideo
+                                                ? 'Video'
+                                                : isAudio
+                                                ? 'Voice Note'
+                                                : isImage
+                                                ? 'Photo'
+                                                : 'Document')
+                                          : (previewText.isEmpty
+                                                ? 'No messages'
+                                                : previewText),
+                                      style: TextStyle(
+                                        color: unreadCount > 0
+                                            ? Colors.grey.shade300
+                                            : Colors.grey.shade500,
+                                        fontSize: 14,
+                                        fontWeight: unreadCount > 0
+                                            ? FontWeight.w500
+                                            : FontWeight.normal,
+                                      ),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            if (unreadCount > 0) ...[
+                              const SizedBox(width: 8),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 4,
+                                ),
+                                decoration: BoxDecoration(
+                                  gradient: LinearGradient(
+                                    colors: [
+                                      Colors.deepPurple.shade400,
+                                      Colors.purple.shade500,
+                                    ],
+                                  ),
+                                  borderRadius: BorderRadius.circular(12),
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: Colors.deepPurple.withValues(
+                                        alpha: 0.4,
+                                      ),
+                                      blurRadius: 6,
+                                      offset: const Offset(0, 2),
+                                    ),
+                                  ],
+                                ),
+                                child: Text(
+                                  unreadCount > 99
+                                      ? '99+'
+                                      : unreadCount.toString(),
                                   style: const TextStyle(
                                     color: Colors.white,
-                                    fontSize: 22,
+                                    fontSize: 12,
                                     fontWeight: FontWeight.bold,
                                   ),
                                 ),
-                          ),
-                        ),
-                        // App badge (WhatsApp/Instagram)
-                        Positioned(
-                          right: 0,
-                          bottom: 0,
-                          child: Container(
-                            width: 20,
-                            height: 20,
-                            decoration: BoxDecoration(
-                              color: Colors.black87,
-                              shape: BoxShape.circle,
-                              border: Border.all(color: Colors.grey.shade800, width: 2),
-                            ),
-                            child: Center(
-                              child: _getAppIcon(conversation['app']?.toString() ?? '', size: 10),
-                            ),
-                          ),
+                              ),
+                            ] else ...[
+                              const SizedBox(width: 8),
+                              Text(
+                                '${conversation['messageCount']}',
+                                style: TextStyle(
+                                  color: Colors.grey.shade600,
+                                  fontSize: 11,
+                                ),
+                              ),
+                            ],
+                          ],
                         ),
                       ],
                     ),
                   ),
-                ),
-                const SizedBox(width: 14),
-                // Content
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      // Header row with name and timestamp
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Row(
-                              children: [
-                                Flexible(
-                                  child: Text(
-                                    sender,
-                                    style: TextStyle(
-                                      fontWeight: unreadCount > 0 ? FontWeight.bold : FontWeight.w600,
-                                      fontSize: 16,
-                                      color: unreadCount > 0 ? Colors.white : Colors.grey.shade300,
-                                    ),
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                                if (isGroupChat) ...[
-                                  const SizedBox(width: 6),
-                                  Container(
-                                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                    decoration: BoxDecoration(
-                                      color: Colors.teal.shade700.withValues(alpha: 0.7),
-                                      borderRadius: BorderRadius.circular(8),
-                                    ),
-                                    child: const Text(
-                                      'GROUP',
-                                      style: TextStyle(
-                                        fontSize: 9,
-                                        fontWeight: FontWeight.bold,
-                                        color: Colors.white70,
-                                        letterSpacing: 0.5,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ],
-                            ),
-                          ),
-                          Text(
-                            _formatTimestamp(conversation['lastTimestamp'] as int? ?? 0),
-                            style: TextStyle(
-                              color: unreadCount > 0 
-                                ? Colors.deepPurple.shade200 
-                                : Colors.grey.shade500,
-                              fontSize: 12,
-                              fontWeight: unreadCount > 0 ? FontWeight.w600 : FontWeight.normal,
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 6),
-                      // Message preview row
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Row(
-                              children: [
-                                if (hasMediaFile)
-                                  Container(
-                                    margin: const EdgeInsets.only(right: 6),
-                                    width: 20,
-                                    height: 20,
-                                    decoration: !isImage ? null : BoxDecoration(
-                                      borderRadius: BorderRadius.circular(4),
-                                      image: DecorationImage(
-                                        image: FileImage(File(lastMediaPath)),
-                                        fit: BoxFit.cover,
-                                      ),
-                                    ),
-                                    child: isVideo 
-                                      ? Icon(Icons.videocam, size: 18, color: Colors.grey.shade400)
-                                      : isAudio
-                                        ? Icon(Icons.mic, size: 18, color: Colors.grey.shade400)
-                                        : !isImage
-                                          ? Icon(Icons.insert_drive_file, size: 18, color: Colors.grey.shade400)
-                                          : null,
-                                  ),
-                                Expanded(
-                                  child: Text(
-                                    previewText.isEmpty && hasMediaFile 
-                                      ? (isVideo ? 'Video' : isAudio ? 'Voice Note' : isImage ? 'Photo' : 'Document') 
-                                      : (previewText.isEmpty ? 'No messages' : previewText),
-                                    style: TextStyle(
-                                      color: unreadCount > 0 
-                                        ? Colors.grey.shade300 
-                                        : Colors.grey.shade500,
-                                      fontSize: 14,
-                                      fontWeight: unreadCount > 0 ? FontWeight.w500 : FontWeight.normal,
-                                    ),
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          if (unreadCount > 0) ...[
-                            const SizedBox(width: 8),
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                              decoration: BoxDecoration(
-                                gradient: LinearGradient(
-                                  colors: [Colors.deepPurple.shade400, Colors.purple.shade500],
-                                ),
-                                borderRadius: BorderRadius.circular(12),
-                                boxShadow: [
-                                  BoxShadow(
-                                    color: Colors.deepPurple.withValues(alpha: 0.4),
-                                    blurRadius: 6,
-                                    offset: const Offset(0, 2),
-                                  ),
-                                ],
-                              ),
-                              child: Text(
-                                unreadCount > 99 ? '99+' : unreadCount.toString(),
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                              ),
-                            ),
-                          ] else ...[
-                            const SizedBox(width: 8),
-                            Text(
-                              '${conversation['messageCount']}',
-                              style: TextStyle(
-                                color: Colors.grey.shade600,
-                                fontSize: 11,
-                              ),
-                            ),
-                          ],
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
       ),
-      ),
     );
   }
-
 }

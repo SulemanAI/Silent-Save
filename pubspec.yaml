@@ -33,7 +33,7 @@ dependencies:
   shared_preferences: ^2.2.2
 
   # Icons
-  font_awesome_flutter: ^10.6.0
+  font_awesome_flutter: ^11.0.0
   scrollable_positioned_list: ^0.3.8
   gal: ^2.3.3
   flutter_slidable: ^4.0.3
@@ -47,6 +47,7 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  sqflite_common_ffi: ^2.4.0+3
 
   flutter_lints: ^5.0.0
   

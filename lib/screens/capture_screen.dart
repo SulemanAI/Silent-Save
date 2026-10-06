@@ -197,7 +197,7 @@ class _CaptureScreenState extends State<CaptureScreen> with SingleTickerProvider
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text('🎥 Recording video (30s)...'),
+            content: Text('🎥 Recording video...'),
             duration: Duration(seconds: 2),
           ),
         );
@@ -231,7 +231,7 @@ class _CaptureScreenState extends State<CaptureScreen> with SingleTickerProvider
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text('🎙 Recording audio (60s)...'),
+            content: Text('🎙 Recording audio...'),
             duration: Duration(seconds: 2),
           ),
         );

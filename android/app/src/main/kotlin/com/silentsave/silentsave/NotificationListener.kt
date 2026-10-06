@@ -39,6 +39,9 @@ class NotificationListener : NotificationListenerService() {
         private const val NOTIFICATIONS_FILE = "pending_notifications.json"
         private const val MAX_QUEUE_SIZE = 2000
         
+        @Volatile
+        var isConnected = false
+        
         // Dedup: Use LinkedHashSet for proper FIFO eviction order
         // Store SHA-256 hashes instead of full strings to save memory
         private val processedHashes = LinkedHashSet<String>()
@@ -298,6 +301,7 @@ class NotificationListener : NotificationListenerService() {
 
     override fun onListenerConnected() {
         super.onListenerConnected()
+        isConnected = true
         Log.i(TAG, "=== NotificationListener CONNECTED ===")
         
         // Start the foreground KeepAliveService to prevent OEM battery managers
@@ -347,6 +351,7 @@ class NotificationListener : NotificationListenerService() {
 
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
+        isConnected = false
         Log.w(TAG, "=== NotificationListener DISCONNECTED ===")
         
         persistProcessedIds()
@@ -1646,8 +1651,9 @@ class NotificationListener : NotificationListenerService() {
         
         // ── PRIMARY STORAGE: Insert directly into SQLite ──────────────────
         // This is instant — no need to wait for Flutter to poll the JSON queue.
+        var insertedMsgId: Long? = null
         try {
-            nativeDb?.insertMessage(
+            val res = nativeDb?.insertMessage(
                 sender = title,
                 message = text,
                 app = packageName,
@@ -1657,6 +1663,9 @@ class NotificationListener : NotificationListenerService() {
                 avatarPath = avatarPath,
                 mediaPath = mediaPath
             )
+            if (res != null && res > 0) {
+                insertedMsgId = res
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Native DB insert error: ${e.message}")
         }
@@ -1706,6 +1715,9 @@ class NotificationListener : NotificationListenerService() {
                         put("timestamp", timestamp)
                         put("senderName", senderName)
                         put("isGroupChat", isGroupChat)
+                        put("chatId", title)
+                        put("senderId", senderName)
+                        if (insertedMsgId != null) put("messageId", insertedMsgId)
                         if (avatarPath != null) put("avatarPath", avatarPath)
                         if (mediaPath != null) put("mediaPath", mediaPath)
                     })
@@ -1762,7 +1774,16 @@ class NotificationListener : NotificationListenerService() {
                     "mediaPath" to if (obj.has("mediaPath")) obj.optString("mediaPath") else null
                 )
             }
-            dbInserted = nativeDb?.insertMessagesBatch(dbMessages) ?: 0
+            val insertedIds = nativeDb?.insertMessagesBatch(dbMessages) ?: emptyList()
+            dbInserted = insertedIds.count { it > 0 }
+            for (i in notifications.indices) {
+                val notif = notifications[i]
+                if (i < insertedIds.size && insertedIds[i] > 0) {
+                    notif.put("messageId", insertedIds[i])
+                }
+                notif.put("chatId", notif.optString("title"))
+                notif.put("senderId", notif.optString("senderName", notif.optString("title")))
+            }
             // Trigger immediate SAF scan for ALL distinct WhatsApp senders in
             // the batch — not just the first one. Previously only the first
             // WA notification triggered a scan, so media for other senders in
