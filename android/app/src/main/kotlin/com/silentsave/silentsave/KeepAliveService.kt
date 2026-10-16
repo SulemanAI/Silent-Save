@@ -65,15 +65,6 @@ class KeepAliveService : Service() {
     }
 
     private var wakeLock: PowerManager.WakeLock? = null
-    private val handler = Handler(Looper.getMainLooper())
-
-    // Runnable that continuously renews the WakeLock so the CPU never sleeps
-    private val wakeLockRenewalRunnable = object : Runnable {
-        override fun run() {
-            acquireWakeLock()
-            handler.postDelayed(this, WAKELOCK_RENEW_INTERVAL_MS)
-        }
-    }
 
     override fun onCreate() {
         super.onCreate()
@@ -86,7 +77,13 @@ class KeepAliveService : Service() {
 
         val notification = buildNotification()
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            if (Build.VERSION.SDK_INT >= 34 /* Build.VERSION_CODES.UPSIDE_DOWN_CAKE */) {
+                startForeground(
+                    NOTIFICATION_ID, notification,
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                @Suppress("DEPRECATION")
                 startForeground(
                     NOTIFICATION_ID, notification,
                     android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
@@ -104,10 +101,9 @@ class KeepAliveService : Service() {
             }
         }
 
-        // Acquire WakeLock immediately and schedule continuous renewal
-        acquireWakeLock()
-        handler.removeCallbacks(wakeLockRenewalRunnable)
-        handler.postDelayed(wakeLockRenewalRunnable, WAKELOCK_RENEW_INTERVAL_MS)
+        // Targeted short WakeLock during startup (3 seconds) to ensure initialization completes
+        // without triggering Transsion OS / OEM battery manager blacklists.
+        acquireShortWakeLock(3000L)
 
         // Schedule self-ping alarm to restart this service if killed
         scheduleSelfPingAlarm()
@@ -117,6 +113,13 @@ class KeepAliveService : Service() {
             MediaWatcherService.start(applicationContext)
         } catch (e: Exception) {
             Log.w(TAG, "MediaWatcherService start failed: ${e.message}")
+        }
+
+        // Ensure WorkManager health checks are scheduled
+        try {
+            NlsHealthWorker.schedule(applicationContext)
+        } catch (e: Exception) {
+            Log.w(TAG, "NlsHealthWorker schedule error: ${e.message}")
         }
 
         // START_STICKY: If the system kills this service, restart it automatically
@@ -132,12 +135,14 @@ class KeepAliveService : Service() {
     override fun onTaskRemoved(rootIntent: Intent?) {
         Log.w(TAG, "Task removed (app swiped away) — scheduling restart")
         scheduleSelfPingAlarm()
+        try {
+            KeepAliveService.start(applicationContext)
+        } catch (_: Exception) {}
         super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
         Log.w(TAG, "KeepAliveService destroyed — requesting restart")
-        handler.removeCallbacks(wakeLockRenewalRunnable)
         releaseWakeLock()
         cancelSelfPingAlarm()
         super.onDestroy()
@@ -238,24 +243,19 @@ class KeepAliveService : Service() {
         }.build()
     }
 
-    private fun acquireWakeLock() {
+    private fun acquireShortWakeLock(durationMs: Long = 3000L) {
         try {
             if (wakeLock == null) {
                 val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
                 wakeLock = pm.newWakeLock(
                     PowerManager.PARTIAL_WAKE_LOCK,
-                    "SilentSave::KeepAliveWakeLock"
+                    "SilentSave::KeepAliveTargetedLock"
                 ).apply {
                     setReferenceCounted(false)
                 }
             }
-            // 5-minute timeout — the renewal handler fires at 4 min,
-            // giving a 1-minute overlap so the lock is never released unexpectedly.
-            // A 5-minute timeout (vs the old 25-minute) ensures stale locks from
-            // a crashed process auto-release quickly, preventing the OEM battery
-            // manager from detecting and force-killing the whole app process.
-            wakeLock?.acquire(5 * 60 * 1000L)
-            Log.d(TAG, "WakeLock acquired/renewed")
+            wakeLock?.acquire(durationMs)
+            Log.d(TAG, "Targeted WakeLock acquired ($durationMs ms)")
         } catch (e: Exception) {
             Log.w(TAG, "WakeLock acquire failed: ${e.message}")
         }

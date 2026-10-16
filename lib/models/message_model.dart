@@ -1,3 +1,5 @@
+import '../utils/text_sanitizer.dart';
+
 class MessageModel {
   final int? id;  final String sender; // Chat/Group name for grouping
   final String message;
@@ -59,16 +61,20 @@ class MessageModel {
         ? DateTime.fromMillisecondsSinceEpoch(timestampValue as int)
         : DateTime.now();
 
+    final rawSender = (map['sender']?.toString() ?? 'Unknown').toWellFormed();
+    final rawMessage = (map['message']?.toString() ?? '').toWellFormed();
+    final rawSenderName = (map['senderName']?.toString() ?? map['sender']?.toString() ?? 'Unknown').toWellFormed();
+
     return MessageModel(
       id: map['id'],
-      sender: map['sender'] ?? 'Unknown',
-      message: map['message'] ?? '',
+      sender: rawSender,
+      message: rawMessage,
       app: map['app'] ?? '',
       timestamp: timestamp,
       isDeleted: map['isDeleted'] == 1,
       isRead: map['isRead'] == 1,
       isSaved: map['isSaved'] == 1,
-      senderName: map['senderName'] ?? map['sender'] ?? 'Unknown',
+      senderName: rawSenderName,
       isGroupChat: map['isGroupChat'] == 1,
       avatarPath: map['avatarPath'],
       mediaPath: map['mediaPath'],

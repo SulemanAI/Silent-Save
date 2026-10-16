@@ -37,11 +37,6 @@ class TimestampMatcher {
         ? (windowMs > 60000 ? 60000 : windowMs)
         : windowMs;
 
-    // Strict sender enforcement: Audio/voice notes must NEVER be linked without a verified sender!
-    if (mediaType == 'audio' && (targetSender == null || targetSender.trim().isEmpty)) {
-      return MatchResult.unmatched();
-    }
-
     // Fetch candidate WhatsApp messages within window
     final candidates = await DatabaseHelper.instance.getRecentWhatsAppMessages(effectiveWindowMs, fileTimestampMs);
     if (candidates.isEmpty) {
@@ -119,15 +114,7 @@ class TimestampMatcher {
     if (targetCandidates.length == 1) {
       return MatchResult.matched(targetCandidates.first);
     }
-
-    // Multiple candidates found:
-    // If no sender is attached, or the reconciler explicitly requires unambiguous matches,
-    // never guess across multiple candidates. A single valid candidate is the only safe
-    // zero-touch path; more than one candidate must remain ambiguous.
-    if (requireUnambiguous || (targetSender == null || targetSender.trim().isEmpty)) {
-      return MatchResult.ambiguous(targetCandidates);
-    }
-
+    
     // Sender-confirmed path: Tier 1 — filename match; Tier 2 — timestamp proximity
     final sortedCandidates = List<Map<String, dynamic>>.from(targetCandidates);
     sortedCandidates.sort((a, b) {
@@ -148,17 +135,44 @@ class TimestampMatcher {
       );
 
       if (aHasName && !bHasName) return -1;
-      if (!aHasName && bHasName) return 1;
+      if (bHasName && !aHasName) return 1;
 
-      final int tsA = a['timestamp'] as int;
-      final int tsB = b['timestamp'] as int;
-      
+      final tsA = a['timestamp'] as int? ?? 0;
+      final tsB = b['timestamp'] as int? ?? 0;
       final deltaA = (tsA - fileTimestampMs).abs();
       final deltaB = (tsB - fileTimestampMs).abs();
       return deltaA.compareTo(deltaB);
     });
 
-    return MatchResult.matched(sortedCandidates[0]);
+    // Multiple candidates found:
+    // First, verify if ALL candidates belong to the EXACT SAME sender.
+    // If they do (e.g. bulk photo upload in a single chat), there is no risk of
+    // cross-chat contamination. We can safely treat this as unambiguous for privacy purposes.
+    bool allSameSender = false;
+    final firstSender = (sortedCandidates.first['sender'] as String? ?? '').trim().toLowerCase();
+    if (firstSender.isNotEmpty) {
+      allSameSender = true;
+      for (var i = 1; i < sortedCandidates.length; i++) {
+        if ((sortedCandidates[i]['sender'] as String? ?? '').trim().toLowerCase() != firstSender) {
+          allSameSender = false;
+          break;
+        }
+      }
+    }
+
+    if (allSameSender) {
+      return MatchResult.matched(sortedCandidates.first);
+    }
+
+    // If no sender is attached, or the reconciler explicitly requires unambiguous matches,
+    // never guess across multiple candidates from different chats.
+    if (requireUnambiguous || (targetSender == null || targetSender.trim().isEmpty)) {
+      return MatchResult.ambiguous(sortedCandidates);
+    }
+    
+    return MatchResult.matched(sortedCandidates.first);
+
+
   }
 }
 

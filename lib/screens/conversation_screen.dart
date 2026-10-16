@@ -1029,7 +1029,11 @@ class _ConversationScreenState extends State<ConversationScreen>
         shape: BoxShape.circle,
         image: hasAvatar
             ? DecorationImage(
-                image: FileImage(File(_avatarPath!)),
+                image: ResizeImage(
+                  FileImage(File(_avatarPath!)),
+                  width: 120,
+                  height: 120,
+                ),
                 fit: BoxFit.cover,
               )
             : null,
@@ -1093,8 +1097,11 @@ class _ConversationScreenState extends State<ConversationScreen>
           if (!_isGenericMediaLabel(m.message) && m.message.trim().isNotEmpty) {
             textParts.add(m.message.trim());
           }
-        } else if (m.message.trim().isNotEmpty) {
-          textParts.add(m.message.trim());
+        } else {
+          final fallback = _getFallbackDisplayText(m);
+          if (fallback.trim().isNotEmpty) {
+            textParts.add(fallback.trim());
+          }
         }
       }
       final text = textParts.isNotEmpty ? textParts.join('\n\n') : null;
@@ -1603,7 +1610,11 @@ class _ConversationScreenState extends State<ConversationScreen>
           decoration: BoxDecoration(
             shape: BoxShape.circle,
             image: DecorationImage(
-              image: FileImage(avatarFile),
+              image: ResizeImage(
+                FileImage(avatarFile),
+                width: 100,
+                height: 100,
+              ),
               fit: BoxFit.cover,
             ),
             border: Border.all(
@@ -1676,7 +1687,7 @@ class _ConversationScreenState extends State<ConversationScreen>
                   horizontal: 16,
                   vertical: 8,
                 ),
-                child: isMedia && !hasImage
+                child: isMedia && !hasImage && !_isAudioMessage(message, message.mediaPath) && !_isVideoMessage(message, message.mediaPath) && !_isDocumentMessage(message, message.mediaPath)
                     ? Row(
                         children: [
                           Icon(
@@ -1696,9 +1707,7 @@ class _ConversationScreenState extends State<ConversationScreen>
                         ],
                       )
                     : Text(
-                        _sanitizeText(message.message).length > 100
-                            ? '${_sanitizeText(message.message).substring(0, 100)}...'
-                            : _sanitizeText(message.message),
+                        truncateText(_getFallbackDisplayText(message), 100),
                         style: TextStyle(
                           fontSize: 13,
                           color: Colors.grey.shade400,
@@ -1905,8 +1914,9 @@ class _ConversationScreenState extends State<ConversationScreen>
                 }(),
               ],
 
-              // ── Copy message text (when non-placeholder text exists) ────
-              if (!isMedia && message.message.trim().isNotEmpty) ...[
+              // ── Copy message text (when non-placeholder text exists or media has fallback text) ────
+              if (_getFallbackDisplayText(message).trim().isNotEmpty &&
+                  (!isMedia || hasImage || _isAudioMessage(message, message.mediaPath) || _isVideoMessage(message, message.mediaPath) || _isDocumentMessage(message, message.mediaPath))) ...[
                 ListTile(
                   leading: const Icon(Icons.text_fields, color: Colors.white70),
                   title: const Text(
@@ -1914,7 +1924,7 @@ class _ConversationScreenState extends State<ConversationScreen>
                     style: TextStyle(color: Colors.white),
                   ),
                   onTap: () {
-                    Clipboard.setData(ClipboardData(text: message.message));
+                    Clipboard.setData(ClipboardData(text: _getFallbackDisplayText(message)));
                     Navigator.pop(ctx);
                     ScaffoldMessenger.of(context).showSnackBar(
                       SnackBar(
@@ -1967,31 +1977,33 @@ class _ConversationScreenState extends State<ConversationScreen>
   }
 
   Widget _buildHighlightText(String text, bool isCurrentMatch) {
-    if (_searchQuery.isEmpty)
+    final wellFormedText = text.toWellFormed();
+    if (_searchQuery.isEmpty) {
       return Text(
-        text,
+        wellFormedText,
         style: const TextStyle(fontSize: 15, color: Colors.white, height: 1.4),
       );
+    }
 
     final queryStr = _searchQuery.toLowerCase();
-    final lowerText = text.toLowerCase();
+    final lowerText = wellFormedText.toLowerCase();
     final spans = <TextSpan>[];
     int start = 0;
 
     while (true) {
       final index = lowerText.indexOf(queryStr, start);
       if (index == -1) {
-        spans.add(TextSpan(text: text.substring(start)));
+        spans.add(TextSpan(text: wellFormedText.substring(start).toWellFormed()));
         break;
       }
 
       if (index > start) {
-        spans.add(TextSpan(text: text.substring(start, index)));
+        spans.add(TextSpan(text: wellFormedText.substring(start, index).toWellFormed()));
       }
 
       spans.add(
         TextSpan(
-          text: text.substring(index, index + queryStr.length),
+          text: wellFormedText.substring(index, index + queryStr.length).toWellFormed(),
           style: TextStyle(
             backgroundColor: isCurrentMatch
                 ? Colors.orange
@@ -2167,32 +2179,170 @@ class _ConversationScreenState extends State<ConversationScreen>
   }
 
   // ══════════════════════════════════════════════════════════════════════
+
+  // ══════════════════════════════════════════════════════════════════════
   // MEDIA RENDERING
   // ══════════════════════════════════════════════════════════════════════
 
-  /// Decides what to render for a message's media content:
-  ///
-  /// Priority order (fallback chain):
-  ///   1. Real image file exists at mediaPath  → show actual image
-  ///   2. Message is a known media label       → show styled placeholder
-  ///      (file not captured yet — hook for SAF path once Phase 2 ships)
-  ///   3. Neither                              → show message text only
+  /// Decides what to render for a message's media content.
+  bool _isCallText(String lower) {
+    if (lower.contains('call') &&
+        (lower.contains('missed') ||
+            lower.contains('incoming') ||
+            lower.contains('ongoing') ||
+            lower.contains('ringing') ||
+            lower.contains('ended'))) {
+      return true;
+    }
+    return lower == 'voice call' ||
+        lower == 'video call' ||
+        lower == 'group call';
+  }
+
+  bool _isAudioMessage(MessageModel message, [String? mediaPath]) {
+    if (mediaPath != null && mediaPath.contains('.')) {
+      final ext = mediaPath.toLowerCase().split('.').last;
+      if (['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext)) {
+        return true;
+      }
+    }
+    final lower = message.message.trim().toLowerCase();
+    if (_isCallText(lower)) return false;
+    return lower.contains('voice') ||
+        lower.contains('audio') ||
+        lower.contains('🎤') ||
+        lower.contains('🎙') ||
+        lower.contains('🎵') ||
+        lower.startsWith('ptt-');
+  }
+
+  bool _isVideoMessage(MessageModel message, [String? mediaPath]) {
+    if (mediaPath != null && mediaPath.contains('.')) {
+      final ext = mediaPath.toLowerCase().split('.').last;
+      if (['mp4', 'mov', 'avi', 'mkv', '3gp'].contains(ext)) {
+        return true;
+      }
+    }
+    final lower = message.message.trim().toLowerCase();
+    if (_isCallText(lower)) return false;
+    return lower.contains('video') ||
+        lower.contains('📹') ||
+        lower.contains('🎥');
+  }
+
+  bool _isDocumentMessage(MessageModel message, [String? mediaPath]) {
+    if (mediaPath != null && mediaPath.contains('.')) {
+      final ext = mediaPath.toLowerCase().split('.').last;
+      if ([
+        'pdf',
+        'doc',
+        'docx',
+        'csv',
+        'xls',
+        'xlsx',
+        'txt',
+        'ppt',
+        'pptx',
+        'zip',
+        'rar',
+      ].contains(ext)) {
+        return true;
+      }
+    }
+    final lower = message.message.trim().toLowerCase();
+    if (_isCallText(lower)) return false;
+    return lower.startsWith('📄') ||
+        lower.startsWith('📎') ||
+        lower.contains('.pdf') ||
+        lower.contains('.doc') ||
+        lower.contains('.docx') ||
+        lower.contains('.csv') ||
+        lower.contains('.xls') ||
+        lower.contains('.xlsx') ||
+        lower.contains('.txt') ||
+        lower.contains('.ppt') ||
+        lower.contains('.zip') ||
+        lower.contains('document') ||
+        lower.contains('file');
+  }
+
+  String _formatVoiceNoteFallbackText(String rawMessage) {
+    final trimmed = rawMessage.trim();
+    final durationMatch = RegExp(r'\(\d+:\d+\)').firstMatch(trimmed);
+    if (durationMatch != null) {
+      if (trimmed.startsWith('🎤')) {
+        return trimmed;
+      }
+      return '🎤 Voice message ${durationMatch.group(0)}';
+    }
+    return '🎤 Voice message (0:02)';
+  }
+
+  String _formatVideoFallbackText(String rawMessage) {
+    final trimmed = rawMessage.trim();
+    final durationMatch = RegExp(r'\(\d+:\d+\)').firstMatch(trimmed);
+    if (durationMatch != null) {
+      if (trimmed.startsWith('🎤')) {
+        return trimmed;
+      }
+      return '🎤 Video ${durationMatch.group(0)}';
+    }
+    return '🎤 Video (0:05)';
+  }
+
+  String _formatDocumentFallbackText(String rawMessage, [String? mediaPath]) {
+    final trimmed = rawMessage.trim();
+    final fileName = (mediaPath != null && mediaPath.isNotEmpty)
+        ? mediaPath.split(Platform.pathSeparator).last
+        : '';
+
+    if (trimmed.isNotEmpty) {
+      final clean = _cleanDocumentCaption(trimmed);
+      final lowerClean = clean.toLowerCase();
+      if (lowerClean != 'document' &&
+          lowerClean != 'file' &&
+          lowerClean != 'document omitted' &&
+          lowerClean.isNotEmpty) {
+        return clean;
+      }
+    }
+
+    if (fileName.isNotEmpty && fileName.toLowerCase() != 'document') {
+      return fileName;
+    }
+
+    if (trimmed.isNotEmpty) return trimmed;
+    return 'Document';
+  }
+
+  String _getFallbackDisplayText(MessageModel message) {
+    if (_isAudioMessage(message, message.mediaPath)) {
+      return _formatVoiceNoteFallbackText(message.message);
+    }
+    if (_isDocumentMessage(message, message.mediaPath)) {
+      return _formatDocumentFallbackText(message.message, message.mediaPath);
+    }
+    if (_isVideoMessage(message, message.mediaPath)) {
+      return _formatVideoFallbackText(message.message);
+    }
+    return message.message;
+  }
+
+  /// Dispatches media rendering based on physical file availability:
+  ///   1. Call notification            → always plain text
+  ///   2. File exists at mediaPath     → render actual image / video / audio / doc
+  ///   3. Unloaded Voice Note / Video  → fallback text bubble with emoji and duration
+  ///   4. Unloaded Document            → document filename/caption as text bubble
+  ///   5. Missing/Uncaptured Photo     → styled placeholder or missing card
+  ///   6. Everything else              → plain text
   Widget _buildMediaContent(MessageModel message, bool isCurrentMatch) {
     final isWhatsApp = message.app.toLowerCase().contains('whatsapp');
     final mediaPath = message.mediaPath;
     final lowerMsg = message.message.trim().toLowerCase();
-    final isCallNotif =
-        (lowerMsg.contains('call') &&
-            (lowerMsg.contains('missed') ||
-                lowerMsg.contains('incoming') ||
-                lowerMsg.contains('ongoing') ||
-                lowerMsg.contains('ringing') ||
-                lowerMsg.contains('ended'))) ||
-        lowerMsg == 'voice call' ||
-        lowerMsg == 'video call' ||
-        lowerMsg == 'group call';
 
-    // Strictly verify that the message belongs to the current conversation
+    final isCallNotif = _isCallText(lowerMsg);
+
+    // Verify that the message belongs to the current conversation
     final msgSender = message.sender.trim().toLowerCase();
     final currentChat = widget.sender.trim().toLowerCase();
     final msgSenderName = (message.senderName ?? '').trim().toLowerCase();
@@ -2200,22 +2350,25 @@ class _ConversationScreenState extends State<ConversationScreen>
         (msgSenderName.isNotEmpty && msgSenderName == currentChat) ||
         (message.isGroupChat == true);
 
-    final hasFile =
+    // ── Case 1: Call notifications → plain text ──────────────────────────
+    if (isCallNotif) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildHighlightText(_sanitizeText(message.message), isCurrentMatch),
+          const SizedBox(height: 6),
+        ],
+      );
+    }
+
+    // ── Case 2: File exists on disk → render actual media ────────────────
+    final hasPhysicalFile = isWhatsApp &&
         isMatchingChat &&
-        !isCallNotif &&
         mediaPath != null &&
         mediaPath.isNotEmpty &&
         File(mediaPath).existsSync();
-    final isMedia =
-        isMatchingChat &&
-        !isCallNotif &&
-        isWhatsApp &&
-        (_isGenericMediaLabel(message.message) ||
-            message.message.startsWith('📄') ||
-            message.message.startsWith('📎'));
 
-    if (hasFile) {
-      // ── Case 1: We have the actual captured image ─────────────────────
+    if (hasPhysicalFile) {
       final isGeneric = _isGenericMediaLabel(message.message, mediaPath);
       final hasCaption = !isGeneric && message.message.trim().isNotEmpty;
 
@@ -2235,20 +2388,68 @@ class _ConversationScreenState extends State<ConversationScreen>
       );
     }
 
-    if (isMedia) {
-      // ── Case 2: Media was sent but file wasn't captured ───────────────
-      // Show an informative placeholder. When SAF captures the real file
-      // and updates mediaPath, this branch will never be reached again.
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _buildMediaPlaceholder(message.message),
-          const SizedBox(height: 8),
-        ],
-      );
+    // ── Case 3: Media cannot be loaded on disk (unloaded / uncaptured / missing) ─
+    if (isWhatsApp && isMatchingChat) {
+      // Audio / Voice note: show "🎤 Voice message (0:02)" text
+      if (_isAudioMessage(message, mediaPath)) {
+        final text = _formatVoiceNoteFallbackText(message.message);
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _buildHighlightText(_sanitizeText(text), isCurrentMatch),
+            const SizedBox(height: 6),
+          ],
+        );
+      }
+
+      // Document: show document name as text
+      if (_isDocumentMessage(message, mediaPath)) {
+        final docName = _formatDocumentFallbackText(message.message, mediaPath);
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _buildHighlightText(_sanitizeText(docName), isCurrentMatch),
+            const SizedBox(height: 6),
+          ],
+        );
+      }
+
+      // Video: show "🎤 Video (0:05)" text
+      if (_isVideoMessage(message, mediaPath)) {
+        final text = _formatVideoFallbackText(message.message);
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _buildHighlightText(_sanitizeText(text), isCurrentMatch),
+            const SizedBox(height: 6),
+          ],
+        );
+      }
+
+      // If mediaPath was recorded but photo file is gone
+      if (mediaPath != null && mediaPath.isNotEmpty) {
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _buildMissingMediaCard(mediaPath),
+            const SizedBox(height: 8),
+          ],
+        );
+      }
+
+      // Photo / sticker placeholder when never captured
+      if (_isGenericMediaLabel(message.message)) {
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _buildMediaPlaceholder(message.message, isWhatsApp: isWhatsApp),
+            const SizedBox(height: 8),
+          ],
+        );
+      }
     }
 
-    // ── Case 3: Plain text message ────────────────────────────────────
+    // ── Case 4: Plain text ────────────────────────────────────────────────
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -2358,6 +2559,7 @@ class _ConversationScreenState extends State<ConversationScreen>
                       fit: BoxFit.cover,
                       width: double.infinity,
                       height: 220,
+                      cacheWidth: 800,
                       errorBuilder: (_, __, ___) => _buildImageError(),
                     ),
                     // Tap-to-expand affordance
@@ -2605,15 +2807,19 @@ class _ConversationScreenState extends State<ConversationScreen>
 
   /// Styled placeholder for media messages where the file wasn't captured
   /// (e.g. the notification carried no BigPicture, or SAF is not yet set up).
-  Widget _buildMediaPlaceholder(String rawLabel) {
+  Widget _buildMediaPlaceholder(String rawLabel, {required bool isWhatsApp}) {
     final info = _mediaTypeInfo(rawLabel);
     return GestureDetector(
       onTap: () async {
-        final hasSaf = await NotificationService.instance
-            .getSafPermissionStatus();
-        final text = hasSaf
-            ? 'Media not found on device. It may have been deleted before downloading, or Auto-Download is disabled in WhatsApp.'
-            : 'Full media capture coming — grant WhatsApp folder access in Settings.';
+        final String text;
+        if (isWhatsApp) {
+          final hasSaf = await NotificationService.instance.getSafPermissionStatus();
+          text = hasSaf
+              ? 'Media not found on device. It may have been deleted before downloading, or Auto-Download is disabled in WhatsApp.'
+              : 'Full media capture coming — grant WhatsApp folder access in Settings.';
+        } else {
+          text = 'Instagram media cannot be saved automatically as it is not downloaded to your device storage.';
+        }
 
         if (!mounted) return;
 
@@ -2712,6 +2918,46 @@ class _ConversationScreenState extends State<ConversationScreen>
     );
   }
 
+  /// Compact card for a mediaPath that was recorded in the DB but whose file
+  /// is no longer available on disk (deleted, moved, or cleared by the OS).
+  Widget _buildMissingMediaCard(String path) {
+    final ext = path.toLowerCase().split('.').last;
+    final isVideo = ['mp4', 'mov', 'avi', 'mkv', '3gp'].contains(ext);
+    final isAudio = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext);
+    final (icon, color, label) = isVideo
+        ? (Icons.videocam_rounded, Colors.blue.shade300, 'Video')
+        : isAudio
+            ? (Icons.mic_rounded, Colors.orange.shade300, 'Voice Note')
+            : (Icons.image_not_supported_rounded, Colors.grey.shade400, 'Photo');
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 14),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.04),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: color.withValues(alpha: 0.6), size: 22),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              '$label · No longer available',
+              style: TextStyle(
+                fontSize: 13,
+                color: Colors.grey.shade500,
+                fontStyle: FontStyle.italic,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+
   Future<void> _openFullScreenImage(
     String path,
     String heroTag, {
@@ -2776,8 +3022,9 @@ class _ConversationScreenState extends State<ConversationScreen>
             lower.contains('ended'))) {
       return false;
     }
-    if (lower == 'voice call' || lower == 'video call' || lower == 'group call')
+    if (lower == 'voice call' || lower == 'video call' || lower == 'group call') {
       return false;
+    }
 
     // Exact label matches (WhatsApp notification text)
     const labels = {
@@ -2825,8 +3072,9 @@ class _ConversationScreenState extends State<ConversationScreen>
       final withoutEmoji = lower.replaceFirst(RegExp(r'^[📄📎]\s*'), '').trim();
       if (withoutEmoji.isEmpty ||
           withoutEmoji == 'document' ||
-          withoutEmoji == 'file')
+          withoutEmoji == 'file') {
         return true;
+      }
       // Ends with (N page) or (N pages)
       if (RegExp(r'\([^)]*page[s]?\)$').hasMatch(withoutEmoji)) return true;
       // If a media file is attached, check if withoutEmoji is just the file's name
@@ -2841,8 +3089,9 @@ class _ConversationScreenState extends State<ConversationScreen>
         final fBaseNorm = fBase.replaceAll('_', ' ');
         if (withoutEmoji == fName ||
             withoutEmoji == fBase ||
-            withoutEmoji == fBaseNorm)
+            withoutEmoji == fBaseNorm) {
           return true;
+        }
       }
     }
 

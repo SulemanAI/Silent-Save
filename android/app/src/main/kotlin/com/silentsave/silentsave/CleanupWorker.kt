@@ -12,6 +12,13 @@ class CleanupWorker(context: Context, params: WorkerParameters) : Worker(context
             // Clean up 24-hour trash files from captures
             SilentCaptureService.cleanupTrash(applicationContext)
             
+            // Rolling cleanup of unlinked media attachments older than 7 days
+            try {
+                NativeDatabaseHelper.getInstance(applicationContext).pruneOrphanedMedia()
+            } catch (e: Exception) {
+                android.util.Log.w("CleanupWorker", "Media prune error: ${e.message}")
+            }
+            
             // Trigger Flutter cleanup via broadcast (for SQLite messages)
             val intent = Intent("com.silentsave.CLEANUP_EVENT")
             applicationContext.sendBroadcast(intent)

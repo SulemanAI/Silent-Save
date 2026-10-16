@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import android.util.Log
@@ -42,23 +43,35 @@ class BootReceiver : BroadcastReceiver() {
         Log.i(TAG, "NLS enabled: $isNlsEnabled")
 
         if (isNlsEnabled) {
-            // Start KeepAlive foreground service FIRST — this keeps the process alive
-            try {
-                KeepAliveService.start(context)
-                Log.i(TAG, "KeepAliveService started on boot/update")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to start KeepAliveService: ${e.message}")
-            }
+            val userManager = context.getSystemService(Context.USER_SERVICE) as? android.os.UserManager
+            val isUnlocked = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                userManager?.isUserUnlocked ?: true
+            } else true
 
-            // Start MediaWatcherService — begins watching WhatsApp media folder
-            try {
-                MediaWatcherService.start(context)
-                Log.i(TAG, "MediaWatcherService started on boot/update")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to start MediaWatcherService: ${e.message}")
+            if (isUnlocked) {
+                // Start KeepAlive foreground service FIRST — this keeps the process alive
+                try {
+                    KeepAliveService.start(context)
+                    Log.i(TAG, "KeepAliveService started on boot/update")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to start KeepAliveService: ${e.message}")
+                }
+
+                // Start MediaWatcherService — begins watching WhatsApp media folder
+                try {
+                    MediaWatcherService.start(context)
+                    Log.i(TAG, "MediaWatcherService started on boot/update")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to start MediaWatcherService: ${e.message}")
+                }
+
+                // Schedule the health worker to keep NLS alive
+                NlsHealthWorker.schedule(context)
+            } else {
+                Log.i(TAG, "Device locked on boot (Direct Boot). Rebinding NLS; CE services deferred until unlock.")
             }
             
-            // Request NLS rebind after boot
+            // Request NLS rebind after boot (directBootAware service rebinds immediately)
             try {
                 val componentName = ComponentName(context, NotificationListener::class.java)
                 NotificationListenerService.requestRebind(componentName)
@@ -66,9 +79,6 @@ class BootReceiver : BroadcastReceiver() {
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to request rebind: ${e.message}")
             }
-
-            // Schedule the health worker to keep NLS alive
-            NlsHealthWorker.schedule(context)
         }
     }
 

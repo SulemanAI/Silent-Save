@@ -4,6 +4,7 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Allows showing the system dialog to request battery optimization exemption,
@@ -67,12 +68,16 @@
             </intent-filter>
         </service>
 
-        <!-- KeepAlive Foreground Service: prevents OEM battery kill of NLS process -->
+        <!-- KeepAlive Foreground Service: specialUse for continuous safety/notification backup -->
         <service
             android:name=".KeepAliveService"
             android:exported="false"
             android:stopWithTask="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Local notification backup, unread safety log, and media reconciliation" />
+        </service>
 
         <!-- MediaWatcherService: ContentObserver for WhatsApp media files.
              Non-foreground — relies on KeepAliveService process to stay alive.

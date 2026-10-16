@@ -78,8 +78,9 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   void _handleTabSelection() async {
-    if (_tabController.indexIsChanging)
+    if (_tabController.indexIsChanging) {
       return; // Wait for animation to finish or only trigger on definitive changes
+    }
 
     if (_tabController.index == 2) {
       if (!_isCapturesAuthenticated) {
@@ -222,14 +223,25 @@ class _HomeScreenState extends State<HomeScreen>
       final lower = manufacturer.toLowerCase();
 
       String? package;
-      if (lower.contains('xiaomi') || lower.contains('redmi')) {
+      String oemName = 'Your Device';
+      if (lower.contains('infinix') || lower.contains('tecno') || lower.contains('itel') || lower.contains('transsion')) {
+        package = 'com.transsion.phonemaster';
+        oemName = 'Infinix / Tecno (XOS)';
+      } else if (lower.contains('xiaomi') || lower.contains('redmi') || lower.contains('poco')) {
         package = 'com.miui.securitycenter';
+        oemName = 'Xiaomi (HyperOS/MIUI)';
       } else if (lower.contains('huawei') || lower.contains('honor')) {
         package = 'com.huawei.systemmanager';
+        oemName = 'Huawei / Honor';
       } else if (lower.contains('oppo') || lower.contains('realme')) {
         package = 'com.coloros.safecenter';
-      } else if (lower.contains('vivo')) {
+        oemName = 'Oppo / Realme (ColorOS)';
+      } else if (lower.contains('vivo') || lower.contains('iqoo')) {
         package = 'com.vivo.permissionmanagement';
+        oemName = 'Vivo / iQOO';
+      } else if (lower.contains('samsung')) {
+        package = 'com.samsung.android.lool';
+        oemName = 'Samsung (One UI)';
       }
 
       if (package == null) return;
@@ -241,16 +253,29 @@ class _HomeScreenState extends State<HomeScreen>
       showDialog<void>(
         context: context,
         builder: (ctx) => AlertDialog(
-          title: const Text('Battery Optimisation'),
-          content: const Text(
-            'Your device manufacturer applies extra battery restrictions. '
-            'To keep SilentSave running in the background, please set it to '
-            '"No restrictions" or "Unrestricted" in Battery settings.',
+          title: Text('$oemName Background Setup'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'To prevent $oemName from killing SilentSave and missing messages:',
+                  style: const TextStyle(fontWeight: FontWeight.w500),
+                ),
+                const SizedBox(height: 12),
+                const Text('1. 🔒 Lock in Recents: Open Recent Apps, pull down or tap the menu on SilentSave, and tap Lock (🔒) so "Clear All" does not force-stop it.'),
+                const SizedBox(height: 8),
+                const Text('2. ⚡ Auto-Start: Enable Auto-start and Secondary start for SilentSave in Phone Master / Settings.'),
+                const SizedBox(height: 8),
+                const Text('3. 🔋 Battery: Set Battery optimization to "Unrestricted" / "No restrictions".'),
+              ],
+            ),
           ),
           actions: [
             TextButton(
               onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('Later'),
+              child: const Text('Got It'),
             ),
             TextButton(
               onPressed: () {
@@ -281,11 +306,11 @@ class _HomeScreenState extends State<HomeScreen>
       });
     }
 
-    // Timing fix: NLS may not have fired onListenerConnected yet when MainActivity
-    // first starts. If permission is granted but the flag is still false, request
-    // a rebind and re-check after a short delay so the flag catches up.
+    // Force-stop recovery: If permission is granted but NLS is disconnected,
+    // trigger component toggle rebind immediately to re-register with NotificationManagerService.
     if (hasPermission && !isConnected) {
-      await Future.delayed(const Duration(seconds: 2));
+      await NotificationService.instance.forceRebindNls();
+      await Future.delayed(const Duration(seconds: 1));
       if (!mounted) return;
       final isConnectedRetry = await NotificationService.instance
           .isNlsConnected();
@@ -1164,16 +1189,17 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Widget _buildHighlightText(String text, String query) {
+    final wellFormedText = text.toWellFormed();
     if (query.isEmpty) {
       return Text(
-        text,
+        wellFormedText,
         style: TextStyle(color: Colors.grey.shade400, fontSize: 14),
         maxLines: 2,
         overflow: TextOverflow.ellipsis,
       );
     }
 
-    final String lowerText = text.toLowerCase();
+    final String lowerText = wellFormedText.toLowerCase();
     final String lowerQuery = query.toLowerCase();
 
     final List<TextSpan> spans = [];
@@ -1184,7 +1210,7 @@ class _HomeScreenState extends State<HomeScreen>
       if (indexOfMatch > start) {
         spans.add(
           TextSpan(
-            text: text.substring(start, indexOfMatch),
+            text: wellFormedText.substring(start, indexOfMatch).toWellFormed(),
             style: TextStyle(color: Colors.grey.shade400, fontSize: 14),
           ),
         );
@@ -1192,7 +1218,7 @@ class _HomeScreenState extends State<HomeScreen>
 
       spans.add(
         TextSpan(
-          text: text.substring(indexOfMatch, indexOfMatch + query.length),
+          text: wellFormedText.substring(indexOfMatch, indexOfMatch + query.length).toWellFormed(),
           style: TextStyle(
             color: Colors.black,
             backgroundColor: Colors.orange.shade300,
@@ -1206,10 +1232,10 @@ class _HomeScreenState extends State<HomeScreen>
       indexOfMatch = lowerText.indexOf(lowerQuery, start);
     }
 
-    if (start < text.length) {
+    if (start < wellFormedText.length) {
       spans.add(
         TextSpan(
-          text: text.substring(start),
+          text: wellFormedText.substring(start).toWellFormed(),
           style: TextStyle(color: Colors.grey.shade400, fontSize: 14),
         ),
       );
@@ -1245,6 +1271,102 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
+  String _formatConversationLastMessage(String lastMessage, String? lastMediaPath) {
+    final lower = lastMessage.trim().toLowerCase();
+    final ext = (lastMediaPath != null && lastMediaPath.contains('.'))
+        ? lastMediaPath.toLowerCase().split('.').last
+        : '';
+    final isCall = (lower.contains('call') &&
+            (lower.contains('missed') ||
+                lower.contains('incoming') ||
+                lower.contains('ongoing') ||
+                lower.contains('ringing') ||
+                lower.contains('ended'))) ||
+        lower == 'voice call' ||
+        lower == 'video call' ||
+        lower == 'group call';
+    if (isCall) return lastMessage;
+
+    final isAudio = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext) ||
+        lower.contains('voice') ||
+        lower.contains('audio') ||
+        lower.contains('🎤') ||
+        lower.contains('🎙') ||
+        lower.contains('🎵') ||
+        lower.startsWith('ptt-');
+
+    if (isAudio) {
+      final durationMatch = RegExp(r'\(\d+:\d+\)').firstMatch(lastMessage);
+      if (durationMatch != null) {
+        if (lastMessage.trim().startsWith('🎤')) return lastMessage.trim();
+        return '🎤 Voice message ${durationMatch.group(0)}';
+      }
+      return '🎤 Voice message (0:02)';
+    }
+
+    final isVideo = ['mp4', 'mov', 'avi', 'mkv', '3gp'].contains(ext) ||
+        lower.contains('video') ||
+        lower.contains('📹') ||
+        lower.contains('🎥');
+
+    if (isVideo) {
+      final durationMatch = RegExp(r'\(\d+:\d+\)').firstMatch(lastMessage);
+      if (durationMatch != null) {
+        if (lastMessage.trim().startsWith('🎤')) return lastMessage.trim();
+        return '🎤 Video ${durationMatch.group(0)}';
+      }
+      return '🎤 Video (0:05)';
+    }
+
+    final isDoc = [
+      'pdf',
+      'doc',
+      'docx',
+      'csv',
+      'xls',
+      'xlsx',
+      'txt',
+      'ppt',
+      'pptx',
+      'zip',
+      'rar',
+    ].contains(ext) ||
+        lower.startsWith('📄') ||
+        lower.startsWith('📎') ||
+        lower.contains('.pdf') ||
+        lower.contains('.doc') ||
+        lower.contains('.docx') ||
+        lower.contains('.csv') ||
+        lower.contains('.xls') ||
+        lower.contains('.xlsx') ||
+        lower.contains('.txt') ||
+        lower.contains('.ppt') ||
+        lower.contains('.zip') ||
+        lower.contains('document') ||
+        lower.contains('file');
+
+    if (isDoc) {
+      final fileName = (lastMediaPath != null && lastMediaPath.isNotEmpty)
+          ? lastMediaPath.split(Platform.pathSeparator).last
+          : '';
+      final clean = lastMessage.replaceFirst(RegExp(r'^[📄📎]\s*'), '').trim();
+      final lowerClean = clean.toLowerCase();
+      if (clean.isNotEmpty &&
+          lowerClean != 'document' &&
+          lowerClean != 'file' &&
+          lowerClean != 'document omitted') {
+        return clean;
+      }
+      if (fileName.isNotEmpty && fileName.toLowerCase() != 'document') {
+        return fileName;
+      }
+      if (lastMessage.trim().isNotEmpty) return lastMessage.trim();
+      return 'Document';
+    }
+
+    return lastMessage;
+  }
+
   Widget _buildConversationCard(Map<String, dynamic> conversation) {
     final bool isGroupChat = conversation['isGroupChat'] == 1;
     final int unreadCount = (conversation['unreadCount'] as int?) ?? 0;
@@ -1262,22 +1384,24 @@ class _HomeScreenState extends State<HomeScreen>
         avatarPath.isNotEmpty &&
         File(avatarPath).existsSync();
 
-    // Build preview text with sender name for group chats
-    String previewText = lastMessage;
-    if (isGroupChat && lastSenderName.isNotEmpty && lastSenderName != sender) {
-      previewText = '$lastSenderName: $lastMessage';
-    }
-
-    // Truncate preview to reasonable length
-    if (previewText.length > 50) {
-      previewText = '${previewText.substring(0, 47)}...';
-    }
-
     final String? lastMediaPath = conversation['lastMediaPath']?.toString();
     final bool hasMediaFile =
         lastMediaPath != null &&
         lastMediaPath.isNotEmpty &&
         File(lastMediaPath).existsSync();
+
+    final displayMessage = hasMediaFile
+        ? lastMessage
+        : _formatConversationLastMessage(lastMessage, lastMediaPath);
+
+    // Build preview text with sender name for group chats
+    String previewText = displayMessage;
+    if (isGroupChat && lastSenderName.isNotEmpty && lastSenderName != sender) {
+      previewText = '$lastSenderName: $displayMessage';
+    }
+
+    // Truncate preview to reasonable length safely
+    previewText = truncateText(previewText, 47);
 
     bool isAudio = false;
     bool isVideo = false;
@@ -1648,7 +1772,7 @@ class _HomeScreenState extends State<HomeScreen>
                                                 : 'Document')
                                           : (previewText.isEmpty
                                                 ? 'No messages'
-                                                : previewText),
+                                                : previewText.toWellFormed()),
                                       style: TextStyle(
                                         color: unreadCount > 0
                                             ? Colors.grey.shade300

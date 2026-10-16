@@ -257,7 +257,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
             val database = safeDb() // Use resilient connection
 
             // Dedup check: same sender + app + message within ±2s
-            val cursor = database.query(
+            val isDuplicate = database.query(
                 "messages",
                 arrayOf("id"),
                 "sender = ? AND app = ? AND message = ? AND timestamp BETWEEN ? AND ?",
@@ -267,9 +267,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
                     (timestampMs + dedupWindowMs).toString()
                 ),
                 null, null, null, "1"
-            )
-            val isDuplicate = cursor.count > 0
-            cursor.close()
+            ).use { it.count > 0 }
 
             if (isDuplicate) {
                 // Not a new message — but if it has media and the existing row doesn't,
@@ -378,34 +376,32 @@ class NativeDatabaseHelper private constructor(context: Context) {
                 """.trimIndent())
 
                 // 2. Find any mediaPath that is assigned to more than 1 message
-                val dupCursor = database.rawQuery("""
+                val duplicatePaths = mutableListOf<String>()
+                database.rawQuery("""
                     SELECT mediaPath, COUNT(*) as cnt 
                     FROM messages 
                     WHERE mediaPath IS NOT NULL AND mediaPath != '' 
                     GROUP BY mediaPath 
                     HAVING cnt > 1
-                """.trimIndent(), null)
-
-                val duplicatePaths = mutableListOf<String>()
-                while (dupCursor.moveToNext()) {
-                    val p = dupCursor.getString(0)
-                    if (!p.isNullOrEmpty()) duplicatePaths.add(p)
+                """.trimIndent(), null).use { dupCursor ->
+                    while (dupCursor.moveToNext()) {
+                        val p = dupCursor.getString(0)
+                        if (!p.isNullOrEmpty()) duplicatePaths.add(p)
+                    }
                 }
-                dupCursor.close()
 
                 for (path in duplicatePaths) {
-                    val msgCursor = database.rawQuery("""
+                    val rows = mutableListOf<Triple<Long, String, Long>>()
+                    database.rawQuery("""
                         SELECT id, message, timestamp 
                         FROM messages 
                         WHERE mediaPath = ? 
                         ORDER BY timestamp ASC
-                    """.trimIndent(), arrayOf(path))
-
-                    val rows = mutableListOf<Triple<Long, String, Long>>()
-                    while (msgCursor.moveToNext()) {
-                        rows.add(Triple(msgCursor.getLong(0), msgCursor.getString(1) ?: "", msgCursor.getLong(2)))
+                    """.trimIndent(), arrayOf(path)).use { msgCursor ->
+                        while (msgCursor.moveToNext()) {
+                            rows.add(Triple(msgCursor.getLong(0), msgCursor.getString(1) ?: "", msgCursor.getLong(2)))
+                        }
                     }
-                    msgCursor.close()
 
                     var winnerId: Long? = null
                     val otherIds = mutableListOf<Long>()
@@ -487,7 +483,9 @@ class NativeDatabaseHelper private constructor(context: Context) {
                 // and an unmatched media_attachment of matching type exists, link them!
                 try {
                     val recentCutoff = System.currentTimeMillis() - 24 * 60 * 60 * 1000L
-                    val unlinkedCursor = database.rawQuery("""
+                    val unlinkedMessages = mutableListOf<Map<String, Any>>()
+                    
+                    database.rawQuery("""
                         SELECT id, sender, senderName, message, timestamp 
                         FROM messages 
                         WHERE (mediaPath IS NULL OR mediaPath = '') 
@@ -495,26 +493,24 @@ class NativeDatabaseHelper private constructor(context: Context) {
                           AND timestamp >= $recentCutoff
                           AND message NOT LIKE 'Reacted %'
                         ORDER BY timestamp DESC
-                    """.trimIndent(), null)
-
-                    val unlinkedMessages = mutableListOf<Map<String, Any>>()
-                    while (unlinkedCursor.moveToNext()) {
-                        val mId = unlinkedCursor.getLong(0)
-                        val mSender = unlinkedCursor.getString(1) ?: ""
-                        val mSenderName = unlinkedCursor.getString(2) ?: ""
-                        val mText = unlinkedCursor.getString(3) ?: ""
-                        val mTs = unlinkedCursor.getLong(4)
-                        if (isMediaPlaceholderText(mText)) {
-                            unlinkedMessages.add(mapOf(
-                                "id" to mId,
-                                "sender" to mSender,
-                                "senderName" to mSenderName,
-                                "text" to mText,
-                                "timestamp" to mTs
-                            ))
+                    """.trimIndent(), null).use { unlinkedCursor ->
+                        while (unlinkedCursor.moveToNext()) {
+                            val mId = unlinkedCursor.getLong(0)
+                            val mSender = unlinkedCursor.getString(1) ?: ""
+                            val mSenderName = unlinkedCursor.getString(2) ?: ""
+                            val mText = unlinkedCursor.getString(3) ?: ""
+                            val mTs = unlinkedCursor.getLong(4)
+                            if (isMediaPlaceholderText(mText)) {
+                                unlinkedMessages.add(mapOf(
+                                    "id" to mId,
+                                    "sender" to mSender,
+                                    "senderName" to mSenderName,
+                                    "text" to mText,
+                                    "timestamp" to mTs
+                                ))
+                            }
                         }
                     }
-                    unlinkedCursor.close()
 
                     for (msg in unlinkedMessages) {
                         val mId = msg["id"] as Long
@@ -531,7 +527,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
                         } ?: continue
 
                         // Look for an unmatched attachment of matching type where sender either matches or is empty/filename
-                        val attachCursor = database.rawQuery("""
+                        database.rawQuery("""
                             SELECT id, file_path, sender_name 
                             FROM media_attachments 
                             WHERE matched = 0 
@@ -540,20 +536,19 @@ class NativeDatabaseHelper private constructor(context: Context) {
                               AND file_path NOT IN (SELECT mediaPath FROM messages WHERE mediaPath IS NOT NULL AND mediaPath != '')
                             ORDER BY ABS(captured_at - $mTs) ASC 
                             LIMIT 1
-                        """.trimIndent(), arrayOf(targetType, mSender.trim(), mSenderName.trim()))
-
-                        if (attachCursor.moveToFirst()) {
-                            val aId = attachCursor.getLong(0)
-                            val fPath = attachCursor.getString(1)
-                            val file = File(fPath)
-                            if (file.exists() && file.length() > 0L) {
-                                database.execSQL("UPDATE messages SET mediaPath = ? WHERE id = ?", arrayOf(fPath, mId.toString()))
-                                database.execSQL("UPDATE media_attachments SET matched = 1, notification_id = ?, sender_name = ? WHERE id = ?", 
-                                    arrayOf(mId.toString(), mSender, aId.toString()))
-                                Log.i(TAG, "✓ Auto-reconciled orphaned $targetType $fPath to message #$mId ($mSender)")
+                        """.trimIndent(), arrayOf(targetType, mSender.trim(), mSenderName.trim())).use { attachCursor ->
+                            if (attachCursor.moveToFirst()) {
+                                val aId = attachCursor.getLong(0)
+                                val fPath = attachCursor.getString(1)
+                                val file = File(fPath)
+                                if (file.exists() && file.length() > 0L) {
+                                    database.execSQL("UPDATE messages SET mediaPath = ? WHERE id = ?", arrayOf(fPath, mId.toString()))
+                                    database.execSQL("UPDATE media_attachments SET matched = 1, notification_id = ?, sender_name = ? WHERE id = ?", 
+                                        arrayOf(mId.toString(), mSender, aId.toString()))
+                                    Log.i(TAG, "✓ Auto-reconciled orphaned $targetType $fPath to message #$mId ($mSender)")
+                                }
                             }
                         }
-                        attachCursor.close()
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "Auto-reconcile orphaned media error: ${e.message}")
@@ -575,15 +570,10 @@ class NativeDatabaseHelper private constructor(context: Context) {
     fun isMediaAlreadyLinked(mediaPath: String): Boolean {
         try {
             val database = safeDb()
-            val c1 = database.rawQuery("SELECT id FROM messages WHERE mediaPath = ? LIMIT 1", arrayOf(mediaPath))
-            val inMessages = c1.moveToFirst()
-            c1.close()
+            val inMessages = database.rawQuery("SELECT id FROM messages WHERE mediaPath = ? LIMIT 1", arrayOf(mediaPath)).use { it.moveToFirst() }
             if (inMessages) return true
 
-            val c2 = database.rawQuery("SELECT id FROM media_attachments WHERE file_path = ? AND matched = 1 AND notification_id IS NOT NULL LIMIT 1", arrayOf(mediaPath))
-            val inAttachments = c2.moveToFirst()
-            c2.close()
-            return inAttachments
+            return database.rawQuery("SELECT id FROM media_attachments WHERE file_path = ? AND matched = 1 AND notification_id IS NOT NULL LIMIT 1", arrayOf(mediaPath)).use { it.moveToFirst() }
         } catch (e: Exception) {
             return false
         }
@@ -716,9 +706,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
                     if (!file.exists() || file.length() <= 0L) continue
 
                     // Check if this file is already linked in the messages table
-                    val checkCursor = database.rawQuery("SELECT id FROM messages WHERE mediaPath = ? LIMIT 1", arrayOf(fPath))
-                    val alreadyUsed = checkCursor.moveToFirst()
-                    checkCursor.close()
+                    val alreadyUsed = database.rawQuery("SELECT id FROM messages WHERE mediaPath = ? LIMIT 1", arrayOf(fPath)).use { it.moveToFirst() }
                     if (alreadyUsed) {
                         // Mark as matched so it won't be checked again
                         val markVals = ContentValues().apply { put("matched", 1) }
@@ -987,9 +975,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
                 database.beginTransaction()
                 try {
                     // Re-verify uniqueness inside transaction
-                    val checkCursor = database.rawQuery("SELECT id FROM messages WHERE mediaPath = ? LIMIT 1", arrayOf(mediaPath))
-                    val alreadyInUse = checkCursor.moveToFirst()
-                    checkCursor.close()
+                    val alreadyInUse = database.rawQuery("SELECT id FROM messages WHERE mediaPath = ? LIMIT 1", arrayOf(mediaPath)).use { it.moveToFirst() }
                     if (alreadyInUse) {
                         Log.w(TAG, "mediaPath $mediaPath was claimed by another thread. Aborting duplicate link.")
                         return true
@@ -1064,5 +1050,70 @@ class NativeDatabaseHelper private constructor(context: Context) {
             Log.e(TAG, "matchAndLinkMedia error: ${e.message}")
             return false
         }
+    }
+
+    /**
+     * Rolling cache cleanup for media_attachments:
+     * - Removes unmatched temporary media files older than maxAgeMs (default: 7 days)
+     * - Preserves 100% of messages and media linked to messages (mediaPath)
+     * - Removes orphaned/empty 0-byte or .tmp files from media_attachments directory
+     * This keeps disk and resident memory within safe limits, avoiding OEM watchdog kills.
+     */
+    fun pruneOrphanedMedia(maxAgeMs: Long = 7L * 24 * 60 * 60 * 1000L): Int {
+        var prunedCount = 0
+        try {
+            val database = safeDb()
+            val cutoff = System.currentTimeMillis() - maxAgeMs
+
+            // 1. Find unmatched media older than cutoff
+            val stalePaths = mutableListOf<Pair<Long, String>>()
+            database.rawQuery("""
+                SELECT id, file_path 
+                FROM media_attachments 
+                WHERE matched = 0 
+                  AND captured_at < $cutoff
+            """.trimIndent(), null).use { cursor ->
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(0)
+                    val path = cursor.getString(1) ?: continue
+                    stalePaths.add(Pair(id, path))
+                }
+            }
+
+            for ((id, path) in stalePaths) {
+                // Ensure this path is NOT currently linked to any saved message
+                val isLinked = database.rawQuery(
+                    "SELECT id FROM messages WHERE mediaPath = ? LIMIT 1",
+                    arrayOf(path)
+                ).use { it.moveToFirst() }
+
+                if (!isLinked) {
+                    try {
+                        val file = File(path)
+                        if (file.exists()) {
+                            file.delete()
+                        }
+                    } catch (_: Exception) {}
+                    database.execSQL("DELETE FROM media_attachments WHERE id = ?", arrayOf(id.toString()))
+                    prunedCount++
+                }
+            }
+
+            // 2. Scan media_attachments directory for empty or abandoned temp files
+            val attachmentsDir = File(appContext.filesDir, "media_attachments")
+            if (attachmentsDir.exists() && attachmentsDir.isDirectory) {
+                attachmentsDir.listFiles()?.forEach { file ->
+                    if (file.isFile && (file.length() == 0L || file.name.endsWith(".tmp"))) {
+                        file.delete()
+                        prunedCount++
+                    }
+                }
+            }
+
+            Log.i(TAG, "Pruned $prunedCount obsolete unlinked media attachments")
+        } catch (e: Exception) {
+            Log.w(TAG, "pruneOrphanedMedia error: ${e.message}")
+        }
+        return prunedCount
     }
 }

@@ -3,6 +3,7 @@ import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import 'package:flutter/foundation.dart';
 import '../models/message_model.dart';
+import '../utils/text_sanitizer.dart';
 import 'encryption_service.dart';
 
 class DatabaseHelper {
@@ -25,6 +26,10 @@ class DatabaseHelper {
     final db = await openDatabase(
       path,
       version: 9, // v9: added permanent saved-message state
+      onConfigure: (db) async {
+        await db.rawQuery('PRAGMA journal_mode = WAL;');
+        await db.rawQuery('PRAGMA busy_timeout = 8000;');
+      },
       onCreate: _createDB,
       onUpgrade: _onUpgrade,
     );
@@ -661,34 +666,33 @@ class DatabaseHelper {
       ORDER BY lastTimestamp DESC
     ''');
 
-    // Decrypt last message if encryption is enabled
-    if (await _encryptionService.isEncryptionEnabled()) {
-      final decryptedResults = <Map<String, dynamic>>[];
-      for (var row in result) {
-        final mutableRow = Map<String, dynamic>.from(row);
+    final isEncrypted = await _encryptionService.isEncryptionEnabled();
+    final safeResults = <Map<String, dynamic>>[];
+    for (var row in result) {
+      final mutableRow = Map<String, dynamic>.from(row);
+      if (isEncrypted) {
         try {
           final decryptedMessage = await _encryptionService.decrypt(
             row['lastMessage'] as String? ?? '',
           );
-          mutableRow['lastMessage'] = decryptedMessage;
+          mutableRow['lastMessage'] = decryptedMessage.toWellFormed();
         } catch (e) {
-          // Keep original if decryption fails
+          mutableRow['lastMessage'] = (row['lastMessage']?.toString() ?? '').toWellFormed();
         }
-        decryptedResults.add(mutableRow);
+      } else {
+        mutableRow['lastMessage'] = (row['lastMessage']?.toString() ?? '').toWellFormed();
       }
-      return decryptedResults;
+      mutableRow['sender'] = (row['sender']?.toString() ?? '').toWellFormed();
+      if (mutableRow['lastSenderName'] != null) {
+        mutableRow['lastSenderName'] = mutableRow['lastSenderName'].toString().toWellFormed();
+      }
+      safeResults.add(mutableRow);
     }
 
     debugPrint(
-      '[DatabaseHelper] getConversations returning ${result.length} conversations',
+      '[DatabaseHelper] getConversations returning ${safeResults.length} conversations',
     );
-    for (var conv in result) {
-      debugPrint(
-        '[DatabaseHelper] Conversation: sender=${conv['sender']}, messageCount=${conv['messageCount']}, unreadCount=${conv['unreadCount']}',
-      );
-    }
-
-    return result;
+    return safeResults;
   }
 
   Future<bool> hasSavedMessages(String sender) async {

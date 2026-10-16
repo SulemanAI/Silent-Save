@@ -1,6 +1,11 @@
 package com.silentsave.silentsave
 
 import android.app.Notification
+import android.content.BroadcastReceiver
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -15,9 +20,9 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import android.os.UserManager
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
-import android.content.Context
 import android.util.Log
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -204,13 +209,65 @@ class NotificationListener : NotificationListenerService() {
     private val JSON_QUEUE_WRITE_INTERVAL = 10 // Write JSON every 10th message
     private val JSON_QUEUE_TIME_THRESHOLD_MS = 30_000L // Or if >30s since last write
 
+    private var isUnlockReceiverRegistered = false
+    private val unlockReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == Intent.ACTION_USER_UNLOCKED) {
+                Log.i(TAG, "Device unlocked! Initializing CE database and flushing direct-boot queue...")
+                try {
+                    unregisterReceiver(this)
+                } catch (_: Exception) {}
+                isUnlockReceiverRegistered = false
+                initializeCeStorage()
+            }
+        }
+    }
+
+    private fun isUserUnlocked(context: Context): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            val um = context.getSystemService(Context.USER_SERVICE) as? UserManager
+            um?.isUserUnlocked ?: true
+        } else {
+            true
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "=== NotificationListener service CREATED ===")
         
-        dedupPrefs = applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        // Use Device Protected Storage Context for boot-time preferences to prevent IllegalStateException
+        val deContext = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            applicationContext.createDeviceProtectedStorageContext()
+        } else {
+            applicationContext
+        }
+
+        dedupPrefs = deContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         restoreProcessedIds()
         
+        if (isUserUnlocked(this)) {
+            initializeCeStorage()
+        } else {
+            Log.i(TAG, "Device locked (Direct Boot mode). Deferring CE database & file operations.")
+            registerUnlockReceiver()
+        }
+    }
+
+    private fun registerUnlockReceiver() {
+        if (!isUnlockReceiverRegistered) {
+            try {
+                val filter = IntentFilter(Intent.ACTION_USER_UNLOCKED)
+                registerReceiver(unlockReceiver, filter)
+                isUnlockReceiverRegistered = true
+                Log.i(TAG, "Registered ACTION_USER_UNLOCKED receiver")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to register unlockReceiver: ${e.message}")
+            }
+        }
+    }
+
+    private fun initializeCeStorage() {
         // Initialize native SQLite writer for instant message+media storage
         try {
             nativeDb = NativeDatabaseHelper.getInstance(applicationContext)
@@ -227,6 +284,9 @@ class NotificationListener : NotificationListenerService() {
         } catch (e: Exception) {
             Log.e(TAG, "Error initializing notifications file: ${e.message}")
         }
+
+        // Flush any notifications queued in DE storage while device was locked
+        flushPendingDirectBootNotifications()
     }
     
     /**
@@ -304,33 +364,24 @@ class NotificationListener : NotificationListenerService() {
         isConnected = true
         Log.i(TAG, "=== NotificationListener CONNECTED ===")
         
-        // Start the foreground KeepAliveService to prevent OEM battery managers
-        // from killing the app process. This is the #1 fix for missed messages.
-        try {
-            KeepAliveService.start(applicationContext)
-            Log.i(TAG, "KeepAliveService started from NLS connect")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start KeepAliveService: ${e.message}")
+        if (isUserUnlocked(this)) {
+            // Start the foreground KeepAliveService to prevent OEM battery managers
+            // from killing the app process.
+            try {
+                KeepAliveService.start(applicationContext)
+                Log.i(TAG, "KeepAliveService started from NLS connect")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start KeepAliveService: ${e.message}")
+            }
+            initializeCeStorage()
+        } else {
+            Log.i(TAG, "Connected while locked — deferring KeepAlive and registering unlock receiver")
+            registerUnlockReceiver()
         }
         
-        // Acquire a partial WakeLock to keep the CPU alive for notification processing.
-        // PARTIAL_WAKE_LOCK only prevents the CPU from sleeping — it does NOT keep
-        // the screen on, so there is no UX impact.
-        acquireProcessingWakeLock()
-        
-        try {
-            val file = getNotificationsFile()
-            ensureValidNotificationsFile(file)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error on connect: ${e.message}")
-        }
-        
-        // Re-process every currently visible notification so nothing is missed
-        // when the service first starts or reconnects after being unbound
-        // (e.g. phone reboot, permission re-grant, system-initiated rebind).
-        // Runs on a background thread to avoid blocking the service callback.
-        // Dedup hashes restored in onCreate() prevent re-saving already-saved messages.
+        // Re-process every currently visible notification with short targeted WakeLock
         Thread {
+            acquireShortWakeLock(5000L)
             try {
                 val active = activeNotifications
                 if (!active.isNullOrEmpty()) {
@@ -345,6 +396,8 @@ class NotificationListener : NotificationListenerService() {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error processing active notifications on connect: ${e.message}")
+            } finally {
+                releaseWakeLock()
             }
         }.start()
     }
@@ -372,7 +425,23 @@ class NotificationListener : NotificationListenerService() {
         }
     }
     
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Log.w(TAG, "NotificationListener onTaskRemoved (app swiped away) — requesting rebind")
+        try {
+            requestRebind(ComponentName(this, NotificationListener::class.java))
+        } catch (e: Exception) {
+            Log.e(TAG, "Error requesting rebind in onTaskRemoved: ${e.message}")
+        }
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
+        if (isUnlockReceiverRegistered) {
+            try {
+                unregisterReceiver(unlockReceiver)
+            } catch (_: Exception) {}
+            isUnlockReceiverRegistered = false
+        }
         persistProcessedIds()
         releaseWakeLock()
         super.onDestroy()
@@ -392,27 +461,21 @@ class NotificationListener : NotificationListenerService() {
     }
 
     /**
-     * Acquire (or renew) a partial WakeLock to keep the CPU alive.
-     * Called on connect, and on every notification posted to ensure
-     * the CPU doesn't sleep between notifications.
+     * Acquire a short-lived targeted partial WakeLock during active notification processing.
+     * Never held perpetually or continuously renewed to prevent OEM watchdog freezing.
      */
-    private fun acquireProcessingWakeLock() {
+    private fun acquireShortWakeLock(durationMs: Long = 3000L) {
         try {
             if (wakeLock == null) {
                 val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
                 wakeLock = pm.newWakeLock(
                     PowerManager.PARTIAL_WAKE_LOCK,
-                    "SilentSave::NLSWakeLock"
+                    "SilentSave::NLSProcessingLock"
                 ).apply {
                     setReferenceCounted(false)
                 }
             }
-            // 5-minute timeout, continuously renewed on each notification so it
-            // never expires while messages are actively arriving.
-            // When notifications stop, the lock auto-releases after 5 minutes,
-            // allowing the phone to sleep normally and preventing the OEM battery
-            // manager from force-killing the process due to excessive WakeLock hold.
-            wakeLock?.acquire(5 * 60 * 1000L)
+            wakeLock?.acquire(durationMs)
         } catch (e: Exception) {
             Log.w(TAG, "WakeLock acquire failed: ${e.message}")
         }
@@ -426,8 +489,17 @@ class NotificationListener : NotificationListenerService() {
         // O(1) package check
         if (packageName !in TARGET_PACKAGES) return
         
-        // Renew WakeLock on every notification to prevent CPU sleep
-        acquireProcessingWakeLock()
+        // Targeted short WakeLock (3 seconds) strictly during message extraction & disk persistence
+        acquireShortWakeLock(3000L)
+        try {
+            onNotificationPostedInternal(sbn)
+        } finally {
+            releaseWakeLock()
+        }
+    }
+
+    private fun onNotificationPostedInternal(sbn: StatusBarNotification) {
+        val packageName = sbn.packageName ?: return
         
         Log.d(TAG, ">>> onNotificationPosted from $packageName")
 
@@ -1208,31 +1280,30 @@ class NotificationListener : NotificationListenerService() {
 
                 // If message body text is blank but media is present (or media URI/MIME type indicated), provide appropriate label
                 val msgText = if (rawMsgText.isNullOrBlank()) {
-                    if (perMessageMediaPath != null || mediaPicturePath != null || msgDataUri != null || msgMimeType != null) {
+                    val topText = (extras.getCharSequence("android.text")?.toString()
+                        ?: extras.getCharSequence("android.bigText")?.toString()
+                        ?: "").trim()
+
+                    if (isCallNotification(topText)) {
+                        Log.d(TAG, "Skipping call notification from topText: '$topText'")
+                        continue
+                    }
+
+                    val extracted = if (topText.isNotBlank() && !isSummaryMessage(topText)) {
+                        extractSenderFromText(topText, title, isGroupChat).second.trim()
+                    } else ""
+
+                    if (extracted.isNotBlank()) {
+                        extracted
+                    } else if (perMessageMediaPath != null || mediaPicturePath != null || msgDataUri != null || msgMimeType != null) {
                         when {
-                            msgMimeType?.startsWith("video/") == true -> "Video"
-                            msgMimeType?.startsWith("audio/") == true -> "Voice Message"
+                            msgMimeType?.startsWith("video/") == true -> "🎤 Video (0:05)"
+                            msgMimeType?.startsWith("audio/") == true -> "🎤 Voice message (0:02)"
                             msgMimeType?.startsWith("application/") == true -> "Document"
                             else -> "Photo"
                         }
                     } else {
-                        // Check if top-level notification text has a media label
-                        val topText = extras.getCharSequence("android.text")?.toString() ?: ""
-                        // ── CRITICAL: Check for call text BEFORE keyword matching ──
-                        // "Missed voice call" contains "voice", which previously matched
-                        // the audio branch below and created a phantom "Voice Message".
-                        if (isCallNotification(topText)) {
-                            Log.d(TAG, "Skipping call notification from topText: '$topText'")
-                            continue
-                        }
-                        val topLower = topText.lowercase()
-                        when {
-                            topLower.contains("photo") || topLower.contains("📷") || topLower.contains("image") -> "Photo"
-                            topLower.contains("video") || topLower.contains("📹") || topLower.contains("🎥") -> "Video"
-                            topLower.contains("voice") || topLower.contains("audio") || topLower.contains("🎤") || topLower.contains("🎙") -> "Voice Message"
-                            topLower.contains("document") || topLower.contains("file") || topLower.contains("📄") || topLower.contains("📎") -> "Document"
-                            else -> continue
-                        }
+                        continue
                     }
                 } else {
                     // Non-blank text — but still check if it's a call notification
@@ -1648,6 +1719,13 @@ class NotificationListener : NotificationListenerService() {
                 persistProcessedIds()
             }
         }
+
+        // If device is locked in Direct Boot mode, buffer in DE storage and defer CE writes
+        if (!isUserUnlocked(this)) {
+            Log.i(TAG, "Device is locked (Direct Boot). Buffering notification to device-protected storage.")
+            bufferDirectBootNotification(title, text, packageName, timestamp, senderName, isGroupChat)
+            return 1
+        }
         
         // ── PRIMARY STORAGE: Insert directly into SQLite ──────────────────
         // This is instant — no need to wait for Flutter to poll the JSON queue.
@@ -1758,6 +1836,22 @@ class NotificationListener : NotificationListenerService() {
      */
     private fun saveNotificationsBatch(notifications: List<JSONObject>): Int {
         if (notifications.isEmpty()) return 0
+
+        // If device is locked in Direct Boot mode, buffer in DE storage and defer CE writes
+        if (!isUserUnlocked(this)) {
+            Log.i(TAG, "Device is locked (Direct Boot). Buffering batch notifications to device-protected storage.")
+            for (obj in notifications) {
+                bufferDirectBootNotification(
+                    obj.optString("title", ""),
+                    obj.optString("text", ""),
+                    obj.optString("packageName", ""),
+                    obj.optLong("timestamp", System.currentTimeMillis()),
+                    obj.optString("senderName", ""),
+                    obj.optBoolean("isGroupChat", false)
+                )
+            }
+            return notifications.size
+        }
         
         // ── PRIMARY STORAGE: Batch insert directly into SQLite ──────────
         var dbInserted = 0
@@ -1853,6 +1947,83 @@ class NotificationListener : NotificationListenerService() {
             Log.e(TAG, "Batch JSON save error: ${e.message}")
             // DB insert already succeeded above — messages are safe
             return maxOf(dbInserted, notifications.size)
+        }
+    }
+
+    private fun bufferDirectBootNotification(
+        title: String, text: String,
+        packageName: String, timestamp: Long,
+        senderName: String, isGroupChat: Boolean
+    ) {
+        try {
+            val deContext = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                applicationContext.createDeviceProtectedStorageContext()
+            } else applicationContext
+            val bufferFile = File(deContext.filesDir, "direct_boot_notifications.json")
+            val array = if (bufferFile.exists()) {
+                try {
+                    val content = bufferFile.readText().trim()
+                    if (content.isNotEmpty()) JSONArray(content) else JSONArray()
+                } catch (_: Exception) { JSONArray() }
+            } else {
+                JSONArray()
+            }
+            array.put(JSONObject().apply {
+                put("title", title)
+                put("text", text)
+                put("packageName", packageName)
+                put("timestamp", timestamp)
+                put("senderName", senderName)
+                put("isGroupChat", isGroupChat)
+            })
+            bufferFile.writeText(array.toString())
+            Log.i(TAG, "Buffered notification in direct boot storage (count=${array.length()})")
+        } catch (e: Exception) {
+            Log.e(TAG, "bufferDirectBootNotification error: ${e.message}")
+        }
+    }
+
+    private fun flushPendingDirectBootNotifications() {
+        try {
+            val deContext = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                applicationContext.createDeviceProtectedStorageContext()
+            } else applicationContext
+            val bufferFile = File(deContext.filesDir, "direct_boot_notifications.json")
+            if (!bufferFile.exists()) return
+
+            val content = bufferFile.readText().trim()
+            if (content.isEmpty()) {
+                bufferFile.delete()
+                return
+            }
+            val array = JSONArray(content)
+            Log.i(TAG, "Flushing ${array.length()} direct boot notifications to CE storage...")
+            for (i in 0 until array.length()) {
+                val obj = array.getJSONObject(i)
+                val title = obj.optString("title", "")
+                val text = obj.optString("text", "")
+                val packageName = obj.optString("packageName", "")
+                val timestamp = obj.optLong("timestamp", System.currentTimeMillis())
+                val senderName = obj.optString("senderName", "")
+                val isGroupChat = obj.optBoolean("isGroupChat", false)
+
+                try {
+                    nativeDb?.insertMessage(
+                        sender = title,
+                        message = text,
+                        app = packageName,
+                        timestampMs = timestamp,
+                        senderName = senderName,
+                        isGroupChat = isGroupChat
+                    )
+                } catch (e: Exception) {
+                    Log.e(TAG, "Direct boot flush insert error: ${e.message}")
+                }
+            }
+            bufferFile.delete()
+            Log.i(TAG, "Flushed and removed direct boot buffer file")
+        } catch (e: Exception) {
+            Log.e(TAG, "flushPendingDirectBootNotifications error: ${e.message}")
         }
     }
 }

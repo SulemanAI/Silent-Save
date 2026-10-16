@@ -7,11 +7,13 @@ import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.DocumentsContract
 import android.provider.Settings
+import android.service.notification.NotificationListenerService
 import android.util.Log
 
 import androidx.work.*
@@ -53,6 +55,38 @@ class MainActivity : FlutterFragmentActivity() {
     // Set before launching ACTION_OPEN_DOCUMENT_TREE, resolved in onActivityResult.
     private var pendingSafResult: MethodChannel.Result? = null
 
+    fun forceRebindNls(context: Context) {
+        try {
+            val componentName = ComponentName(context, NotificationListener::class.java)
+            val pm = context.packageManager
+            pm.setComponentEnabledSetting(
+                componentName,
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                PackageManager.DONT_KILL_APP
+            )
+            pm.setComponentEnabledSetting(
+                componentName,
+                PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                PackageManager.DONT_KILL_APP
+            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                NotificationListenerService.requestRebind(componentName)
+            }
+            Log.i(TAG, "forceRebindNls: successfully toggled component and requested rebind")
+        } catch (e: Exception) {
+            Log.e(TAG, "forceRebindNls error: ${e.message}")
+        }
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        Log.i(TAG, "onTrimMemory level: $level")
+        if (level >= TRIM_MEMORY_BACKGROUND || level >= TRIM_MEMORY_UI_HIDDEN) {
+            activeMethodChannel?.invokeMethod("onTrimMemory", mapOf("level" to level))
+            System.gc()
+        }
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
@@ -71,10 +105,21 @@ class MainActivity : FlutterFragmentActivity() {
 
         // Schedule NLS health check worker to keep NLS alive on aggressive OEM phones
         NlsHealthWorker.schedule(applicationContext)
+
+        // Recover from OEM force-stop / One-key clean:
+        // If permission is enabled but NLS is disconnected, toggle component state to re-trigger binding
+        if (isNotificationServiceEnabled() && !NotificationListener.isConnected) {
+            Log.i(TAG, "NLS disconnected with permission granted -> executing forceRebindNls on startup")
+            forceRebindNls(applicationContext)
+        }
         
         channel.setMethodCallHandler { call, result ->
             Log.d(TAG, "Method call: ${call.method}")
             when (call.method) {
+                "forceRebindNls" -> {
+                    forceRebindNls(applicationContext)
+                    result.success(true)
+                }
                 "isNotificationPermissionGranted" -> {
                     val granted = isNotificationServiceEnabled()
                     Log.d(TAG, "Permission: $granted")

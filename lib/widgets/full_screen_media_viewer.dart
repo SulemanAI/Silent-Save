@@ -137,11 +137,12 @@ class _FullScreenMediaViewerState extends State<FullScreenMediaViewer> {
               icon: const Icon(Icons.copy, color: Colors.white),
               tooltip: 'Copy to clipboard',
               onPressed: () async {
+                final messenger = ScaffoldMessenger.of(context);
                 final ok = await NotificationService.instance.copyMediaToClipboard(
                   filePath: _paths[_currentIndex],
                 );
                 if (!mounted) return;
-                ScaffoldMessenger.of(context).showSnackBar(
+                messenger.showSnackBar(
                   SnackBar(
                     backgroundColor: Colors.white,
                     content: Text(

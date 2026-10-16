@@ -6,6 +6,10 @@ import 'services/encryption_service.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   
+  // Cap image cache to prevent uncompressed bitmap accumulation from ballooning RSS past OEM thresholds
+  PaintingBinding.instance.imageCache.maximumSizeBytes = 50 * 1024 * 1024; // 50 MB
+  PaintingBinding.instance.imageCache.maximumSize = 100;
+  
   // Initialize services with error handling to prevent app crash on startup
   try {
     await EncryptionService.instance.initializeEncryption()

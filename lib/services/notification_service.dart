@@ -70,7 +70,12 @@ class NotificationService with WidgetsBindingObserver {
     // This allows native to push notifications directly when Flutter is in foreground
     platform.setMethodCallHandler((call) async {
       try {
-        if (call.method == 'onNotificationReceived') {
+        if (call.method == 'onTrimMemory') {
+          debugPrint('[NotificationService] onTrimMemory received -> clearing volatile image caches');
+          PaintingBinding.instance.imageCache.clear();
+          PaintingBinding.instance.imageCache.clearLiveImages();
+          return;
+        } else if (call.method == 'onNotificationReceived') {
           if (call.arguments is Map && call.arguments['event'] == 'db_updated') {
             debugPrint('[NotificationService] db_updated received -> instant UI refresh');
             newMessageNotifier.value++;
@@ -111,6 +116,8 @@ class NotificationService with WidgetsBindingObserver {
       _startPollTimer();
     } else if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive) {
       _appInForeground = false;
+      // Drop live image references when backgrounded to prevent memory pressure kills
+      PaintingBinding.instance.imageCache.clearLiveImages();
       // Stop the poll timer when app is in background — native side handles capture
       _stopPollTimer();
     }
@@ -197,9 +204,9 @@ class NotificationService with WidgetsBindingObserver {
             continue;
           }
           
-          // Truncate extremely long messages to prevent memory issues
+          // Truncate extremely long messages to prevent memory issues safely
           if (text.length > 10000) {
-            text = '${text.substring(0, 10000)}... [truncated]';
+            text = '${truncateText(text, 10000)} [truncated]';
           }
           
           // Parse timestamp robustly
@@ -347,10 +354,7 @@ class NotificationService with WidgetsBindingObserver {
         final window = isAudio ? 60000 : (hasSender ? 86400000 : 30000);
         final matchResult = hasSender
             ? await TimestampMatcher.matchMediaToNotification(mediaEvent, window)
-            : (isAudio
-                ? MatchResult.unmatched()
-                : await TimestampMatcher.matchMediaToNotification(
-                    mediaEvent, window, requireUnambiguous: true));
+            : await TimestampMatcher.matchMediaToNotification(mediaEvent, window, requireUnambiguous: true);
         
         final attachmentData = <String, dynamic>{
           'media_type': mediaEvent['mediaType'] ?? 'unknown',
@@ -427,8 +431,8 @@ class NotificationService with WidgetsBindingObserver {
         final mediaType = item['media_type'] as String? ?? 'unknown';
 
         // Voice notes contain no contact metadata and arrive concurrently.
-        // NEVER auto-link audio/voice notes in the no-sender path!
-        if (mediaType == 'audio' || fName.endsWith('.opus') || fName.startsWith('PTT-')) continue;
+        // We now allow them through because TimestampMatcher with requireUnambiguous=true
+        // safely handles collisions by aborting if multiple candidates exist in the time window.
 
         final mediaEvent = <String, dynamic>{
           'originalUri': item['original_uri'] ?? '',
@@ -625,6 +629,18 @@ class NotificationService with WidgetsBindingObserver {
       return await platform.invokeMethod('isNlsConnected') as bool;
     } catch (e) {
       debugPrint('[NotificationService] NLS connection check error: $e');
+      return false;
+    }
+  }
+
+  /// Forces an Android component toggle to recover NotificationListenerService
+  /// if it was unbound or killed by OEM force-stop / One-Key Clean.
+  Future<bool> forceRebindNls() async {
+    try {
+      final res = await platform.invokeMethod('forceRebindNls');
+      return res as bool? ?? false;
+    } catch (e) {
+      debugPrint('[NotificationService] forceRebindNls error: $e');
       return false;
     }
   }
