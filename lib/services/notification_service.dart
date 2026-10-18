@@ -59,6 +59,19 @@ class NotificationService with WidgetsBindingObserver {
   /// Notifier that increments whenever new messages are saved to the database.
   /// UI widgets can listen to this to auto-refresh.
   final ValueNotifier<int> newMessageNotifier = ValueNotifier<int>(0);
+  
+  // Debounce timer for UI notifications.
+  // During message bursts (32 notifications at once), calling newMessageNotifier.value++
+  // for each item floods the Flutter rendering pipeline (BLASTBufferQueue overflow).
+  // Instead we coalesce all updates within 300ms into a single UI refresh.
+  Timer? _notifyDebounceTimer;
+  
+  void _scheduleNotify() {
+    _notifyDebounceTimer?.cancel();
+    _notifyDebounceTimer = Timer(const Duration(milliseconds: 300), () {
+      newMessageNotifier.value++;
+    });
+  }
 
   NotificationService._init() {
     debugPrint('[NotificationService] Initializing (hybrid mode)...');
@@ -79,7 +92,7 @@ class NotificationService with WidgetsBindingObserver {
           if (call.arguments is Map && call.arguments['event'] == 'db_updated') {
             debugPrint('[NotificationService] db_updated received -> instant UI refresh');
             newMessageNotifier.value++;
-            await _checkForNewMedia();
+            _checkForNewMedia();
             return;
           }
           await _handleNotificationReceived(call.arguments);
@@ -204,6 +217,23 @@ class NotificationService with WidgetsBindingObserver {
             continue;
           }
           
+          // Skip WhatsApp system, security, and login notifications
+          final lowerTitle = title.toLowerCase();
+          final lowerText = text.toLowerCase();
+          if (lowerTitle.contains('whatsapp login') ||
+              lowerTitle.contains('recent login') ||
+              lowerTitle.contains('recent whatsapp login') ||
+              lowerTitle == 'whatsapp' ||
+              lowerTitle == 'whatsapp web' ||
+              lowerTitle == 'whatsapp desktop' ||
+              lowerText.contains('logged in to whatsapp') ||
+              lowerText.contains('log in to whatsapp') ||
+              lowerText.contains('checking for new messages') ||
+              lowerText.contains('whatsapp web is currently active') ||
+              lowerText.contains('backup in progress')) {
+            continue;
+          }
+          
           // Truncate extremely long messages to prevent memory issues safely
           if (text.length > 10000) {
             text = '${truncateText(text, 10000)} [truncated]';
@@ -295,7 +325,8 @@ class NotificationService with WidgetsBindingObserver {
         _totalProcessed += totalInserted;
         if (totalInserted > 0) {
           debugPrint('[NotificationService] ✓ Batch: $totalInserted/${messagesToInsert.length} new messages saved');
-          newMessageNotifier.value++;
+          // Debounced: burst of messages becomes one UI refresh
+          _scheduleNotify();
         }
       }
       
@@ -380,7 +411,7 @@ class NotificationService with WidgetsBindingObserver {
           );
           
           // Notify UI immediately so the conversation view refreshes without waiting
-          newMessageNotifier.value++;
+          _scheduleNotify();
         } else if (matchResult.isAmbiguous && matchResult.ambiguousCandidates != null) {
           final ids = matchResult.ambiguousCandidates!.map((c) => c['id']).toList();
           attachmentData['candidate_notification_ids'] = jsonEncode(ids);
@@ -392,13 +423,14 @@ class NotificationService with WidgetsBindingObserver {
         }
 
         processed++;
-        // Yield to UI thread every 10 items to prevent Dart event loop starvation
-        // which caused false timeouts when queue had 100+ entries.
-        if (processed % 10 == 0) await Future.delayed(Duration.zero);
+        // Yield to UI thread on every item so UI frame rendering and gestures never freeze
+        await Future.delayed(Duration.zero);
       }
       
-      // Notify UI of new media
-      newMessageNotifier.value++;
+      debugPrint('[NotificationService] Processed $processed media queue events');
+      // Debounced notify: if many media items were processed in a burst,
+      // only one UI refresh fires instead of one per item.
+      _scheduleNotify();
       
     } catch (e) {
       debugPrint('[NotificationService] Error checking new media: $e');
@@ -467,7 +499,7 @@ class NotificationService with WidgetsBindingObserver {
         // isAmbiguous or isUnmatched → leave matched=0, TTL will handle it
       }
 
-      if (linked > 0) newMessageNotifier.value++;
+      if (linked > 0) _scheduleNotify();
       return linked;
     } catch (e) {
       debugPrint('[NotificationService] reconcileNoSenderMedia error: $e');
@@ -537,7 +569,7 @@ class NotificationService with WidgetsBindingObserver {
         }
       }
       if (linked > 0) {
-        newMessageNotifier.value++;
+        _scheduleNotify();
       }
       return linked;
     } catch (e) {
@@ -568,6 +600,22 @@ class NotificationService with WidgetsBindingObserver {
       final rawSender = data['title']?.toString() ?? 'Unknown';
       final sender = sanitizeText(cleanGroupName(rawSender));
       final messageText = sanitizeText(data['text']?.toString() ?? '');
+      
+      final lowerSender = sender.toLowerCase();
+      final lowerMsg = messageText.toLowerCase();
+      if (lowerSender.contains('whatsapp login') ||
+          lowerSender.contains('recent login') ||
+          lowerSender.contains('recent whatsapp login') ||
+          lowerSender == 'whatsapp' ||
+          lowerSender == 'whatsapp web' ||
+          lowerSender == 'whatsapp desktop' ||
+          lowerMsg.contains('logged in to whatsapp') ||
+          lowerMsg.contains('log in to whatsapp') ||
+          lowerMsg.contains('checking for new messages') ||
+          lowerMsg.contains('whatsapp web is currently active') ||
+          lowerMsg.contains('backup in progress')) {
+        return;
+      }
       final app = data['packageName']?.toString() ?? '';
       final timestampValue = data['timestamp'];
       final senderName = sanitizeText(data['senderName']?.toString() ?? sender);
@@ -601,7 +649,7 @@ class NotificationService with WidgetsBindingObserver {
         debugPrint('[NotificationService] DB dedup: duplicate skipped');
       } else {
         debugPrint('[NotificationService] ✓ Saved message #$_totalProcessed from "$sender"');
-        newMessageNotifier.value++;
+        _scheduleNotify();
       }
     } catch (e, stackTrace) {
       debugPrint('[NotificationService] Error handling notification: $e');

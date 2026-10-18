@@ -44,6 +44,10 @@ class KeepAliveService : Service() {
         private const val WAKELOCK_RENEW_INTERVAL_MS = 4L * 60 * 1000
         // Self-ping alarm every 10 minutes
         private const val SELF_PING_INTERVAL_MS = 10L * 60 * 1000
+        // In-process NLS watchdog interval
+        private const val WATCHDOG_INTERVAL_MS = 60L * 1000
+        // Media retention sweep interval
+        private const val RETENTION_SWEEP_INTERVAL_MS = 6L * 60 * 60 * 1000
 
         fun start(context: Context) {
             val intent = Intent(context, KeepAliveService::class.java)
@@ -65,6 +69,66 @@ class KeepAliveService : Service() {
     }
 
     private var wakeLock: PowerManager.WakeLock? = null
+
+    // ── In-process watchdog ────────────────────────────────────────────
+    // Observed failure: process + this FGS stay alive, but the system drops the
+    // NotificationListener binding (ServiceRecord app=null) and nothing re-binds it
+    // until the 15-min WorkManager check. Re-check every minute instead.
+    private val watchdogHandler = Handler(Looper.getMainLooper())
+    private var watchdogRunning = false
+    private val watchdogRunnable = object : Runnable {
+        override fun run() {
+            try { watchdogTick() } catch (e: Exception) { Log.w(TAG, "Watchdog error: ${e.message}") }
+            watchdogHandler.postDelayed(this, WATCHDOG_INTERVAL_MS)
+        }
+    }
+
+    private fun watchdogTick() {
+        if (isNlsPermissionGranted() && !NotificationListener.isConnected) {
+            Log.w(TAG, "Watchdog: NLS not connected while permission granted — rebinding")
+            try {
+                val cn = android.content.ComponentName(this, NotificationListener::class.java)
+                val pm = packageManager
+                pm.setComponentEnabledSetting(cn, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED, android.content.pm.PackageManager.DONT_KILL_APP)
+                pm.setComponentEnabledSetting(cn, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED, android.content.pm.PackageManager.DONT_KILL_APP)
+                android.service.notification.NotificationListenerService.requestRebind(cn)
+            } catch (e: Exception) {
+                Log.w(TAG, "Watchdog rebind failed: ${e.message}")
+            }
+        }
+
+        // One-time: remove profile pictures previously mis-saved as message media
+        val prefsOnce = getSharedPreferences("keepalive_state", Context.MODE_PRIVATE)
+        if (!prefsOnce.getBoolean("purged_avatar_media_v1", false)) {
+            prefsOnce.edit().putBoolean("purged_avatar_media_v1", true).apply()
+            Thread {
+                try { NativeDatabaseHelper.getInstance(applicationContext).purgeAvatarMisusedMedia() }
+                catch (e: Exception) { Log.w(TAG, "Avatar purge failed: ${e.message}") }
+            }.start()
+        }
+
+        // 15-day media retention, at most once every 6 hours
+        val prefs = getSharedPreferences("keepalive_state", Context.MODE_PRIVATE)
+        val last = prefs.getLong("last_media_prune", 0L)
+        val now = System.currentTimeMillis()
+        if (now - last > RETENTION_SWEEP_INTERVAL_MS) {
+            prefs.edit().putLong("last_media_prune", now).apply()
+            Thread {
+                try {
+                    NativeDatabaseHelper.getInstance(applicationContext).pruneExpiredMedia()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Retention sweep failed: ${e.message}")
+                }
+            }.start()
+        }
+    }
+
+    private fun isNlsPermissionGranted(): Boolean {
+        val flat = android.provider.Settings.Secure.getString(
+            contentResolver, "enabled_notification_listeners"
+        ) ?: return false
+        return flat.contains(android.content.ComponentName(this, NotificationListener::class.java).flattenToString())
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -108,6 +172,12 @@ class KeepAliveService : Service() {
         // Schedule self-ping alarm to restart this service if killed
         scheduleSelfPingAlarm()
 
+        // Start the in-process watchdog (idempotent)
+        if (!watchdogRunning) {
+            watchdogRunning = true
+            watchdogHandler.postDelayed(watchdogRunnable, 5_000L)
+        }
+
         // Also ensure MediaWatcherService is running alongside us
         try {
             MediaWatcherService.start(applicationContext)
@@ -143,6 +213,8 @@ class KeepAliveService : Service() {
 
     override fun onDestroy() {
         Log.w(TAG, "KeepAliveService destroyed — requesting restart")
+        watchdogHandler.removeCallbacks(watchdogRunnable)
+        watchdogRunning = false
         releaseWakeLock()
         cancelSelfPingAlarm()
         super.onDestroy()

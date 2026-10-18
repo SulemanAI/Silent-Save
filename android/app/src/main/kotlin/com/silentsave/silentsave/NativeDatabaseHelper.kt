@@ -31,7 +31,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
     companion object {
         private const val TAG = "NativeDB"
         private const val DB_NAME = "silentsave.db"
-        private const val DB_VERSION = 8
+        private const val DB_VERSION = 9 // v9: isSaved column added
 
         @Volatile
         private var INSTANCE: NativeDatabaseHelper? = null
@@ -70,12 +70,18 @@ class NativeDatabaseHelper private constructor(context: Context) {
      */
     private fun openDatabase(): SQLiteDatabase {
         val dbPath = appContext.getDatabasePath(DB_NAME).absolutePath
-        val database = SQLiteDatabase.openOrCreateDatabase(dbPath, null)
-        // Enable WAL for concurrent reader+writer (Flutter sqflite + this Kotlin writer)
-        database.enableWriteAheadLogging()
+        val database = SQLiteDatabase.openDatabase(
+            dbPath,
+            null,
+            SQLiteDatabase.OPEN_READWRITE or SQLiteDatabase.CREATE_IF_NECESSARY or SQLiteDatabase.ENABLE_WRITE_AHEAD_LOGGING
+        )
         // 8s busy timeout: gives Flutter sqflite time to release its lock before we fail.
-        // Increased from 5s to be more resilient when both sides write simultaneously.
-        database.execSQL("PRAGMA busy_timeout = 8000;")
+        // PRAGMA statements that return a result must use rawQuery in Android SQLite.
+        try {
+            database.rawQuery("PRAGMA busy_timeout = 8000", null)?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to set PRAGMA busy_timeout: ${e.message}")
+        }
         return database
     }
 
@@ -136,7 +142,8 @@ class NativeDatabaseHelper private constructor(context: Context) {
                     senderName TEXT,
                     isGroupChat INTEGER DEFAULT 0,
                     avatarPath TEXT,
-                    mediaPath TEXT
+                    mediaPath TEXT,
+                    isSaved INTEGER DEFAULT 0
                 )
             """.trimIndent())
 
@@ -184,12 +191,45 @@ class NativeDatabaseHelper private constructor(context: Context) {
             // Ensure all columns exist (handles upgrades from older versions)
             ensureColumns()
 
-            // One-time cleanup for any historically corrupted or cross-linked media
-            cleanupCorruptedMediaLinks()
+            // Run cleanup only once per 5 minutes to avoid heavy JOIN queries
+            // running on every service restart during active message bursts.
+            // Previously called unconditionally here, it caused DB lock contention
+            // when Flutter was simultaneously writing via sqflite.
+            maybeRunCleanup()
 
             Log.i(TAG, "Schema verified/created successfully")
         } catch (e: Exception) {
             Log.e(TAG, "Schema initialization error: ${e.message}")
+        }
+    }
+
+    /**
+     * Run cleanupCorruptedMediaLinks at most once every 5 minutes.
+     * Uses SharedPreferences to persist the last-run timestamp across
+     * service restarts (which happen frequently on OEM devices).
+     */
+    private fun maybeRunCleanup() {
+        try {
+            val prefs = appContext.getSharedPreferences("nativedb_state", Context.MODE_PRIVATE)
+            val lastRun = prefs.getLong("last_cleanup_ms", 0L)
+            val now = System.currentTimeMillis()
+            val minIntervalMs = 5 * 60 * 1000L // 5 minutes
+            if (now - lastRun < minIntervalMs) {
+                Log.d(TAG, "cleanupCorruptedMediaLinks skipped (ran ${(now - lastRun) / 1000}s ago)")
+                return
+            }
+            prefs.edit().putLong("last_cleanup_ms", now).apply()
+            // Run on a background thread — the cleanup holds a long transaction
+            // and must never block the notification posting thread.
+            Thread {
+                try {
+                    cleanupCorruptedMediaLinks()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Background cleanup error: ${e.message}")
+                }
+            }.start()
+        } catch (e: Exception) {
+            Log.w(TAG, "maybeRunCleanup error: ${e.message}")
         }
     }
 
@@ -214,7 +254,8 @@ class NativeDatabaseHelper private constructor(context: Context) {
                 "senderName" to "TEXT",
                 "isGroupChat" to "INTEGER DEFAULT 0",
                 "avatarPath" to "TEXT",
-                "mediaPath" to "TEXT"
+                "mediaPath" to "TEXT",
+                "isSaved" to "INTEGER DEFAULT 0"
             )
 
             for ((name, type) in requiredColumns) {
@@ -298,8 +339,12 @@ class NativeDatabaseHelper private constructor(context: Context) {
 
             if (rowId > 0) {
                 Log.i(TAG, "✓ Inserted #$rowId from '$sender' (media=${mediaPath != null})")
-                // Reverse-link waiting media ONLY if this message arrived without media AND is an explicit media placeholder
-                if (mediaPath == null && isMediaPlaceholderText(message) && app.contains("whatsapp")) {
+                // Reverse-link waiting media if this message arrived without media (or with a temporary image preview for a video) AND is an explicit media placeholder
+                val isVideoPlaceholder = message.lowercase().let { 
+                    it.contains("video") || it.contains("🎥") || it.contains("📹") 
+                }
+                val canCheckWaitingMedia = (mediaPath == null || (isVideoPlaceholder && (mediaPath.endsWith(".jpg", ignoreCase = true) || mediaPath.endsWith(".jpeg", ignoreCase = true) || mediaPath.endsWith(".png", ignoreCase = true))))
+                if (canCheckWaitingMedia && isMediaPlaceholderText(message) && app.contains("whatsapp")) {
                     linkWaitingMediaToMessage(rowId, sender, senderName, message, timestampMs)
                 }
                 MainActivity.notifyFlutterMessageOrMediaUpdated()
@@ -331,12 +376,49 @@ class NativeDatabaseHelper private constructor(context: Context) {
         }
         if (lower == "voice call" || lower == "video call" || lower == "group call") return false
         
-        val genericLabels = listOf(
-            "photo", "image", "video", "audio", "voice message", "voice", "document", "file",
-            "sticker", "gif", "📷", "🖼", "📹", "🎥", "🎞", "🎤", "🎙", "🎵", "📄", "📎",
-            ".pdf", ".doc", ".docx", ".csv", ".xls", ".xlsx", ".txt", ".ppt", ".zip"
+        // Exact WhatsApp notification labels (WhatsApp uses these when sending media without caption)
+        val exactLabels = setOf(
+            "photo", "image", "voice message", "voice note", "video message",
+            "sticker", "gif", "contact card", "location", "live location",
+            "photo omitted", "video omitted", "audio omitted", "voice message omitted", "sticker omitted", "document omitted",
+            "sent a photo", "sent a video", "sent a picture", "sent an audio", "sent a voice message", "sent a document", "sent a sticker", "sent a gif"
         )
-        return genericLabels.any { lower.contains(it) }
+        if (exactLabels.contains(lower)) return true
+
+        if (lower.startsWith("sent a ") || lower.startsWith("sent an ")) {
+            val rest = lower.substringAfter("sent a").substringAfter("sent an").trim()
+            if (rest.contains("photo") || rest.contains("video") || rest.contains("image") ||
+                rest.contains("voice") || rest.contains("audio") || rest.contains("document") ||
+                rest.contains("sticker") || rest.contains("gif") || rest.contains("picture")) {
+                return true
+            }
+        }
+
+        // Media emoji prefixes
+        if (lower.startsWith("📷") || lower.startsWith("🖼") || lower.startsWith("📹") ||
+            lower.startsWith("🎥") || lower.startsWith("🎞") || lower.startsWith("🎤") ||
+            lower.startsWith("🎙") || lower.startsWith("🎵") || lower.startsWith("📄") ||
+            lower.startsWith("📎")) {
+            return true
+        }
+
+        // Internal WhatsApp filename prefixes
+        if (lower.startsWith("ptt-") || lower.startsWith("aud-") || lower.startsWith("vid-") ||
+            lower.startsWith("doc-") || lower.startsWith("stk-") || lower.startsWith("img-")) {
+            return true
+        }
+
+        // WhatsApp duration tags: e.g. "🎤 Voice message (0:02)" or "Voice message (0:02)" or "Video (0:05)"
+        if (Regex("""^[🎤🎙]\s*(?:voice|audio)?\s*(?:message|note)?(?:\s*\(\d+:\d+\))?$""").matches(lower)) return true
+        if (Regex("""^voice\s+(?:message|note)(?:\s*\(\d+:\d+\))?$""").matches(lower)) return true
+        if (Regex("""^(?:voice|audio)\s*\(\d+:\d+\)$""").matches(lower)) return true
+        if (Regex("""^[🎥📹]\s*video(?:\s*\(\d+:\d+\))?$""").matches(lower)) return true
+        if (Regex("""^video\s*\(\d+:\d+\)$""").matches(lower)) return true
+
+        // Document extensions at the end of filename
+        if (Regex("""\.(pdf|docx?|xlsx?|pptx?|txt|zip|rar|csv)$""").containsMatchIn(lower)) return true
+
+        return false
     }
 
     /**
@@ -374,6 +456,59 @@ class NativeDatabaseHelper private constructor(context: Context) {
                       AND mediaPath IS NOT NULL 
                       AND mediaPath != ''
                 """.trimIndent())
+
+                // 1c. Delete WhatsApp system and security notifications that were mistakenly saved as chat messages
+                // (e.g. "Recent WhatsApp login", "WhatsApp Web", "Checking for new messages", etc.)
+                database.execSQL("""
+                    DELETE FROM messages 
+                    WHERE app LIKE '%whatsapp%' 
+                      AND (
+                        LOWER(sender) LIKE '%whatsapp login%' 
+                        OR LOWER(sender) LIKE '%recent whatsapp login%' 
+                        OR LOWER(sender) LIKE '%recent login%' 
+                        OR LOWER(sender) = 'whatsapp' 
+                        OR LOWER(sender) = 'whatsapp web' 
+                        OR LOWER(sender) = 'whatsapp desktop' 
+                        OR LOWER(message) LIKE '%logged in to whatsapp%' 
+                        OR LOWER(message) LIKE '%log in to whatsapp%' 
+                        OR LOWER(message) LIKE '%checking for new messages%' 
+                        OR LOWER(message) LIKE '%whatsapp web is currently active%'
+                        OR LOWER(message) LIKE '%backup in progress%'
+                      )
+                """.trimIndent())
+
+                // 1d. Clear audio mediaPath on messages that have text that is NOT an audio placeholder
+                // (e.g. "Voice note ka masla he", "Send me a voice note", "Tu bata", etc.)
+                // WhatsApp voice notes (.opus, .m4a, .mp3, etc.) NEVER carry text captions.
+                try {
+                    val audioUnlinkIds = mutableListOf<Long>()
+                    database.rawQuery("""
+                        SELECT id, message, mediaPath FROM messages 
+                        WHERE app LIKE '%whatsapp%' 
+                          AND mediaPath IS NOT NULL AND mediaPath != ''
+                          AND (
+                              LOWER(mediaPath) LIKE '%.opus' 
+                              OR LOWER(mediaPath) LIKE '%.m4a' 
+                              OR LOWER(mediaPath) LIKE '%.mp3' 
+                              OR LOWER(mediaPath) LIKE '%.wav' 
+                              OR LOWER(mediaPath) LIKE '%.ogg' 
+                              OR LOWER(mediaPath) LIKE '%.aac'
+                          )
+                    """.trimIndent(), null).use { audioCur ->
+                        while (audioCur.moveToNext()) {
+                            val mId = audioCur.getLong(0)
+                            val mText = audioCur.getString(1) ?: ""
+                            if (!isMediaPlaceholderText(mText)) {
+                                audioUnlinkIds.add(mId)
+                            }
+                        }
+                    }
+                    for (id in audioUnlinkIds) {
+                        database.execSQL("UPDATE messages SET mediaPath = NULL WHERE id = ?", arrayOf(id.toString()))
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error cleaning erroneously linked audio messages: ${e.message}")
+                }
 
                 // 2. Find any mediaPath that is assigned to more than 1 message
                 val duplicatePaths = mutableListOf<String>()
@@ -523,6 +658,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
                             mText.contains("photo") || mText.contains("image") || mText.contains("📷") || mText.contains("🖼") -> "image"
                             mText.contains("video") || mText.contains("📹") || mText.contains("🎥") -> "video"
                             mText.contains("document") || mText.contains("file") || mText.contains("📄") || mText.contains("📎") -> "document"
+                            mText.contains("voice") || mText.contains("audio") || mText.contains("🎤") || mText.contains("🎙") -> "audio"
                             else -> null
                         } ?: continue
 
@@ -546,6 +682,66 @@ class NativeDatabaseHelper private constructor(context: Context) {
                                     database.execSQL("UPDATE media_attachments SET matched = 1, notification_id = ?, sender_name = ? WHERE id = ?", 
                                         arrayOf(mId.toString(), mSender, aId.toString()))
                                     Log.i(TAG, "✓ Auto-reconciled orphaned $targetType $fPath to message #$mId ($mSender)")
+                                }
+                            }
+                        }
+                    }
+
+                    // 7b. Recover any unindexed files in media_attachments dir from the last 24 hours
+                    val attachmentsDir = File(appContext.filesDir, "media_attachments")
+                    if (attachmentsDir.exists()) {
+                        val recentFiles = attachmentsDir.listFiles()?.filter {
+                            it.isFile && it.length() > 0 &&
+                            (System.currentTimeMillis() - it.lastModified() < 24 * 60 * 60 * 1000L)
+                        } ?: emptyList()
+
+                        for (f in recentFiles) {
+                            val fPath = f.absolutePath
+                            val isLinked = database.rawQuery(
+                                "SELECT id FROM messages WHERE mediaPath = ? LIMIT 1",
+                                arrayOf(fPath)
+                            ).use { it.moveToFirst() }
+                            if (isLinked) continue
+
+                            val modTime = f.lastModified()
+                            val fName = f.name.lowercase()
+                            val isImg = fName.startsWith("img-") || fName.endsWith(".jpg") || fName.endsWith(".png") || fName.endsWith(".jpeg")
+                            val isVid = fName.startsWith("vid-") || fName.endsWith(".mp4")
+                            val isAud = fName.startsWith("ptt-") || fName.startsWith("aud-") || fName.endsWith(".opus")
+
+                            val query = if (isAud) {
+                                """
+                                SELECT id, sender FROM messages
+                                WHERE (mediaPath IS NULL OR mediaPath = '')
+                                  AND app LIKE '%whatsapp%'
+                                  AND ABS(timestamp - $modTime) < 180000
+                                  AND (message LIKE '🎤%' OR message LIKE '🎙%' OR LOWER(message) LIKE '%voice%' OR LOWER(message) LIKE '%audio%')
+                                ORDER BY ABS(timestamp - $modTime) ASC
+                                LIMIT 1
+                                """
+                            } else {
+                                """
+                                SELECT id, sender FROM messages
+                                WHERE (mediaPath IS NULL OR mediaPath = '')
+                                  AND app LIKE '%whatsapp%'
+                                  AND ABS(timestamp - $modTime) < 300000
+                                  AND message NOT LIKE 'Reacted %'
+                                ORDER BY ABS(timestamp - $modTime) ASC
+                                LIMIT 1
+                                """
+                            }
+
+                            database.rawQuery(query.trimIndent(), null).use { cur ->
+                                if (cur.moveToFirst()) {
+                                    val mId = cur.getLong(0)
+                                    val sender = cur.getString(1) ?: ""
+                                    database.execSQL("UPDATE messages SET mediaPath = ? WHERE id = ?", arrayOf(fPath, mId.toString()))
+                                    val mType = if (isVid) "video" else if (isAud) "audio" else "image"
+                                    database.execSQL("""
+                                        INSERT OR REPLACE INTO media_attachments (notification_id, media_type, file_path, original_uri, sender_name, captured_at, matched)
+                                        VALUES (?, ?, ?, '', ?, ?, 1)
+                                    """.trimIndent(), arrayOf(mId.toString(), mType, fPath, sender, modTime.toString()))
+                                    Log.i(TAG, "✓ Recovered unindexed file $fPath -> linked to msg #$mId ($sender)")
                                 }
                             }
                         }
@@ -624,6 +820,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
 
         if (insertedCount > 0) {
             Log.i(TAG, "✓ Batch inserted $insertedCount/${messages.size} messages")
+            MainActivity.notifyFlutterMessageOrMediaUpdated()
         }
         return insertedIds
     }
@@ -638,19 +835,36 @@ class NativeDatabaseHelper private constructor(context: Context) {
         timestampMs: Long, windowMs: Long, mediaPath: String
     ) {
         try {
-            val start = timestampMs - windowMs
-            val end = timestampMs + windowMs
+            val effectiveWindow = maxOf(windowMs, 60_000L) // Allow up to 60s for double-post arrival
+            val start = timestampMs - effectiveWindow
+            val end = timestampMs + effectiveWindow
+            val database = safeDb()
             val values = ContentValues().apply {
                 put("mediaPath", mediaPath)
             }
-            val rows = safeDb().update(
+            val isVideo = mediaPath.endsWith(".mp4", ignoreCase = true)
+            val mediaPathCond = if (isVideo) 
+                "(mediaPath IS NULL OR mediaPath = '' OR mediaPath LIKE '%.jpg' OR mediaPath LIKE '%.jpeg' OR mediaPath LIKE '%.png')"
+            else 
+                "(mediaPath IS NULL OR mediaPath = '')"
+
+            val rows = database.update(
                 "messages",
                 values,
-                "sender = ? AND app = ? AND message = ? AND timestamp BETWEEN ? AND ? AND (mediaPath IS NULL OR mediaPath = '')",
-                arrayOf(sender, app, message, start.toString(), end.toString())
+                "sender = ? AND app = ? AND $mediaPathCond AND timestamp BETWEEN ? AND ? AND message NOT LIKE 'Reacted %' AND message NOT LIKE 'Reacted to %'",
+                arrayOf(sender, app, start.toString(), end.toString())
             )
             if (rows > 0) {
                 Log.d(TAG, "Updated mediaPath for existing message ($rows rows): $mediaPath")
+                // Also update media_attachments to track as matched
+                try {
+                    val file = File(mediaPath)
+                    val attachVals = ContentValues().apply {
+                        put("sender_name", sender)
+                        put("matched", 1)
+                    }
+                    database.update("media_attachments", attachVals, "file_path = ?", arrayOf(mediaPath))
+                } catch (_: Exception) {}
                 MainActivity.notifyFlutterMessageOrMediaUpdated()
             }
         } catch (e: Exception) {
@@ -715,7 +929,25 @@ class NativeDatabaseHelper private constructor(context: Context) {
                     }
 
                     // ── STRICT SENDER MATCHING ──────────────────────────────
-                    val senderMatches = attachSender.isNotEmpty() && !attachSender.contains('.') && (
+                    // A sender_name that is really a captured file name (stored when no sender was known).
+                    // NOTE: previously ANY sender containing '.' was rejected, which broke legit chat
+                    // names like "Dr. Ali" or "m.suleman_.05". Detect real filenames precisely instead.
+                    val attachSenderIsFilename = attachSender.contains('.') && (
+                        attachSender.startsWith("IMG-") || attachSender.startsWith("VID-") ||
+                        attachSender.startsWith("AUD-") || attachSender.startsWith("PTT-") ||
+                        attachSender.startsWith("DOC-") || attachSender.startsWith("STK-") ||
+                        attachSender.endsWith(".jpg") || attachSender.endsWith(".jpeg") ||
+                        attachSender.endsWith(".mp4") || attachSender.endsWith(".opus") ||
+                        attachSender.endsWith(".webp") || attachSender.endsWith(".aac") ||
+                        attachSender.endsWith(".pdf") || attachSender.endsWith(".zip")
+                    )
+
+                    // Sender-confirmed files must ALSO be close in time to this message (5 min) so a
+                    // stale unlinked file from the same chat is never attached to a newer message.
+                    // Audio keeps its existing behaviour.
+                    val closeInTime = mType == "audio" || Math.abs(capAt - timestampMs) <= 300_000L
+
+                    val senderMatches = attachSender.isNotEmpty() && !attachSenderIsFilename && closeInTime && (
                         attachSender.equals(sender, ignoreCase = true) ||
                         (senderName.isNotEmpty() && attachSender.equals(senderName, ignoreCase = true)) ||
                         attachSender.trim().equals(sender.trim(), ignoreCase = true)
@@ -732,20 +964,10 @@ class NativeDatabaseHelper private constructor(context: Context) {
                     //
                     // In both cases the media type must explicitly match the message text;
                     // blank messages are NOT accepted as wildcards (see requireExplicitMediaKeyword).
-                    val attachSenderIsFilename = attachSender.contains('.') && (
-                        attachSender.startsWith("IMG-") || attachSender.startsWith("VID-") ||
-                        attachSender.startsWith("AUD-") || attachSender.startsWith("PTT-") ||
-                        attachSender.startsWith("DOC-") || attachSender.startsWith("STK-") ||
-                        attachSender.endsWith(".jpg") || attachSender.endsWith(".jpeg") ||
-                        attachSender.endsWith(".mp4") || attachSender.endsWith(".opus") ||
-                        attachSender.endsWith(".webp") || attachSender.endsWith(".aac") ||
-                        attachSender.endsWith(".pdf") || attachSender.endsWith(".zip")
-                    )
 
                     val isRecentUnassigned = when {
-                        // Audio/voice notes contain no sender info and arrive concurrently.
-                        // NEVER reverse-link audio without an explicit confirmed sender match!
-                        mType == "audio" -> false
+                        // Audio/voice notes: allow reverse-linking within 45s of arrival if no collision
+                        mType == "audio" -> Math.abs(capAt - timestampMs) <= 45_000L
                         // Truly empty — 30s window
                         attachSender.isEmpty() -> Math.abs(capAt - timestampMs) <= 30_000L
                         // Filename stored as sender — captured without notification: 30s window
@@ -762,12 +984,36 @@ class NativeDatabaseHelper private constructor(context: Context) {
                         continue
                     }
 
+                    // ── ANTI-COLLISION PRIVACY GUARD ──────────────────────────────────────────
+                    // For unassigned audio (mType == "audio"), verify that NO OTHER chat in the
+                    // database also received an unlinked voice note within this 45-second window.
+                    // If multiple chats qualify, abort immediately so audio is never linked to the wrong user!
+                    if (mType == "audio" && !senderMatches) {
+                        val otherAudioCount = database.rawQuery("""
+                            SELECT COUNT(DISTINCT sender) FROM messages 
+                            WHERE app LIKE '%whatsapp%' 
+                              AND id != ? 
+                              AND (mediaPath IS NULL OR mediaPath = '') 
+                              AND timestamp BETWEEN ? AND ?
+                              AND (LOWER(message) LIKE '%voice%' OR LOWER(message) LIKE '%audio%' OR LOWER(message) LIKE '%🎤%' OR LOWER(message) LIKE '%🎙%')
+                        """.trimIndent(), arrayOf(
+                            messageId.toString(),
+                            (timestampMs - 45_000L).toString(),
+                            (timestampMs + 45_000L).toString()
+                        )).use { if (it.moveToFirst()) it.getInt(0) else 0 }
+
+                        if (otherAudioCount > 0) {
+                            Log.w(TAG, "Ambiguous unassigned audio detected ($otherAudioCount other chats). Aborting link to prevent cross-chat misattribution.")
+                            continue
+                        }
+                    }
+
                     val cleanBase = file.nameWithoutExtension.lowercase()
                     val isMatch = when (mType) {
-                        "image" -> lowerMsg.contains("photo") || lowerMsg.contains("📷") || lowerMsg.contains("🖼") || lowerMsg.contains("image") || lowerMsg.contains("sticker") || lowerMsg.contains("gif") || lowerMsg.contains("👾") || lowerMsg.contains("💟") || (!requireExplicitMediaKeyword && lowerMsg.isEmpty())
-                        "video" -> lowerMsg.contains("video") || lowerMsg.contains("🎥") || lowerMsg.contains("📹") || lowerMsg.contains("🎞") || lowerMsg.contains("gif") || (!requireExplicitMediaKeyword && lowerMsg.isEmpty())
-                        "audio" -> lowerMsg.contains("voice") || lowerMsg.contains("audio") || lowerMsg.contains("🎙") || lowerMsg.contains("🎤") || lowerMsg.contains("🎵") || (!requireExplicitMediaKeyword && lowerMsg.isEmpty())
-                        "document" -> lowerMsg.contains("document") || lowerMsg.contains("📄") || lowerMsg.contains("📎") || lowerMsg.contains("file") || lowerMsg.contains(".pdf") || lowerMsg.contains(".doc") || lowerMsg.contains(".csv") || lowerMsg.contains(".xls") || lowerMsg.contains(".txt") || lowerMsg.contains(".ppt") || lowerMsg.contains(".zip") || (cleanBase.length >= 3 && lowerMsg.contains(cleanBase)) || (!requireExplicitMediaKeyword && lowerMsg.isEmpty())
+                        "image" -> !requireExplicitMediaKeyword || isMediaPlaceholderText(lowerMsg) || (cleanBase.length >= 3 && lowerMsg.contains(cleanBase))
+                        "video" -> !requireExplicitMediaKeyword || isMediaPlaceholderText(lowerMsg) || (cleanBase.length >= 3 && lowerMsg.contains(cleanBase))
+                        "audio" -> isMediaPlaceholderText(lowerMsg) || (!requireExplicitMediaKeyword && lowerMsg.isEmpty())
+                        "document" -> !requireExplicitMediaKeyword || isMediaPlaceholderText(lowerMsg) || (cleanBase.length >= 3 && lowerMsg.contains(cleanBase))
                         else -> false
                     }
 
@@ -834,11 +1080,27 @@ class NativeDatabaseHelper private constructor(context: Context) {
 
             val now = System.currentTimeMillis()
             val effectiveTime = if (fileTimestamp > 1_000_000_000_000L) fileTimestamp else now
-            // Audio files (voice notes) arrive within seconds. Restrict audio to ±60s!
-            val windowStart = if (mediaType == "audio") maxOf(minOf(effectiveTime, now) - 60_000L, 0L)
-                              else minOf(effectiveTime, now) - 24 * 60 * 60 * 1000L
-            val windowEnd = if (mediaType == "audio") minOf(effectiveTime, now) + 60_000L
-                            else maxOf(effectiveTime, now) + 60_000L // 1 min buffer
+            // Audio files (voice notes): when targetSender is confirmed, allow up to 3 minutes window
+            // (sender-scoped, 100% safe against cross-user contamination).
+            // When targetSender is null (senderless), enforce tight 45s window + single candidate uniqueness!
+            val windowStart = if (mediaType == "audio") {
+                if (!targetSender.isNullOrBlank()) {
+                    maxOf(effectiveTime - 180_000L, 0L)
+                } else {
+                    maxOf(minOf(effectiveTime, now) - 45_000L, 0L)
+                }
+            } else {
+                minOf(effectiveTime, now) - 24 * 60 * 60 * 1000L
+            }
+            val windowEnd = if (mediaType == "audio") {
+                if (!targetSender.isNullOrBlank()) {
+                    effectiveTime + 120_000L
+                } else {
+                    minOf(effectiveTime, now) + 45_000L
+                }
+            } else {
+                maxOf(effectiveTime, now) + 60_000L // 1 min buffer
+            }
 
             val cleanBase = fileName.substringBeforeLast('.').lowercase()
             val cleanBaseNorm = cleanBase.replace('_', ' ')
@@ -854,9 +1116,13 @@ class NativeDatabaseHelper private constructor(context: Context) {
                 // Prevent "Missed voice call" (contains "voice") from matching audio media.
                 // This check is redundant with shouldProcessNotification but acts as a
                 // safety net in case a call text somehow reaches the database.
+                if (msgText.startsWith("reacted ") || msgText.startsWith("reacted to ")) return false
                 if (msgText.contains("call") && (msgText.contains("missed") || msgText.contains("incoming") || 
                     msgText.contains("ongoing") || msgText.contains("ringing") || msgText.contains("ended"))) return false
                 if (msgText == "voice call" || msgText == "video call" || msgText == "group call") return false
+                if (msgText.contains("logged in to whatsapp") || msgText.contains("log in to whatsapp") ||
+                    msgText.contains("checking for new messages") || msgText.contains("backup in progress") ||
+                    msgText.contains("whatsapp web is currently active")) return false
                 
                 val matchesBase = cleanBase.length >= 3 && (
                     msgText.contains(cleanBase) ||
@@ -864,16 +1130,30 @@ class NativeDatabaseHelper private constructor(context: Context) {
                     msgText.contains(fileName.lowercase())
                 )
                 return when (mediaType) {
-                    "image" -> msgText.contains("photo") || msgText.contains("📷") || msgText.contains("🖼") || msgText.contains("image") || msgText.contains("sticker") || msgText.contains("gif") || msgText.contains("👾") || msgText.contains("💟") || (fileName.startsWith("STK-") && msgText.contains("sticker")) || matchesBase
-                    "video" -> msgText.contains("video") || msgText.contains("🎥") || msgText.contains("📹") || msgText.contains("🎞") || msgText.contains("gif") || matchesBase
-                    "audio" -> msgText.contains("voice") || msgText.contains("audio") || msgText.contains("🎙") || msgText.contains("🎤") || msgText.contains("🎵") || matchesBase
-                    "document" -> msgText.contains("document") || msgText.contains("📄") || msgText.contains("📎") || msgText.contains("file") || msgText.contains(".pdf") || msgText.contains(".doc") || msgText.contains(".csv") || msgText.contains(".xls") || msgText.contains(".txt") || msgText.contains(".ppt") || msgText.contains(".zip") || matchesBase
+                    "image" -> {
+                        val isSticker = fileName.startsWith("STK-", ignoreCase = true) || fileName.endsWith(".webp", ignoreCase = true)
+                        if (isSticker) {
+                            msgText.isEmpty() || msgText == "sticker" || msgText == "gif" || msgText.contains("👾") || msgText.contains("💟") || msgText.startsWith("stk-")
+                        } else {
+                            // Images commonly have text captions (and DB messages may be encrypted).
+                            // When targetSender is confirmed, any unlinked message from that sender is an eligible candidate!
+                            !targetSender.isNullOrBlank() || isMediaPlaceholderText(msgText) || matchesBase
+                        }
+                    }
+                    "video" -> !targetSender.isNullOrBlank() || isMediaPlaceholderText(msgText) || matchesBase
+                    "audio" -> isMediaPlaceholderText(msgText)
+                    "document" -> isMediaPlaceholderText(msgText) || matchesBase
                     else -> false
                 }
             }
 
             var matchedMessageId: Long? = null
             var matchedSenderName: String = ""
+
+            val mediaPathCond = if (mediaType == "video") 
+                "(mediaPath IS NULL OR mediaPath = '' OR mediaPath LIKE '%.jpg' OR mediaPath LIKE '%.jpeg' OR mediaPath LIKE '%.png')" 
+            else 
+                "(mediaPath IS NULL OR mediaPath = '')"
 
             // Zero-touch fallback: if no sender context exists yet, only auto-link when there
             // is exactly one valid message candidate in the time window. Multiple matches remain
@@ -888,7 +1168,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
                     SELECT id, message, timestamp, sender, senderName
                     FROM messages
                     WHERE (app LIKE '%whatsapp%')
-                      AND (mediaPath IS NULL OR mediaPath = '')
+                      AND $mediaPathCond
                       AND timestamp BETWEEN $windowStart AND $windowEnd
                       AND (message NOT LIKE 'Reacted %' AND message NOT LIKE 'Reacted to %')
                     ORDER BY ABS(timestamp - $effectiveTime) ASC
@@ -926,7 +1206,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
                     FROM messages 
                     WHERE (app LIKE '%whatsapp%') 
                       AND (sender = ? COLLATE NOCASE OR senderName = ? COLLATE NOCASE OR LOWER(TRIM(sender)) = LOWER(?) OR LOWER(TRIM(senderName)) = LOWER(?))
-                      AND (mediaPath IS NULL OR mediaPath = '') 
+                      AND $mediaPathCond 
                       AND timestamp BETWEEN $windowStart AND $windowEnd
                       AND (message NOT LIKE 'Reacted %' AND message NOT LIKE 'Reacted to %')
                     ORDER BY ABS(timestamp - $effectiveTime) ASC
@@ -1053,6 +1333,62 @@ class NativeDatabaseHelper private constructor(context: Context) {
     }
 
     /**
+     * Link an asynchronously extracted media file directly to a message by sender/title and timestamp.
+     */
+    fun linkExtractedMediaToMessage(title: String, timestamp: Long, mediaPath: String, mediaType: String): Boolean {
+        try {
+            val database = safeDb()
+            database.beginTransaction()
+            try {
+                // Find matching message without mediaPath
+                var targetId: Long? = null
+                val cursor = database.rawQuery(
+                    """
+                    SELECT id FROM messages 
+                    WHERE (senderName = ? OR sender = ? OR sender LIKE ?) 
+                      AND (mediaPath IS NULL OR mediaPath = '')
+                      AND ABS(timestamp - ?) <= 60000
+                      AND message NOT LIKE 'Reacted %' AND message NOT LIKE 'Reacted to %'
+                    ORDER BY ABS(timestamp - ?) ASC LIMIT 1
+                    """.trimIndent(),
+                    arrayOf(title, title, "%$title%", timestamp.toString(), timestamp.toString())
+                )
+                cursor.use {
+                    if (it.moveToFirst()) {
+                        targetId = it.getLong(0)
+                    }
+                }
+
+                if (targetId != null) {
+                    val msgValues = ContentValues().apply {
+                        put("mediaPath", mediaPath)
+                    }
+                    database.update("messages", msgValues, "id = ?", arrayOf(targetId.toString()))
+                    val attachValues = ContentValues().apply {
+                        put("notification_id", targetId)
+                        put("media_type", mediaType)
+                        put("file_path", mediaPath)
+                        put("original_uri", mediaPath)
+                        put("sender_name", title)
+                        put("captured_at", timestamp)
+                        put("matched", 1)
+                    }
+                    database.insertWithOnConflict("media_attachments", null, attachValues, SQLiteDatabase.CONFLICT_REPLACE)
+                    database.setTransactionSuccessful()
+                    Log.i(TAG, "✓ linkExtractedMediaToMessage linked $mediaPath to msg #$targetId ($title)")
+                    MainActivity.notifyFlutterMessageOrMediaUpdated()
+                    return true
+                }
+            } finally {
+                database.endTransaction()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "linkExtractedMediaToMessage error: ${e.message}")
+        }
+        return false
+    }
+
+    /**
      * Rolling cache cleanup for media_attachments:
      * - Removes unmatched temporary media files older than maxAgeMs (default: 7 days)
      * - Preserves 100% of messages and media linked to messages (mediaPath)
@@ -1115,5 +1451,87 @@ class NativeDatabaseHelper private constructor(context: Context) {
             Log.w(TAG, "pruneOrphanedMedia error: ${e.message}")
         }
         return prunedCount
+    }
+
+    /**
+     * Retention sweep: every captured WhatsApp media file (matched or not) is kept for
+     * [maxAgeMs] (default 15 days) and then removed from disk and from the DB.
+     * Media that belongs to a message the user explicitly saved (isSaved = 1) is never touched.
+     * Also removes stray files on disk that have no DB row but are older than the cutoff.
+     */
+    fun pruneExpiredMedia(maxAgeMs: Long = 15L * 24 * 60 * 60 * 1000L): Int {
+        var removed = 0
+        try {
+            val database = safeDb()
+            val cutoff = System.currentTimeMillis() - maxAgeMs
+
+            // Paths protected because the user saved the owning message
+            val protectedPaths = HashSet<String>()
+            database.rawQuery(
+                "SELECT mediaPath FROM messages WHERE isSaved = 1 AND mediaPath IS NOT NULL AND mediaPath != ''",
+                null
+            ).use { c -> while (c.moveToNext()) c.getString(0)?.let { protectedPaths.add(it) } }
+
+            // 1. DB-tracked attachments older than cutoff
+            val expired = mutableListOf<Pair<Long, String>>()
+            database.rawQuery(
+                "SELECT id, file_path FROM media_attachments WHERE captured_at < $cutoff", null
+            ).use { c ->
+                while (c.moveToNext()) {
+                    val path = c.getString(1) ?: continue
+                    expired.add(Pair(c.getLong(0), path))
+                }
+            }
+            for ((id, path) in expired) {
+                if (path in protectedPaths) continue
+                try { File(path).takeIf { it.exists() }?.delete() } catch (_: Exception) {}
+                database.execSQL("UPDATE messages SET mediaPath = NULL WHERE mediaPath = ? AND isSaved = 0", arrayOf(path))
+                database.execSQL("DELETE FROM media_attachments WHERE id = ?", arrayOf(id.toString()))
+                removed++
+            }
+
+            // 2. Stray files on disk (no DB row / lost row) older than cutoff
+            for (dirName in listOf("media_attachments", "media")) {
+                val dir = File(appContext.filesDir, dirName)
+                if (!dir.isDirectory) continue
+                dir.listFiles()?.forEach { f ->
+                    if (f.isFile && f.lastModified() < cutoff && f.absolutePath !in protectedPaths) {
+                        if (f.delete()) removed++
+                    }
+                }
+            }
+            Log.i(TAG, "pruneExpiredMedia: removed $removed expired media item(s)")
+        } catch (e: Exception) {
+            Log.w(TAG, "pruneExpiredMedia error: ${e.message}")
+        }
+        return removed
+    }
+
+    /**
+     * One-time cleanup: the old LargeIcon fallback saved the sender/group profile picture
+     * as if it were the message's media (files named *_notif_media_*). Unlink those from
+     * messages and delete the files.
+     */
+    fun purgeAvatarMisusedMedia(): Int {
+        var count = 0
+        try {
+            val database = safeDb()
+            val paths = mutableListOf<String>()
+            database.rawQuery(
+                "SELECT DISTINCT mediaPath FROM messages WHERE mediaPath LIKE '%_notif_media_%'", null
+            ).use { c -> while (c.moveToNext()) c.getString(0)?.let { paths.add(it) } }
+            for (p in paths) {
+                database.execSQL("UPDATE messages SET mediaPath = NULL WHERE mediaPath = ?", arrayOf(p))
+                try { File(p).takeIf { it.exists() }?.delete() } catch (_: Exception) {}
+                count++
+            }
+            File(appContext.filesDir, "media").listFiles()?.forEach { f ->
+                if (f.isFile && f.name.contains("_notif_media_") && f.delete()) count++
+            }
+            Log.i(TAG, "purgeAvatarMisusedMedia: cleaned $count item(s)")
+        } catch (e: Exception) {
+            Log.w(TAG, "purgeAvatarMisusedMedia error: ${e.message}")
+        }
+        return count
     }
 }

@@ -345,6 +345,9 @@ class _HomeScreenState extends State<HomeScreen>
     }
 
     try {
+      DatabaseHelper.instance.cleanupCorruptedMediaLinks().catchError((e) {
+        debugPrint('[HomeScreen] cleanupCorruptedMediaLinks error: $e');
+      });
       // First, refresh notifications to process any pending ones (with timeout)
       await NotificationService.instance.refreshNotifications();
     } catch (e) {
@@ -1273,9 +1276,17 @@ class _HomeScreenState extends State<HomeScreen>
 
   String _formatConversationLastMessage(String lastMessage, String? lastMediaPath) {
     final lower = lastMessage.trim().toLowerCase();
+
+    // 1. Reactions: NEVER overwrite reaction text with media placeholders
+    if (lower.startsWith('reacted ') || lower.startsWith('reacted to ')) {
+      return lastMessage;
+    }
+
     final ext = (lastMediaPath != null && lastMediaPath.contains('.'))
         ? lastMediaPath.toLowerCase().split('.').last
         : '';
+
+    // 2. Calls: NEVER overwrite call notifications
     final isCall = (lower.contains('call') &&
             (lower.contains('missed') ||
                 lower.contains('incoming') ||
@@ -1287,38 +1298,55 @@ class _HomeScreenState extends State<HomeScreen>
         lower == 'group call';
     if (isCall) return lastMessage;
 
-    final isAudio = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext) ||
-        lower.contains('voice') ||
-        lower.contains('audio') ||
-        lower.contains('🎤') ||
-        lower.contains('🎙') ||
-        lower.contains('🎵') ||
-        lower.startsWith('ptt-');
+    // 3. Audio / Voice message:
+    // Only format as audio if it is strictly an audio placeholder or an audio file without custom text
+    final isAudioExt = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext);
+    final isAudioPlaceholder = lower.startsWith('🎤') ||
+        lower.startsWith('🎙') ||
+        lower.startsWith('ptt-') ||
+        lower.startsWith('aud-') ||
+        lower == 'voice message' ||
+        lower == 'voice note' ||
+        lower == 'voice message omitted' ||
+        lower == 'audio message' ||
+        lower == 'audio omitted' ||
+        RegExp(r'^[🎤🎙]\s*(?:voice|audio)?\s*(?:message|note)?(?:\s*\(\d+:\d+\))?$').hasMatch(lower) ||
+        RegExp(r'^voice\s+(?:message|note)(?:\s*\(\d+:\d+\))?$').hasMatch(lower) ||
+        RegExp(r'^(?:voice|audio)\s*\(\d+:\d+\)$').hasMatch(lower);
 
-    if (isAudio) {
+    if (isAudioPlaceholder || (isAudioExt && (lastMessage.trim().isEmpty || isAudioPlaceholder))) {
       final durationMatch = RegExp(r'\(\d+:\d+\)').firstMatch(lastMessage);
       if (durationMatch != null) {
         if (lastMessage.trim().startsWith('🎤')) return lastMessage.trim();
         return '🎤 Voice message ${durationMatch.group(0)}';
       }
-      return '🎤 Voice message (0:02)';
+      return lastMessage.trim().startsWith('🎤') ? lastMessage.trim() : '🎤 Voice message';
     }
 
-    final isVideo = ['mp4', 'mov', 'avi', 'mkv', '3gp'].contains(ext) ||
-        lower.contains('video') ||
-        lower.contains('📹') ||
-        lower.contains('🎥');
+    // 4. Video:
+    // Only format as video if it is strictly a video placeholder or a video file without custom text
+    final isVideoExt = ['mp4', 'mov', 'avi', 'mkv', '3gp'].contains(ext);
+    final isVideoPlaceholder = lower.startsWith('🎥') ||
+        lower.startsWith('📹') ||
+        lower.startsWith('vid-') ||
+        lower == 'video message' ||
+        lower == 'video omitted' ||
+        RegExp(r'^[🎥📹]\s*video(?:\s*\(\d+:\d+\))?$').hasMatch(lower) ||
+        RegExp(r'^video\s*\(\d+:\d+\)$').hasMatch(lower);
 
-    if (isVideo) {
+    if (isVideoPlaceholder || (isVideoExt && (lastMessage.trim().isEmpty || isVideoPlaceholder))) {
       final durationMatch = RegExp(r'\(\d+:\d+\)').firstMatch(lastMessage);
       if (durationMatch != null) {
-        if (lastMessage.trim().startsWith('🎤')) return lastMessage.trim();
-        return '🎤 Video ${durationMatch.group(0)}';
+        if (lastMessage.trim().startsWith('🎥') || lastMessage.trim().startsWith('📹')) return lastMessage.trim();
+        return '🎥 Video ${durationMatch.group(0)}';
       }
-      return '🎤 Video (0:05)';
+      return (lastMessage.trim().startsWith('🎥') || lastMessage.trim().startsWith('📹'))
+          ? lastMessage.trim()
+          : '🎥 Video';
     }
 
-    final isDoc = [
+    // 5. Document:
+    final isDocExt = [
       'pdf',
       'doc',
       'docx',
@@ -1330,22 +1358,16 @@ class _HomeScreenState extends State<HomeScreen>
       'pptx',
       'zip',
       'rar',
-    ].contains(ext) ||
-        lower.startsWith('📄') ||
-        lower.startsWith('📎') ||
-        lower.contains('.pdf') ||
-        lower.contains('.doc') ||
-        lower.contains('.docx') ||
-        lower.contains('.csv') ||
-        lower.contains('.xls') ||
-        lower.contains('.xlsx') ||
-        lower.contains('.txt') ||
-        lower.contains('.ppt') ||
-        lower.contains('.zip') ||
-        lower.contains('document') ||
-        lower.contains('file');
+      'apk',
+    ].contains(ext);
 
-    if (isDoc) {
+    final isDocPlaceholder = lower.startsWith('📄') ||
+        lower.startsWith('📎') ||
+        lower.startsWith('doc-') ||
+        lower == 'document omitted' ||
+        RegExp(r'\.(pdf|docx?|xlsx?|pptx?|txt|zip|rar|csv)$').hasMatch(lower);
+
+    if (isDocPlaceholder || (isDocExt && (lastMessage.trim().isEmpty || isDocPlaceholder))) {
       final fileName = (lastMediaPath != null && lastMediaPath.isNotEmpty)
           ? lastMediaPath.split(Platform.pathSeparator).last
           : '';
@@ -1364,7 +1386,70 @@ class _HomeScreenState extends State<HomeScreen>
       return 'Document';
     }
 
+    // 6. Photo / Sticker / GIF:
+    final isImageExt = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'].contains(ext);
+    final strippedImg = lower.replaceFirst(RegExp(r'^[📷🖼]\s*'), '').trim();
+    final hasImgEmoji = strippedImg != lower;
+    final isPureImageLabel = lower == 'photo' ||
+        lower == 'image' ||
+        lower == 'sticker' ||
+        lower == 'gif' ||
+        lower == 'photo omitted' ||
+        lower == 'image omitted' ||
+        lower == 'sticker omitted' ||
+        lower.startsWith('img-') ||
+        lower.startsWith('stk-');
+
+    if (hasImgEmoji) {
+      if (strippedImg.isEmpty || strippedImg == 'photo' || strippedImg == 'image') {
+        return '📷 Photo';
+      }
+      if (strippedImg == 'sticker') return 'Sticker';
+      if (strippedImg == 'gif') return 'GIF';
+      // Real caption following the 📷 emoji! Preserve it with the icon!
+      return '📷 ${lastMessage.replaceFirst(RegExp(r'^[📷🖼]\s*'), '').trim()}';
+    }
+
+    if (isPureImageLabel) {
+      if (lower.contains('sticker') || lower.startsWith('stk-')) return 'Sticker';
+      if (lower.contains('gif')) return 'GIF';
+      return '📷 Photo';
+    }
+
+    if (isImageExt && lastMessage.trim().isEmpty) {
+      return '📷 Photo';
+    }
+
+    // Default: return the real message text!
     return lastMessage;
+  }
+
+  bool _isGenericPlaceholder(String text) {
+    final lower = text.trim().toLowerCase();
+    if (lower.startsWith('reacted ') || lower.startsWith('reacted to ')) return false;
+    const placeholders = {
+      'photo', 'image', 'video message', 'voice message', 'voice note',
+      'sticker', 'gif', 'photo omitted', 'video omitted', 'audio omitted',
+      'voice message omitted', 'sticker omitted', 'document omitted',
+      'sent a photo', 'sent a video', 'sent a picture', 'sent an audio',
+      'sent a voice message', 'sent a document', 'sent a sticker', 'sent a gif'
+    };
+    if (placeholders.contains(lower)) return true;
+
+    // Check emoji prefixes
+    final stripped = lower.replaceFirst(RegExp(r'^[📷📹🎥🎤🎙📄📎]\s*'), '').trim();
+    if (stripped != lower) {
+      if (stripped.isEmpty || placeholders.contains(stripped)) return true;
+      if (RegExp(r'^(?:voice|audio)?\s*(?:message|note)?(?:\s*\(\d+:\d+\))?$').hasMatch(stripped)) return true;
+      if (RegExp(r'^video(?:\s*\(\d+:\d+\))?$').hasMatch(stripped)) return true;
+      return false; // Contains a real user caption!
+    }
+
+    if (lower.startsWith('ptt-') || lower.startsWith('aud-') ||
+        lower.startsWith('vid-') || lower.startsWith('doc-') || lower.startsWith('stk-')) {
+      return true;
+    }
+    return false;
   }
 
   Widget _buildConversationCard(Map<String, dynamic> conversation) {
@@ -1390,7 +1475,7 @@ class _HomeScreenState extends State<HomeScreen>
         lastMediaPath.isNotEmpty &&
         File(lastMediaPath).existsSync();
 
-    final displayMessage = hasMediaFile
+    final displayMessage = (hasMediaFile && lastMessage.trim().isNotEmpty && !_isGenericPlaceholder(lastMessage))
         ? lastMessage
         : _formatConversationLastMessage(lastMessage, lastMediaPath);
 

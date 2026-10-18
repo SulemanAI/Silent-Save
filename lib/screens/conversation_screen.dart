@@ -2200,70 +2200,104 @@ class _ConversationScreenState extends State<ConversationScreen>
   }
 
   bool _isAudioMessage(MessageModel message, [String? mediaPath]) {
-    if (mediaPath != null && mediaPath.contains('.')) {
-      final ext = mediaPath.toLowerCase().split('.').last;
-      if (['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext)) {
-        return true;
-      }
-    }
     final lower = message.message.trim().toLowerCase();
+    // 1. Reactions: NEVER treat reactions as audio messages
+    if (lower.startsWith('reacted ') || lower.startsWith('reacted to ')) {
+      return false;
+    }
+    // 2. Call notifications: NEVER treat calls as audio messages
     if (_isCallText(lower)) return false;
-    return lower.contains('voice') ||
-        lower.contains('audio') ||
-        lower.contains('🎤') ||
-        lower.contains('🎙') ||
-        lower.contains('🎵') ||
-        lower.startsWith('ptt-');
+
+    // Check media file extension
+    final path = mediaPath ?? message.mediaPath;
+    final ext = (path != null && path.contains('.'))
+        ? path.toLowerCase().split('.').last
+        : '';
+    final isAudioExt = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'aac'].contains(ext);
+
+    // Audio placeholders: WhatsApp notifications for audio/voice notes
+    final isAudioPlaceholder = lower.startsWith('🎤') ||
+        lower.startsWith('🎙') ||
+        lower.startsWith('ptt-') ||
+        lower.startsWith('aud-') ||
+        lower == 'voice message' ||
+        lower == 'voice note' ||
+        lower == 'voice message omitted' ||
+        lower == 'audio message' ||
+        lower == 'audio omitted' ||
+        RegExp(r'^[🎤🎙]\s*(?:voice|audio)?\s*(?:message|note)?(?:\s*\(\d+:\d+\))?$').hasMatch(lower) ||
+        RegExp(r'^voice\s+(?:message|note)(?:\s*\(\d+:\d+\))?$').hasMatch(lower) ||
+        RegExp(r'^(?:voice|audio)\s*\(\d+:\d+\)$').hasMatch(lower);
+
+    // Only return true if it is an explicit audio placeholder, or if it is an audio file and message is empty or placeholder
+    return isAudioPlaceholder || (isAudioExt && (lower.isEmpty || isAudioPlaceholder));
   }
 
   bool _isVideoMessage(MessageModel message, [String? mediaPath]) {
-    if (mediaPath != null && mediaPath.contains('.')) {
-      final ext = mediaPath.toLowerCase().split('.').last;
-      if (['mp4', 'mov', 'avi', 'mkv', '3gp'].contains(ext)) {
-        return true;
-      }
-    }
     final lower = message.message.trim().toLowerCase();
+    // 1. Reactions: NEVER treat reactions as video messages
+    if (lower.startsWith('reacted ') || lower.startsWith('reacted to ')) {
+      return false;
+    }
+    // 2. Call notifications: NEVER treat calls as video messages
     if (_isCallText(lower)) return false;
-    return lower.contains('video') ||
-        lower.contains('📹') ||
-        lower.contains('🎥');
+
+    // Check media file extension
+    final path = mediaPath ?? message.mediaPath;
+    final ext = (path != null && path.contains('.'))
+        ? path.toLowerCase().split('.').last
+        : '';
+    final isVideoExt = ['mp4', 'mov', 'avi', 'mkv', '3gp'].contains(ext);
+
+    // Video placeholders: WhatsApp notifications for videos
+    final isVideoPlaceholder = lower.startsWith('🎥') ||
+        lower.startsWith('📹') ||
+        lower.startsWith('vid-') ||
+        lower == 'video message' ||
+        lower == 'video omitted' ||
+        RegExp(r'^[🎥📹]\s*video(?:\s*\(\d+:\d+\))?$').hasMatch(lower) ||
+        RegExp(r'^video\s*\(\d+:\d+\)$').hasMatch(lower);
+
+    // Only return true if it is an explicit video placeholder, or if it is a video file and message is empty or placeholder
+    return isVideoPlaceholder || (isVideoExt && (lower.isEmpty || isVideoPlaceholder));
   }
 
   bool _isDocumentMessage(MessageModel message, [String? mediaPath]) {
-    if (mediaPath != null && mediaPath.contains('.')) {
-      final ext = mediaPath.toLowerCase().split('.').last;
-      if ([
-        'pdf',
-        'doc',
-        'docx',
-        'csv',
-        'xls',
-        'xlsx',
-        'txt',
-        'ppt',
-        'pptx',
-        'zip',
-        'rar',
-      ].contains(ext)) {
-        return true;
-      }
-    }
     final lower = message.message.trim().toLowerCase();
+    // 1. Reactions: NEVER treat reactions as document messages
+    if (lower.startsWith('reacted ') || lower.startsWith('reacted to ')) {
+      return false;
+    }
+    // 2. Call notifications
     if (_isCallText(lower)) return false;
-    return lower.startsWith('📄') ||
+
+    // Check media file extension
+    final path = mediaPath ?? message.mediaPath;
+    final ext = (path != null && path.contains('.'))
+        ? path.toLowerCase().split('.').last
+        : '';
+    final isDocExt = [
+      'pdf',
+      'doc',
+      'docx',
+      'csv',
+      'xls',
+      'xlsx',
+      'txt',
+      'ppt',
+      'pptx',
+      'zip',
+      'rar',
+      'apk',
+    ].contains(ext);
+
+    final isDocPlaceholder = lower.startsWith('📄') ||
         lower.startsWith('📎') ||
-        lower.contains('.pdf') ||
-        lower.contains('.doc') ||
-        lower.contains('.docx') ||
-        lower.contains('.csv') ||
-        lower.contains('.xls') ||
-        lower.contains('.xlsx') ||
-        lower.contains('.txt') ||
-        lower.contains('.ppt') ||
-        lower.contains('.zip') ||
-        lower.contains('document') ||
-        lower.contains('file');
+        lower.startsWith('doc-') ||
+        lower == 'document omitted' ||
+        RegExp(r'\.(pdf|docx?|xlsx?|pptx?|txt|zip|rar|csv)$').hasMatch(lower);
+
+    return isDocPlaceholder || (isDocExt && (lower.isEmpty || isDocPlaceholder));
   }
 
   String _formatVoiceNoteFallbackText(String rawMessage) {
@@ -2275,19 +2309,21 @@ class _ConversationScreenState extends State<ConversationScreen>
       }
       return '🎤 Voice message ${durationMatch.group(0)}';
     }
-    return '🎤 Voice message (0:02)';
+    return trimmed.startsWith('🎤') ? trimmed : '🎤 Voice message';
   }
 
   String _formatVideoFallbackText(String rawMessage) {
     final trimmed = rawMessage.trim();
     final durationMatch = RegExp(r'\(\d+:\d+\)').firstMatch(trimmed);
     if (durationMatch != null) {
-      if (trimmed.startsWith('🎤')) {
+      if (trimmed.startsWith('🎥') || trimmed.startsWith('📹')) {
         return trimmed;
       }
-      return '🎤 Video ${durationMatch.group(0)}';
+      return '🎥 Video ${durationMatch.group(0)}';
     }
-    return '🎤 Video (0:05)';
+    return (trimmed.startsWith('🎥') || trimmed.startsWith('📹'))
+        ? trimmed
+        : '🎥 Video';
   }
 
   String _formatDocumentFallbackText(String rawMessage, [String? mediaPath]) {
@@ -3013,6 +3049,11 @@ class _ConversationScreenState extends State<ConversationScreen>
   /// want to show a media placeholder instead of raw text.
   bool _isGenericMediaLabel(String text, [String? mediaPath]) {
     final lower = text.trim().toLowerCase();
+    // 0. Reactions: NEVER treat reactions as media labels
+    if (lower.startsWith('reacted ') || lower.startsWith('reacted to ')) {
+      return false;
+    }
+
     // Call notifications are NOT media labels
     if (lower.contains('call') &&
         (lower.contains('missed') ||
@@ -3046,25 +3087,28 @@ class _ConversationScreenState extends State<ConversationScreen>
       'document',
       'document omitted',
       'file',
+      'sent a photo',
+      'sent a video',
+      'sent a picture',
+      'sent an audio',
+      'sent a voice message',
+      'sent a document',
+      'sent a sticker',
+      'sent a gif',
     };
     if (labels.contains(lower)) return true;
 
-    // Emoji-prefixed labels WhatsApp uses in BigText
-    const emojiPrefixes = [
-      '📷',
-      '📹',
-      '🎤',
-      '🎵',
-      '🎞',
-      '🗺',
-      '📍',
-      '👤',
-      '🎥',
-      '🖼',
-      '🎙',
-    ];
-    for (final p in emojiPrefixes) {
-      if (lower.startsWith(p)) return true;
+    // Emoji-prefixed labels WhatsApp uses in BigText (e.g. "📷 Photo", "🎤 Voice message")
+    // If text starts with an emoji prefix, check what remains after stripping the emoji.
+    // If the stripped text is empty or a generic label, it IS a generic label.
+    // If there is other user text (e.g. "📷 Location: DHA SUFFA UNIVERSITY..."), it is a REAL CAPTION!
+    final strippedEmoji = lower.replaceFirst(RegExp(r'^[📷📹🎤🎵🎞🗺📍👤🎥🖼🎙]\s*'), '').trim();
+    if (strippedEmoji != lower) {
+      if (strippedEmoji.isEmpty || labels.contains(strippedEmoji)) return true;
+      // Duration tag like "voice message (0:02)"
+      if (RegExp(r'^(?:voice|audio)?\s*(?:message|note)?(?:\s*\(\d+:\d+\))?$').hasMatch(strippedEmoji)) return true;
+      if (RegExp(r'^video(?:\s*\(\d+:\d+\))?$').hasMatch(strippedEmoji)) return true;
+      return false; // Contains a real caption or user message text!
     }
 
     // Document file summary patterns like "📄 filename.pdf (1 page)" or "📄 Document"
@@ -3100,21 +3144,33 @@ class _ConversationScreenState extends State<ConversationScreen>
     if (colonIdx > 0 && colonIdx < lower.length - 1) {
       final afterColon = lower.substring(colonIdx + 1).trim();
       if (labels.contains(afterColon)) return true;
-      for (final p in emojiPrefixes) {
-        if (afterColon.startsWith(p)) return true;
+      final strippedAfterColon = afterColon.replaceFirst(RegExp(r'^[📷📹🎤🎵🎞🗺📍👤🎥🖼🎙]\s*'), '').trim();
+      if (strippedAfterColon != afterColon && (strippedAfterColon.isEmpty || labels.contains(strippedAfterColon))) {
+        return true;
       }
     }
 
     return false;
   }
 
-  /// Cleans redundant WhatsApp document prefixes from user captions
-  String _cleanDocumentCaption(String caption) {
+  /// Cleans redundant WhatsApp media emoji prefixes (e.g. "📷 ", "📄 ") from captions
+  String _cleanMediaCaption(String caption) {
     if (caption.startsWith('📄') || caption.startsWith('📎')) {
       final cleaned = caption.replaceFirst(RegExp(r'^[📄📎]\s*'), '').trim();
       if (cleaned.isNotEmpty) return cleaned;
     }
+    if (caption.startsWith('📷') || caption.startsWith('🖼')) {
+      final cleaned = caption.replaceFirst(RegExp(r'^[📷🖼]\s*'), '').trim();
+      if (cleaned.isNotEmpty && cleaned.toLowerCase() != 'photo' && cleaned.toLowerCase() != 'image') {
+        return cleaned;
+      }
+    }
     return caption;
+  }
+
+  /// Cleans redundant WhatsApp document prefixes from user captions
+  String _cleanDocumentCaption(String caption) {
+    return _cleanMediaCaption(caption);
   }
 
   _MediaTypeInfo _mediaTypeInfo(String rawLabel) {
@@ -3127,41 +3183,48 @@ class _ConversationScreenState extends State<ConversationScreen>
         label: isVideo ? 'Missed Video Call' : 'Missed Call',
       );
     }
-    if (lower.contains('voice') ||
-        lower.contains('audio') ||
-        lower.contains('🎤') ||
-        lower.contains('🎵') ||
-        lower.contains('🎙')) {
+    if (lower.startsWith('🎤') ||
+        lower.startsWith('🎙') ||
+        lower.startsWith('ptt-') ||
+        lower.startsWith('aud-') ||
+        lower == 'voice message' ||
+        lower == 'voice note' ||
+        lower == 'audio') {
       return _MediaTypeInfo(
         icon: Icons.mic_rounded,
         color: Colors.deepPurple.shade300,
         label: 'Voice Message',
       );
     }
-    if (lower.contains('video') ||
-        lower.contains('📹') ||
-        lower.contains('🎥')) {
+    if (lower.startsWith('🎥') ||
+        lower.startsWith('📹') ||
+        lower.startsWith('vid-') ||
+        lower == 'video' ||
+        lower == 'video message') {
       return _MediaTypeInfo(
         icon: Icons.videocam_rounded,
         color: Colors.blue.shade300,
         label: 'Video',
       );
     }
-    if (lower.contains('sticker') || lower.contains('gif')) {
+    if (lower.contains('sticker') || lower.contains('gif') || lower.startsWith('stk-')) {
       return _MediaTypeInfo(
         icon: Icons.emoji_emotions_rounded,
         color: Colors.amber.shade300,
         label: 'Sticker / GIF',
       );
     }
-    if (lower.contains('document') ||
-        lower.contains('file') ||
-        lower.contains('📄') ||
-        lower.contains('📎') ||
-        lower.contains('.pdf') ||
-        lower.contains('.doc') ||
-        lower.contains('.xls') ||
-        lower.contains('.csv')) {
+    if (lower.startsWith('📄') ||
+        lower.startsWith('📎') ||
+        lower.startsWith('doc-') ||
+        lower == 'document' ||
+        lower == 'file' ||
+        lower.endsWith('.pdf') ||
+        lower.endsWith('.doc') ||
+        lower.endsWith('.docx') ||
+        lower.endsWith('.xls') ||
+        lower.endsWith('.xlsx') ||
+        lower.endsWith('.csv')) {
       final isPdf = lower.contains('.pdf');
       return _MediaTypeInfo(
         icon: isPdf
@@ -3171,9 +3234,15 @@ class _ConversationScreenState extends State<ConversationScreen>
         label: isPdf ? 'PDF Document' : 'Document',
       );
     }
-    if (lower.contains('location') ||
-        lower.contains('🗺') ||
-        lower.contains('📍')) {
+    // Strict match for location sharing only — NEVER match sentences containing "location"
+    if (lower == 'location' ||
+        lower == 'live location' ||
+        lower == '📍 location' ||
+        lower == '🗺 live location' ||
+        lower == '🗺 location' ||
+        lower == '📍 live location' ||
+        lower == '📍' ||
+        lower == '🗺') {
       return _MediaTypeInfo(
         icon: Icons.location_on_rounded,
         color: Colors.red.shade300,

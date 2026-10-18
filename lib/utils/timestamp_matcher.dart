@@ -66,6 +66,7 @@ class TimestampMatcher {
     final cleanBaseNorm = cleanBase.replaceAll('_', ' ');
     final cleanBaseUnderscore = cleanBase.replaceAll(' ', '_');
 
+    final hasSender = targetSender != null && targetSender.trim().isNotEmpty;
     var targetCandidates = effectiveCandidates.where((candidate) {
       final msgText = (candidate['message'] as String? ?? '').toLowerCase().trim();
       if (msgText.startsWith('reacted ') || msgText.startsWith('reacted to ')) return false;
@@ -81,6 +82,11 @@ class TimestampMatcher {
       if (msgText == 'voice call' || msgText == 'video call' || msgText == 'group call') {
         return false;
       }
+      if (msgText.contains('logged in to whatsapp') || msgText.contains('log in to whatsapp') ||
+          msgText.contains('checking for new messages') || msgText.contains('backup in progress') ||
+          msgText.contains('whatsapp web is currently active')) {
+        return false;
+      }
 
       final matchesBase = cleanBase.length >= 3 && (
         msgText.contains(cleanBase) ||
@@ -89,19 +95,55 @@ class TimestampMatcher {
         (displayName.isNotEmpty && msgText.contains(displayName))
       );
       
-      if (mediaType == 'image' && (msgText.contains('photo') || msgText.contains('image') || msgText.contains('📷') || msgText.contains('🖼') || msgText.contains('sticker') || msgText.contains('gif') || msgText.contains('👾') || msgText.contains('💟') || displayName.startsWith('stk-') || matchesBase || msgText.isEmpty)) {
-        return true;
-      } else if (mediaType == 'video' && (msgText.contains('video') || msgText.contains('📹') || msgText.contains('🎥') || msgText.contains('🎞') || msgText.contains('gif') || matchesBase || msgText.isEmpty)) {
-        return true;
-      } else if (mediaType == 'audio' && (msgText.contains('audio') || msgText.contains('voice') || msgText.contains('🎤') || msgText.contains('🎵') || msgText.contains('🎙') || matchesBase || msgText.isEmpty)) {
-        return true;
-      } else if (mediaType == 'document') {
-        if (msgText.contains('document') || msgText.contains('📄') || msgText.contains('📎') || msgText.contains('file') ||
-            msgText.contains('.pdf') || msgText.contains('.doc') || msgText.contains('.csv') || msgText.contains('.xls') ||
-            msgText.contains('.txt') || msgText.contains('.ppt') || msgText.contains('.zip') ||
-            matchesBase || msgText.isEmpty) {
-          return true;
+      final isAudioPlaceholder = msgText.startsWith('🎤') ||
+          msgText.startsWith('🎙') ||
+          msgText.startsWith('ptt-') ||
+          msgText.startsWith('aud-') ||
+          msgText == 'voice message' ||
+          msgText == 'voice note' ||
+          msgText == 'voice message omitted' ||
+          msgText == 'audio message' ||
+          msgText == 'audio omitted' ||
+          RegExp(r'^[🎤🎙]\s*(?:voice|audio)?\s*(?:message|note)?(?:\s*\(\d+:\d+\))?$').hasMatch(msgText) ||
+          RegExp(r'^voice\s+(?:message|note)(?:\s*\(\d+:\d+\))?$').hasMatch(msgText) ||
+          RegExp(r'^(?:voice|audio)\s*\(\d+:\d+\)$').hasMatch(msgText);
+
+      final isVideoPlaceholder = msgText.startsWith('🎥') ||
+          msgText.startsWith('📹') ||
+          msgText.startsWith('vid-') ||
+          msgText == 'video message' ||
+          msgText == 'video omitted' ||
+          RegExp(r'^[🎥📹]\s*video(?:\s*\(\d+:\d+\))?$').hasMatch(msgText) ||
+          RegExp(r'^video\s*\(\d+:\d+\)$').hasMatch(msgText);
+
+      final isDocPlaceholder = msgText.startsWith('📄') ||
+          msgText.startsWith('📎') ||
+          msgText.startsWith('doc-') ||
+          msgText == 'document omitted' ||
+          RegExp(r'\.(pdf|docx?|xlsx?|pptx?|txt|zip|rar|csv)$').hasMatch(msgText);
+
+      final isImagePlaceholder = msgText.startsWith('📷') ||
+          msgText.startsWith('🖼') ||
+          msgText.startsWith('img-') ||
+          msgText.startsWith('stk-') ||
+          msgText == 'photo' ||
+          msgText == 'image' ||
+          msgText == 'sticker' ||
+          msgText == 'gif';
+
+      if (mediaType == 'image') {
+        final isSticker = displayName.startsWith('stk-') || displayName.endsWith('.webp');
+        if (isSticker) {
+          return msgText.isEmpty || msgText == 'sticker' || msgText == 'gif' || msgText.contains('👾') || msgText.contains('💟') || msgText.startsWith('stk-');
         }
+        // Photos commonly have captions! When sender is confirmed, any unlinked message from that sender is eligible.
+        return hasSender || isImagePlaceholder || matchesBase || msgText.isEmpty;
+      } else if (mediaType == 'video') {
+        return hasSender || isVideoPlaceholder || matchesBase || msgText.isEmpty;
+      } else if (mediaType == 'audio') {
+        return isAudioPlaceholder || msgText.isEmpty;
+      } else if (mediaType == 'document') {
+        return isDocPlaceholder || matchesBase || msgText.isEmpty;
       }
       return false;
     }).toList();

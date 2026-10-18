@@ -12,9 +12,12 @@ class CleanupWorker(context: Context, params: WorkerParameters) : Worker(context
             // Clean up 24-hour trash files from captures
             SilentCaptureService.cleanupTrash(applicationContext)
             
-            // Rolling cleanup of unlinked media attachments older than 7 days
+            // Rolling cleanup of unlinked media attachments older than 7 days,
+            // then 15-day retention for ALL captured media (except user-saved messages)
             try {
-                NativeDatabaseHelper.getInstance(applicationContext).pruneOrphanedMedia()
+                val db = NativeDatabaseHelper.getInstance(applicationContext)
+                db.pruneOrphanedMedia()
+                db.pruneExpiredMedia()
             } catch (e: Exception) {
                 android.util.Log.w("CleanupWorker", "Media prune error: ${e.message}")
             }

@@ -11,6 +11,13 @@ class DatabaseHelper {
   static Database? _database;
   final EncryptionService _encryptionService = EncryptionService.instance;
 
+  // Guard: prevent cleanupCorruptedMediaLinks from running concurrently.
+  // The cleanup holds a multi-UPDATE transaction and if called simultaneously
+  // from startup + HomeScreen + native service it causes DB lock errors.
+  bool _cleanupRunning = false;
+  DateTime? _lastCleanupRun;
+  static const _cleanupMinInterval = Duration(minutes: 5);
+
   DatabaseHelper._init();
 
   Future<Database> get database async {
@@ -27,8 +34,17 @@ class DatabaseHelper {
       path,
       version: 9, // v9: added permanent saved-message state
       onConfigure: (db) async {
+        // WAL must be set first — if sqflite reconnects and tries to switch to
+        // TRUNCATE while the native side holds a WAL write lock, it will fail
+        // with "database is locked". Setting it here prevents sqflite from
+        // defaulting to TRUNCATE mode on reconnect.
         await db.rawQuery('PRAGMA journal_mode = WAL;');
-        await db.rawQuery('PRAGMA busy_timeout = 8000;');
+        // Increase timeout so concurrent native writes don't immediately abort.
+        await db.rawQuery('PRAGMA busy_timeout = 10000;');
+        // NORMAL is safe with WAL: reduces fsync pressure during burst writes.
+        await db.rawQuery('PRAGMA synchronous = NORMAL;');
+        // Auto-checkpoint every 200 pages to keep WAL file from growing unbounded.
+        await db.rawQuery('PRAGMA wal_autocheckpoint = 200;');
       },
       onCreate: _createDB,
       onUpgrade: _onUpgrade,
@@ -37,7 +53,10 @@ class DatabaseHelper {
     // Safety net: ensure avatarPath column exists regardless of migration state.
     // This handles edge cases where the DB version was bumped but the ALTER failed.
     await _ensureColumns(db);
-    await cleanupCorruptedMediaLinks(db);
+    // Do NOT call cleanupCorruptedMediaLinks here — the native NativeDatabaseHelper
+    // also runs it on every service start. Running it during DB init while the
+    // native side is actively writing causes immediate DB lock errors.
+    // The cleanup is called lazily from HomeScreen with the run-once guard.
 
     return db;
   }
@@ -249,7 +268,23 @@ class DatabaseHelper {
     );
 
     if (duplicateCheck.isNotEmpty) {
-      debugPrint('[DatabaseHelper] Duplicate (±2s window), skipping');
+      final existing = duplicateCheck.first;
+      final existingMedia = existing['mediaPath'] as String?;
+      if ((existingMedia == null || existingMedia.isEmpty) &&
+          message.mediaPath != null &&
+          message.mediaPath!.isNotEmpty) {
+        await db.update(
+          'messages',
+          {'mediaPath': message.mediaPath},
+          where: 'id = ?',
+          whereArgs: [existing['id']],
+        );
+        debugPrint(
+          '[DatabaseHelper] Updated mediaPath for duplicate msg #${existing['id']} -> ${message.mediaPath}',
+        );
+      } else {
+        debugPrint('[DatabaseHelper] Duplicate (±2s window), skipping');
+      }
       return -1;
     }
 
@@ -307,9 +342,25 @@ class DatabaseHelper {
           );
 
           if (duplicateCheck.isNotEmpty) {
-            debugPrint(
-              '[DatabaseHelper] Dedup skip: "${message.sender}" @${message.timestamp.millisecondsSinceEpoch}ms',
-            );
+            final existing = duplicateCheck.first;
+            final existingMedia = existing['mediaPath'] as String?;
+            if ((existingMedia == null || existingMedia.isEmpty) &&
+                message.mediaPath != null &&
+                message.mediaPath!.isNotEmpty) {
+              await txn.update(
+                'messages',
+                {'mediaPath': message.mediaPath},
+                where: 'id = ?',
+                whereArgs: [existing['id']],
+              );
+              debugPrint(
+                '[DatabaseHelper] Updated mediaPath for deduped msg #${existing['id']} -> ${message.mediaPath}',
+              );
+            } else {
+              debugPrint(
+                '[DatabaseHelper] Dedup skip: "${message.sender}" @${message.timestamp.millisecondsSinceEpoch}ms',
+              );
+            }
             continue;
           }
 
@@ -658,6 +709,13 @@ class DatabaseHelper {
         (SELECT avatarPath FROM messages m5 WHERE m5.sender = m.sender AND m5.app = m.app AND m5.avatarPath IS NOT NULL AND m5.avatarPath != '' ORDER BY m5.timestamp DESC LIMIT 1) as latestAvatarPath
       FROM messages m
       WHERE m.isDeleted = 0
+        AND LOWER(m.sender) NOT IN ('whatsapp', 'whatsapp web', 'whatsapp business', 'recent whatsapp login', 'recent login')
+        AND LOWER(m.sender) NOT LIKE '%whatsapp login%'
+        AND LOWER(m.sender) NOT LIKE '%recent%login%'
+        AND LOWER(m.message) NOT LIKE '%logged in to whatsapp%'
+        AND LOWER(m.message) NOT LIKE '%log in to whatsapp%'
+        AND LOWER(m.message) NOT LIKE '%checking for new messages%'
+        AND LOWER(m.message) NOT LIKE '%whatsapp web is currently active%'
       AND m.timestamp = (
         SELECT MAX(timestamp) FROM messages m4 
         WHERE m4.sender = m.sender AND m4.app = m.app AND m4.isDeleted = 0
@@ -1202,8 +1260,23 @@ class DatabaseHelper {
     }
   }
 
-  /// One-time cleanup for any historically corrupted or cross-linked media
+  /// One-time cleanup for any historically corrupted or cross-linked media.
+  /// Protected by a run-once guard: will silently skip if already running or
+  /// if run less than 5 minutes ago, to prevent concurrent DB lock errors.
   Future<void> cleanupCorruptedMediaLinks([Database? existingDb]) async {
+    // Guard: skip if already running (e.g. called from HomeScreen while native
+    // service is also running it on connect)
+    if (_cleanupRunning) {
+      debugPrint('[DatabaseHelper] cleanupCorruptedMediaLinks skipped (already running)');
+      return;
+    }
+    final now = DateTime.now();
+    if (_lastCleanupRun != null && now.difference(_lastCleanupRun!) < _cleanupMinInterval) {
+      debugPrint('[DatabaseHelper] cleanupCorruptedMediaLinks skipped (ran ${now.difference(_lastCleanupRun!).inSeconds}s ago)');
+      return;
+    }
+    _cleanupRunning = true;
+    _lastCleanupRun = now;
     try {
       final db = existingDb ?? await database;
       // 1. Clear mediaPath on emoji reaction messages
@@ -1231,6 +1304,26 @@ class DatabaseHelper {
                OR LOWER(message) = 'group call')
           AND mediaPath IS NOT NULL 
           AND mediaPath != ''
+      ''');
+
+      // 1c. Delete WhatsApp system and security notifications that were mistakenly saved as chat messages
+      // (e.g. "Recent WhatsApp login", "WhatsApp Web", "Checking for new messages", etc.)
+      await db.execute('''
+        DELETE FROM messages 
+        WHERE app LIKE '%whatsapp%' 
+          AND (
+            LOWER(sender) LIKE '%whatsapp login%' 
+            OR LOWER(sender) LIKE '%recent whatsapp login%' 
+            OR LOWER(sender) LIKE '%recent login%' 
+            OR LOWER(sender) = 'whatsapp' 
+            OR LOWER(sender) = 'whatsapp web' 
+            OR LOWER(sender) = 'whatsapp desktop' 
+            OR LOWER(message) LIKE '%logged in to whatsapp%' 
+            OR LOWER(message) LIKE '%log in to whatsapp%' 
+            OR LOWER(message) LIKE '%checking for new messages%' 
+            OR LOWER(message) LIKE '%whatsapp web is currently active%'
+            OR LOWER(message) LIKE '%backup in progress%'
+          )
       ''');
 
       // 2. Find any mediaPath that is assigned to more than 1 message
@@ -1449,6 +1542,8 @@ class DatabaseHelper {
       debugPrint('[DatabaseHelper] Completed cleanupCorruptedMediaLinks');
     } catch (e) {
       debugPrint('[DatabaseHelper] cleanupCorruptedMediaLinks error: $e');
+    } finally {
+      _cleanupRunning = false;
     }
   }
 

@@ -14,22 +14,27 @@ SilentSave uses a "Zero-Touch" matching engine to silently link media files (dow
 3. **Temporal Matching:** `NotificationService` calls `TimestampMatcher`. The matcher scans the database for any WhatsApp media notifications received within a tight ±30-to-60 second window around the file's creation time.
 4. **The Link:** If an unambiguous match is found within that exact time window, the system permanently links the high-quality file directly to the sender's message.
 
-### Unblocking Voice Notes
-Previously, voice notes (`.opus` or `PTT-` files) were strictly blocked from this zero-touch process because SAF does not provide contact metadata in the filename. This block was **removed** because it was overly restrictive. By removing it, voice notes now pass through the zero-touch pipeline. They are successfully linked using temporal matching just like images and videos, drastically improving the user experience without sacrificing safety.
+### Unblocking Voice Notes with Anti-Collision Privacy Guards
+Previously, voice notes (`.opus` or `PTT-` files) were blocked from reverse-linking because SAF does not provide contact metadata in the filename. To unblock voice notes while strictly guaranteeing that Alice's audio NEVER links to Bob:
+1. **Sender-Scoped Burst Scans:** Scans triggered by notifications retain the confirmed `targetSender` across normalized timestamps (handling Android OEM 0-second or second-based timestamp discrepancies).
+2. **Reverse-Linking Anti-Collision Guard:** In `NativeDatabaseHelper.linkWaitingMediaToMessage()`, when an unassigned audio file arrives, the engine queries the database to verify if ANY OTHER chat in the database received an unlinked voice message within the 45-second window. If multiple chats received voice messages around the same time, the system detects the collision and **aborts the link**, completely preventing cross-chat misattribution.
+3. **24-Hour Reconciliation:** Audio is included in `cleanupCorruptedMediaLinks()` to safely link orphaned voice notes when the confirmed sender matches.
 
 ---
 
 ## 2. Handling Collisions: The "Fail-Safe" Professional Practice
 
-Reviewers often ask: *"What if Alice and Bob both send a photo at the exact same millisecond? Will the system link Alice's photo to Bob's chat?"*
+Reviewers often ask: *"What if Alice and Bob both send a photo or voice note at the exact same millisecond? Will the system link Alice's media to Bob's chat?"*
 
-SilentSave uses **Fail-Safe Design** (or "Failing Closed") to prevent this. 
+SilentSave uses **Fail-Safe Design** (or "Failing Closed") to prevent this across both Kotlin (background) and Flutter (foreground):
 
-### The `requireUnambiguous` Guard
-In `TimestampMatcher.dart`, the matching algorithm enforces `requireUnambiguous = true`. If the algorithm detects *more than one* valid notification candidate within the temporal window (e.g., both Alice and Bob sent a picture at 12:00:01), it flags the match as `ambiguous` and **completely aborts the linking process**.
+### The `requireUnambiguous` & Anti-Collision Guards
+* **In Flutter (`TimestampMatcher.dart`):** The matching algorithm enforces `requireUnambiguous = true`. If the algorithm detects *more than one* valid notification candidate within the temporal window (e.g., both Alice and Bob sent a picture at 12:00:01), it flags the match as `ambiguous` and **completely aborts the linking process**.
+* **In Native Kotlin (`NativeDatabaseHelper.kt`):** Both `matchAndLinkMedia()` and `linkWaitingMediaToMessage()` count candidates. If `targetSender` is absent and `candidateCount > 1`, native linking strictly aborts.
+* **Direct Notification Image Capture:** For WhatsApp image messages where SAF auto-download hasn't triggered yet, `NotificationListener` extracts the image thumbnail from `notification.getLargeIcon()` and package-aware `Icon` loaders, directly attributing it to the notification's confirmed sender.
 
 ### Why This is an Industry Best Practice
-* **Privacy Over Convenience:** Showing Alice's private picture in Bob's chat history is a catastrophic privacy breach (a P0 critical bug). Failing to auto-link the picture is a minor inconvenience. Professional systems prioritize data integrity.
+* **Privacy Over Convenience:** Showing Alice's private picture or voice note in Bob's chat history is a catastrophic privacy breach (a P0 critical bug). Failing to auto-link the file is a minor inconvenience. Professional systems prioritize data integrity.
 * **Deterministic Behavior:** If an algorithm guesses during a 50/50 split, the system behaves unpredictably. Aborting on ambiguity guarantees 100% predictable, safe behavior.
 * **Database Contamination Prevention:** Incorrectly linking a file corrupts the user's local chat database permanently. Failing safely prevents this contamination.
 

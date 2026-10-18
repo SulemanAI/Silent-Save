@@ -18,24 +18,37 @@ class VideoThumbnailWidget extends StatefulWidget {
 }
 
 class _VideoThumbnailWidgetState extends State<VideoThumbnailWidget> {
+  static final Map<String, Uint8List> _thumbnailCache = {};
   Uint8List? _thumbnailBytes;
   bool _isLoading = true;
 
   @override
   void initState() {
     super.initState();
-    _generateThumbnail();
+    if (_thumbnailCache.containsKey(widget.videoPath)) {
+      _thumbnailBytes = _thumbnailCache[widget.videoPath];
+      _isLoading = false;
+    } else {
+      _generateThumbnail();
+    }
   }
 
   @override
   void didUpdateWidget(covariant VideoThumbnailWidget oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.videoPath != widget.videoPath) {
-      setState(() {
-        _thumbnailBytes = null;
-        _isLoading = true;
-      });
-      _generateThumbnail();
+      if (_thumbnailCache.containsKey(widget.videoPath)) {
+        setState(() {
+          _thumbnailBytes = _thumbnailCache[widget.videoPath];
+          _isLoading = false;
+        });
+      } else {
+        setState(() {
+          _thumbnailBytes = null;
+          _isLoading = true;
+        });
+        _generateThumbnail();
+      }
     }
   }
 
@@ -47,6 +60,9 @@ class _VideoThumbnailWidgetState extends State<VideoThumbnailWidget> {
         maxWidth: 400, // Reasonable max width for chat thumb
         quality: 50,
       );
+      if (uint8list != null) {
+        _thumbnailCache[widget.videoPath] = uint8list;
+      }
       if (mounted) {
         setState(() {
           _thumbnailBytes = uint8list;

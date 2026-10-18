@@ -1,6 +1,7 @@
 package com.silentsave.silentsave
 
 import android.app.Service
+import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -185,9 +186,36 @@ class MediaWatcherService : Service() {
     private var periodicScanRunnable: Runnable? = null
     private var cachedTreeUri: Uri? = null
 
+    // ── Seen-files tracking (zero-touch "only copy what is NEW") ─────────────────
+    // A directory entry is "new" when its document id has never been seen before,
+    // regardless of its modification time (gallery photos carry old camera mtimes).
+    // Persisted so restarts don't re-copy history. The first scan of each sub-folder
+    // only baselines existing files (except those modified in the last 10 minutes).
+    private val knownFiles: MutableSet<String> =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+
+    private fun knownFilesStore() = File(applicationContext.filesDir, "media_known.txt")
+
+    private fun loadKnownFiles() {
+        try {
+            val f = knownFilesStore()
+            if (f.exists()) f.forEachLine { if (it.isNotBlank()) knownFiles.add(it) }
+            Log.i(TAG, "Loaded ${knownFiles.size} known file ids")
+        } catch (e: Exception) { Log.w(TAG, "loadKnownFiles: ${e.message}") }
+    }
+
+    private fun markKnown(key: String) {
+        if (knownFiles.add(key)) {
+            try { knownFilesStore().appendText(key + "\n") } catch (_: Exception) {}
+        }
+    }
+
+    private fun isBaselineDone(subdirName: String) = prefs.getBoolean("baseline_$subdirName", false)
+
     override fun onCreate() {
         super.onCreate()
         instance = this
+        loadKnownFiles()
         Log.i(TAG, "CREATED")
         try {
             nativeDb = NativeDatabaseHelper.getInstance(applicationContext)
@@ -269,18 +297,33 @@ class MediaWatcherService : Service() {
         val runnablesForSender = mutableListOf<Runnable>()
         burstScanRunnables[senderKey] = runnablesForSender
 
-        // 9-step backoff: 0ms, 500ms, 800ms, 1500ms, 3000ms, 7000ms, 14000ms, 25000ms, 40000ms
-        // The 500ms and 800ms steps catch instant downloads (voice notes, stickers, fast compressed photos)
-        // without waiting for the 1.5s or 3s tick.
-        val delays = listOf(0L, 500L, 800L, 1500L, 3000L, 7000L, 14000L, 25000L, 40000L)
+        val isVideoHint = hintSubdir?.contains("Video", ignoreCase = true) == true
+        // For video, include intervals up to 50s because video downloads (5MB-30MB) take several seconds
+        val delays = if (isVideoHint) {
+            listOf(0L, 300L, 800L, 1500L, 3000L, 5000L, 8000L, 12000L, 18000L, 25000L, 35000L, 50000L)
+        } else {
+            listOf(0L, 200L, 500L, 1000L, 2000L, 4000L, 8000L, 16000L, 30000L, 45000L)
+        }
         for (delay in delays) {
             val runnable = object : Runnable {
                 override fun run() {
                     Log.d(TAG, "Executing burst scan (delay=${delay}ms, hint=$hintSubdir, sender=$targetSender)")
+
+                    // 1. FAST MEDIASTORE SCAN: Executes in 1-2ms and catches incoming photos/videos instantly!
+                    scanMediaStore(hintSubdir, targetSender)
+
+                    // 2. TARGETED SAF SCAN: Scan the specific folder matching hintSubdir
                     if (hintSubdir != null) {
                         scanSubdirByName(treeUri, hintSubdir, targetSender)
+                    } else {
+                        // Fast targeted scans for both common media folders when hint is not specific
+                        scanSubdirByName(treeUri, "WhatsApp Video", targetSender)
+                        scanSubdirByName(treeUri, "WhatsApp Images", targetSender)
+                        if (delay == 0L || delay >= 16000L) {
+                            scanAllSubdirs(treeUri, targetSender)
+                        }
                     }
-                    scanAllSubdirs(treeUri, targetSender)
+
                     synchronized(runnablesForSender) {
                         runnablesForSender.remove(this)
                         if (runnablesForSender.isEmpty()) {
@@ -308,11 +351,117 @@ class MediaWatcherService : Service() {
         }
     }
 
-    private fun scanSubdirByName(treeUri: Uri, subdirName: String, targetSender: String? = null) {
-        val uri = subdirUriMap[subdirName]
-        if (uri != null) {
-            scanSubdir(treeUri, uri, subdirName, targetSender)
+    private fun scanSubdirByName(treeUri: Uri, subdirName: String, targetSender: String? = null): Int {
+        var uri = subdirUriMap[subdirName]
+        if (uri == null) {
+            try {
+                val root = DocumentFile.fromTreeUri(applicationContext, treeUri)
+                val targetDoc = root?.findFile(subdirName) 
+                    ?: root?.findFile("Media")?.findFile(subdirName)
+                if (targetDoc != null && targetDoc.isDirectory) {
+                    uri = targetDoc.uri
+                    subdirUriMap[subdirName] = uri
+                }
+            } catch (e: Exception) {
+                Log.d(TAG, "scanSubdirByName locate error: ${e.message}")
+            }
         }
+        return if (uri != null) {
+            scanSubdir(treeUri, uri, subdirName, targetSender)
+        } else 0
+    }
+
+    /**
+     * Fast MediaStore scan for recently added media.
+     * Executes in 1-2 milliseconds using indexed SQLite system database.
+     * Returns true if a new file was successfully copied and linked.
+     */
+    private fun scanMediaStore(hintSubdir: String?, targetSender: String?): Boolean {
+        try {
+            val isVideo = hintSubdir?.contains("Video", ignoreCase = true) == true
+            val isAudio = hintSubdir?.contains("Audio", ignoreCase = true) == true || 
+                          hintSubdir?.contains("Voice Notes", ignoreCase = true) == true
+
+            // Determine target query URIs. If hint is unknown/null, query BOTH Images and Videos!
+            val queryTargets = when {
+                isVideo -> listOf(MediaStore.Video.Media.EXTERNAL_CONTENT_URI to "video")
+                isAudio -> listOf(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI to "audio")
+                hintSubdir?.contains("Images", ignoreCase = true) == true -> listOf(MediaStore.Images.Media.EXTERNAL_CONTENT_URI to "image")
+                else -> listOf(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI to "image",
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI to "video"
+                )
+            }
+
+            // Look back up to 2 minutes for freshly arrived media
+            val nowSec = System.currentTimeMillis() / 1000L
+            val cutoffSec = nowSec - 120L
+
+            val projection = arrayOf(
+                MediaStore.MediaColumns._ID,
+                MediaStore.MediaColumns.DATA,
+                MediaStore.MediaColumns.DISPLAY_NAME,
+                MediaStore.MediaColumns.SIZE,
+                MediaStore.MediaColumns.DATE_ADDED,
+                MediaStore.MediaColumns.DATE_MODIFIED
+            )
+
+            val selection = "${MediaStore.MediaColumns.DATE_ADDED} >= ? AND (" +
+                    "${MediaStore.MediaColumns.DATA} LIKE '%com.whatsapp%' OR " +
+                    "${MediaStore.MediaColumns.DATA} LIKE '%WhatsApp%')"
+            val selectionArgs = arrayOf(cutoffSec.toString())
+            val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC LIMIT 5"
+
+            for ((contentUri, mediaType) in queryTargets) {
+                contentResolver.query(contentUri, projection, selection, selectionArgs, sortOrder)?.use { cursor ->
+                    val idIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+                    val dataIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA)
+                    val nameIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+                    val sizeIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
+                    val addedIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_ADDED)
+
+                    while (cursor.moveToNext()) {
+                        val id = cursor.getLong(idIdx)
+                        val dataPath = cursor.getString(dataIdx) ?: continue
+                        val displayName = cursor.getString(nameIdx) ?: File(dataPath).name
+                        val size = cursor.getLong(sizeIdx)
+                        val addedSec = cursor.getLong(addedIdx)
+
+                        if (size <= 0L) continue
+                        if (displayName.startsWith(".") || displayName == ".nomedia") continue
+                        if (dataPath.contains("/Sent/") || dataPath.contains("/.Shared/")) continue
+
+                        val knownKey = "mediastore|$id|$displayName"
+                        if (knownFiles.contains(knownKey)) continue
+
+                        val itemUri = ContentUris.withAppendedId(contentUri, id)
+                        val destDir = getMediaAttachmentsDir(applicationContext)
+                        val safeName = displayName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+                        val destFile = File(destDir, safeName)
+
+                        // Skip if already copied & linked
+                        if (destFile.exists() && destFile.length() == size &&
+                            (linkedPaths.contains(destFile.absolutePath) || nativeDb?.isMediaAlreadyLinked(destFile.absolutePath) == true)) {
+                            markKnown(knownKey)
+                            continue
+                        }
+
+                        // Copy file to private storage
+                        val path = copyToPrivateStorage(itemUri, displayName, size)
+                        if (path != null && File(path).length() == size) {
+                            markKnown(knownKey)
+                            val captureTime = if (addedSec > 0) addedSec * 1000L else System.currentTimeMillis()
+                            Log.i(TAG, "✓ MediaStore fast-captured $displayName (${size}B) for sender '$targetSender'")
+                            processMediaEvent(itemUri.toString(), mediaType, path, captureTime, size, displayName, 0, targetSender)
+                            return true
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "scanMediaStore error: ${e.message}")
+        }
+        return false
     }
 
     // ── ContentObserver registration ──────────────────────────────────────
@@ -496,17 +645,18 @@ class MediaWatcherService : Service() {
         } catch (e: Exception) { Log.e(TAG, "scanAllSubdirs: ${e.message}") }
     }
 
-    private fun scanSubdir(treeUri: Uri, subdirUri: Uri, subdirName: String, targetSender: String? = null) {
+    private fun scanSubdir(treeUri: Uri, subdirUri: Uri, subdirName: String, targetSender: String? = null): Int {
         try {
             val lastScanKey = "$PREF_LAST_SCAN_TS_PREFIX$subdirName"
             val scanStart  = System.currentTimeMillis()
             val cutoffTime = scanStart - 24 * 60 * 60 * 1000L // 24-hour window for active captures
+            val baselineDone = isBaselineDone(subdirName)
 
             val initialDocId: String = try {
                 DocumentsContract.getDocumentId(subdirUri)
             } catch (_: Exception) {
                 try { DocumentsContract.getTreeDocumentId(subdirUri) }
-                catch (e: Exception) { Log.e(TAG, "No docId for $subdirName: ${e.message}"); return }
+                catch (e: Exception) { Log.e(TAG, "No docId for $subdirName: ${e.message}"); return 0 }
             }
 
             var found = 0
@@ -557,15 +707,15 @@ class MediaWatcherService : Service() {
                             val destDir  = getMediaAttachmentsDir(applicationContext)
                             val destFile = File(destDir, safeName)
 
-                            // Prune historical files: ONLY skip if rawModified is a valid millisecond timestamp (> year 2001)
-                            // AND strictly older than cutoffTime. If 0, -1, or unpopulated by OEM, keep it!
-                            // SENDER-SAFETY: During an active burst scan (targetSender != null) for newly arrived media,
-                            // if destFile does not exist yet, do NOT prune it! Photos/videos sent from a gallery
-                            // often carry their original camera/creation timestamp which can be hours or days old.
-                            if (rawModified > 1_000_000_000_000L && rawModified < cutoffTime) {
-                                if (targetSender == null || destFile.exists()) {
-                                    continue
-                                }
+                            // ZERO-TOUCH "NEW FILE" DETECTION (replaces the old mtime/24h heuristic,
+                            // which made every notification burst re-copy ALL historical files).
+                            // Unseen document id => new file => copy immediately, whatever its mtime.
+                            val knownKey = "$subdirName|$docId"
+                            if (knownFiles.contains(knownKey)) continue
+                            if (!baselineDone) {
+                                val recentlyModified = rawModified > 1_000_000_000_000L &&
+                                    scanStart - rawModified in 0..(10 * 60 * 1000L)
+                                if (!recentlyModified) { markKnown(knownKey); continue }
                             }
 
                             // Skip files that have already been copied and successfully linked
@@ -579,23 +729,24 @@ class MediaWatcherService : Service() {
 
                             val path = copyToPrivateStorage(fileUri, name, size)
                             if (path != null) {
-                                // For audio (voice notes), rawModified is when it was recorded live in WhatsApp.
-                                // For images, videos, and documents: the file just arrived on this device right now,
-                                // so captureTime is scanStart. The EXIF/camera timestamp (rawModified) can be days old!
-                                val captureTime = if (type == "audio") {
-                                    if (rawModified > 1_000_000_000_000L) rawModified else scanStart
-                                } else {
-                                    scanStart
+                                // Only mark as seen once the copy is complete (size matches);
+                                // a still-downloading file will be re-copied on the next pass.
+                                if (File(path).length() == size) markKnown(knownKey)
+                                // For audio (voice notes), normalize rawModified whether in milliseconds, seconds, or unpopulated (0)
+                                val modMs = when {
+                                    rawModified > 1_000_000_000_000L -> rawModified
+                                    rawModified in 1_000_000_000L..999_999_999_999L -> rawModified * 1000L
+                                    else -> scanStart
                                 }
+                                val captureTime = if (type == "audio") modMs else scanStart
 
                                 // SENDER-SAFETY:
-                                // Audio/voice notes share weekly folders without contact names in filenames,
-                                // so audio requires rawModified to be within 60s of scanStart to inherit targetSender.
-                                // For images, videos, and documents: newly copied files arriving during an active
-                                // burst scan for targetSender belong to targetSender!
+                                // Newly copied files arriving during an active burst scan for targetSender belong to targetSender.
+                                // For audio: if modMs is within 3 minutes of scanStart or unpopulated (0), targetSender is safely attributed.
                                 val fileSender = if (targetSender != null) {
                                     if (type == "audio") {
-                                        if (rawModified > 1_000_000_000_000L && Math.abs(rawModified - scanStart) <= 60_000L) targetSender else null
+                                        val isRecentAudio = if (rawModified > 0) Math.abs(modMs - scanStart) <= 180_000L else true
+                                        if (isRecentAudio) targetSender else null
                                     } else {
                                         targetSender
                                     }
@@ -632,8 +783,12 @@ class MediaWatcherService : Service() {
                 }
             }
             if (found > 0) Log.i(TAG, "scan $subdirName: $found file(s) checked")
-            prefs.edit().putLong(lastScanKey, scanStart).apply()
-        } catch (e: Exception) { Log.e(TAG, "scanSubdir($subdirName): ${e.message}") }
+            prefs.edit().putLong(lastScanKey, scanStart).putBoolean("baseline_$subdirName", true).apply()
+            return found
+        } catch (e: Exception) { 
+            Log.e(TAG, "scanSubdir($subdirName): ${e.message}")
+            return 0
+        }
     }
 
     // ── File copy ─────────────────────────────────────────────────────────
@@ -654,7 +809,7 @@ class MediaWatcherService : Service() {
 
             contentResolver.openInputStream(sourceUri)?.use { input ->
                 FileOutputStream(destFile).use { out ->
-                    val buf = ByteArray(8192); var n: Int
+                    val buf = ByteArray(65536); var n: Int
                     while (input.read(buf).also { n = it } != -1) out.write(buf, 0, n)
                     out.flush()
                 }
@@ -707,6 +862,9 @@ class MediaWatcherService : Service() {
             Log.i(TAG, "Zero-touch matched media: $displayName ($targetSender)")
             linkedPaths.add(privatePath)
             pendingRetries.remove(privatePath)
+            if (!targetSender.isNullOrBlank()) {
+                cancelBurstScans(targetSender)
+            }
             // Cap linkedPaths to prevent memory leak
             if (linkedPaths.size > 500) {
                 val iter = linkedPaths.iterator()

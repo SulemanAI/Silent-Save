@@ -14,6 +14,7 @@ class EncryptionService {
   
   Encrypter? _encrypter;
   IV? _iv;
+  bool? _cachedIsEnabled;
   
   // Race condition prevention: track initialization state
   bool _isInitializing = false;
@@ -117,6 +118,9 @@ class EncryptionService {
   }
 
   Future<void> _resetStorage() async {
+    _cachedIsEnabled = false;
+    _encrypter = null;
+    _iv = null;
     try {
       await _secureStorage.deleteAll();
       debugPrint('[EncryptionService] Storage reset complete');
@@ -126,18 +130,24 @@ class EncryptionService {
   }
 
   Future<bool> isEncryptionEnabled() async {
+    if (_cachedIsEnabled != null) {
+      return _cachedIsEnabled!;
+    }
     try {
       final enabled = await _secureStorage.read(key: _enabledStorageKey);
-      return enabled == 'true';
+      _cachedIsEnabled = (enabled == 'true');
+      return _cachedIsEnabled!;
     } catch (e) {
       // If we can't read, encryption is effectively disabled
       debugPrint('[EncryptionService] Error reading encryption status: $e');
       await _resetStorage();
+      _cachedIsEnabled = false;
       return false;
     }
   }
 
   Future<void> enableEncryption(bool enable) async {
+    _cachedIsEnabled = enable;
     try {
       await _secureStorage.write(
         key: _enabledStorageKey,
@@ -153,6 +163,7 @@ class EncryptionService {
     } catch (e) {
       debugPrint('[EncryptionService] Error enabling encryption: $e');
       await _resetStorage();
+      _cachedIsEnabled = false;
     }
   }
 
@@ -199,6 +210,10 @@ class EncryptionService {
 
   Future<String> decrypt(String encryptedText) async {
     try {
+      if (_cachedIsEnabled == false) {
+        return encryptedText;
+      }
+      
       // Quick check: if text doesn't look like base64-encoded ciphertext, return as-is
       if (!_isLikelyEncrypted(encryptedText)) {
         return encryptedText;
