@@ -75,10 +75,10 @@ class NativeDatabaseHelper private constructor(context: Context) {
             null,
             SQLiteDatabase.OPEN_READWRITE or SQLiteDatabase.CREATE_IF_NECESSARY or SQLiteDatabase.ENABLE_WRITE_AHEAD_LOGGING
         )
-        // 8s busy timeout: gives Flutter sqflite time to release its lock before we fail.
+        // 15s busy timeout: gives Flutter sqflite and native threads time to release locks.
         // PRAGMA statements that return a result must use rawQuery in Android SQLite.
         try {
-            database.rawQuery("PRAGMA busy_timeout = 8000", null)?.close()
+            database.rawQuery("PRAGMA busy_timeout = 15000", null)?.close()
         } catch (e: Exception) {
             Log.w(TAG, "Failed to set PRAGMA busy_timeout: ${e.message}")
         }
@@ -219,10 +219,11 @@ class NativeDatabaseHelper private constructor(context: Context) {
                 return
             }
             prefs.edit().putLong("last_cleanup_ms", now).apply()
-            // Run on a background thread — the cleanup holds a long transaction
-            // and must never block the notification posting thread.
+            // Delay cleanup by 12 seconds so startup DB queries & Flutter UI initialization complete first
+            // and must never block the notification posting thread or startup sequence.
             Thread {
                 try {
+                    Thread.sleep(12_000L)
                     cleanupCorruptedMediaLinks()
                 } catch (e: Exception) {
                     Log.w(TAG, "Background cleanup error: ${e.message}")
@@ -428,7 +429,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
     fun cleanupCorruptedMediaLinks() {
         try {
             val database = safeDb() // Use resilient connection
-            database.beginTransaction()
+            database.beginTransactionNonExclusive()
             try {
                 // 1. Clear mediaPath on emoji reaction messages
                 database.execSQL("""
@@ -786,7 +787,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
         var insertedCount = 0
         try {
             val database = safeDb()
-            database.beginTransaction()
+            database.beginTransactionNonExclusive()
             try {
                 for (msg in messages) {
                     val sender = msg["sender"] as? String
@@ -1026,7 +1027,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
             }
 
             if (matchedAttachmentId != null && matchedFilePath != null) {
-                database.beginTransaction()
+                database.beginTransactionNonExclusive()
                 try {
                     val msgVals = ContentValues().apply { put("mediaPath", matchedFilePath) }
                     database.update("messages", msgVals, "id = ?", arrayOf(messageId.toString()))
@@ -1252,7 +1253,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
             // If Pass 1 found no matching message for targetSender, we do NOT guess or assign to another chat.
             if (matchedMessageId != null) {
                 val database = safeDb()
-                database.beginTransaction()
+                database.beginTransactionNonExclusive()
                 try {
                     // Re-verify uniqueness inside transaction
                     val alreadyInUse = database.rawQuery("SELECT id FROM messages WHERE mediaPath = ? LIMIT 1", arrayOf(mediaPath)).use { it.moveToFirst() }
@@ -1338,7 +1339,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
     fun linkExtractedMediaToMessage(title: String, timestamp: Long, mediaPath: String, mediaType: String): Boolean {
         try {
             val database = safeDb()
-            database.beginTransaction()
+            database.beginTransactionNonExclusive()
             try {
                 // Find matching message without mediaPath
                 var targetId: Long? = null

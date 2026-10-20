@@ -85,12 +85,9 @@ class KeepAliveService : Service() {
 
     private fun watchdogTick() {
         if (isNlsPermissionGranted() && !NotificationListener.isConnected) {
-            Log.w(TAG, "Watchdog: NLS not connected while permission granted — rebinding")
+            Log.w(TAG, "Watchdog: NLS not connected while permission granted — requesting safe rebind")
             try {
                 val cn = android.content.ComponentName(this, NotificationListener::class.java)
-                val pm = packageManager
-                pm.setComponentEnabledSetting(cn, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED, android.content.pm.PackageManager.DONT_KILL_APP)
-                pm.setComponentEnabledSetting(cn, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED, android.content.pm.PackageManager.DONT_KILL_APP)
                 android.service.notification.NotificationListenerService.requestRebind(cn)
             } catch (e: Exception) {
                 Log.w(TAG, "Watchdog rebind failed: ${e.message}")

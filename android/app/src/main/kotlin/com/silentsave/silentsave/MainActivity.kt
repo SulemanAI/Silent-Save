@@ -36,18 +36,33 @@ class MainActivity : FlutterFragmentActivity() {
         @Volatile
         private var activeMethodChannel: MethodChannel? = null
 
+        private val mainLooperHandler = android.os.Handler(android.os.Looper.getMainLooper())
+        private var pendingNotifyRunnable: Runnable? = null
+        private val notifyLock = Any()
+
         /**
          * Notify Flutter UI that new messages or media attachments have been linked
          * natively into SQLite so the UI updates immediately without manual reload.
+         * DEBOUNCED: Coalesces burst notifications (e.g. 50 in 3 seconds) into a
+         * single UI refresh event every 500ms, completely eliminating MethodChannel flooding
+         * and UI thread lockups.
          */
         fun notifyFlutterMessageOrMediaUpdated() {
-            try {
-                android.os.Handler(android.os.Looper.getMainLooper()).post {
+            synchronized(notifyLock) {
+                if (pendingNotifyRunnable != null) {
+                    return // Already scheduled to fire within debounce window
+                }
+                val runnable = Runnable {
+                    synchronized(notifyLock) {
+                        pendingNotifyRunnable = null
+                    }
                     try {
                         activeMethodChannel?.invokeMethod("onNotificationReceived", mapOf("event" to "db_updated"))
                     } catch (_: Exception) {}
                 }
-            } catch (_: Exception) {}
+                pendingNotifyRunnable = runnable
+                mainLooperHandler.postDelayed(runnable, 500L)
+            }
         }
     }
 
@@ -58,21 +73,10 @@ class MainActivity : FlutterFragmentActivity() {
     fun forceRebindNls(context: Context) {
         try {
             val componentName = ComponentName(context, NotificationListener::class.java)
-            val pm = context.packageManager
-            pm.setComponentEnabledSetting(
-                componentName,
-                PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
-                PackageManager.DONT_KILL_APP
-            )
-            pm.setComponentEnabledSetting(
-                componentName,
-                PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-                PackageManager.DONT_KILL_APP
-            )
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 NotificationListenerService.requestRebind(componentName)
             }
-            Log.i(TAG, "forceRebindNls: successfully toggled component and requested rebind")
+            Log.i(TAG, "forceRebindNls: safe requestRebind requested (system token preserved)")
         } catch (e: Exception) {
             Log.e(TAG, "forceRebindNls error: ${e.message}")
         }
@@ -126,7 +130,11 @@ class MainActivity : FlutterFragmentActivity() {
                     result.success(granted)
                 }
                 "isNlsConnected" -> {
-                    result.success(NotificationListener.isConnected)
+                    val connected = NotificationListener.isConnected
+                    if (!connected && isNotificationServiceEnabled()) {
+                        forceRebindNls(applicationContext)
+                    }
+                    result.success(connected)
                 }
                 "openNotificationSettings" -> {
                     openNotificationSettings()

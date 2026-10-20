@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.database.ContentObserver
 import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
@@ -67,16 +68,27 @@ class MediaWatcherService : Service() {
         @Volatile
         var latestActiveSenderTime: Long = 0L
 
+        private val lastTriggerTimeBySender = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
         fun triggerImmediateScan(
             context: Context, 
             hintSubdir: String? = null, 
             reason: String = "unknown",
             targetSender: String? = null
         ) {
+            val senderKey = targetSender ?: "_global_"
+            val now = System.currentTimeMillis()
+            val lastTime = lastTriggerTimeBySender[senderKey] ?: 0L
+            if (now - lastTime < 1800L) {
+                Log.d(TAG, "triggerImmediateScan: throttled for '$senderKey' (${now - lastTime}ms since last scan)")
+                return
+            }
+            lastTriggerTimeBySender[senderKey] = now
+
             Log.i(TAG, "triggerImmediateScan: hint=$hintSubdir reason=$reason targetSender=$targetSender")
             if (!targetSender.isNullOrBlank()) {
                 latestActiveSender = targetSender
-                latestActiveSenderTime = System.currentTimeMillis()
+                latestActiveSenderTime = now
             }
             val treeUri = getPersistedUri(context) ?: run {
                 Log.w(TAG, "triggerImmediateScan: No SAF URI persisted")
@@ -90,7 +102,7 @@ class MediaWatcherService : Service() {
                         setReferenceCounted(false)
                     }
                 }
-                scanWakeLock?.acquire(45_000L)
+                scanWakeLock?.acquire(15_000L)
             } catch (e: Exception) {
                 Log.w(TAG, "WakeLock acquire error: ${e.message}")
             }
@@ -199,12 +211,34 @@ class MediaWatcherService : Service() {
     private fun loadKnownFiles() {
         try {
             val f = knownFilesStore()
-            if (f.exists()) f.forEachLine { if (it.isNotBlank()) knownFiles.add(it) }
+            if (f.exists()) {
+                val lines = f.readLines()
+                if (lines.size > 800 || f.length() > 100_000L) {
+                    val recent = lines.takeLast(400)
+                    f.writeText(recent.joinToString("\n") + "\n")
+                    recent.forEach { if (it.isNotBlank()) knownFiles.add(it) }
+                } else {
+                    lines.forEach { if (it.isNotBlank()) knownFiles.add(it) }
+                }
+            }
             Log.i(TAG, "Loaded ${knownFiles.size} known file ids")
         } catch (e: Exception) { Log.w(TAG, "loadKnownFiles: ${e.message}") }
     }
 
     private fun markKnown(key: String) {
+        if (knownFiles.size > 1000) {
+            // Keep memory footprint and file bounded
+            val iter = knownFiles.iterator()
+            var removed = 0
+            while (iter.hasNext() && removed < 300) {
+                iter.next()
+                iter.remove()
+                removed++
+            }
+            try {
+                knownFilesStore().writeText(knownFiles.joinToString("\n") + "\n")
+            } catch (_: Exception) {}
+        }
         if (knownFiles.add(key)) {
             try { knownFilesStore().appendText(key + "\n") } catch (_: Exception) {}
         }
@@ -298,11 +332,10 @@ class MediaWatcherService : Service() {
         burstScanRunnables[senderKey] = runnablesForSender
 
         val isVideoHint = hintSubdir?.contains("Video", ignoreCase = true) == true
-        // For video, include intervals up to 50s because video downloads (5MB-30MB) take several seconds
         val delays = if (isVideoHint) {
-            listOf(0L, 300L, 800L, 1500L, 3000L, 5000L, 8000L, 12000L, 18000L, 25000L, 35000L, 50000L)
+            listOf(0L, 800L, 2500L, 6000L, 12000L)
         } else {
-            listOf(0L, 200L, 500L, 1000L, 2000L, 4000L, 8000L, 16000L, 30000L, 45000L)
+            listOf(0L, 500L, 1500L, 4000L, 10000L)
         }
         for (delay in delays) {
             val runnable = object : Runnable {
@@ -310,7 +343,11 @@ class MediaWatcherService : Service() {
                     Log.d(TAG, "Executing burst scan (delay=${delay}ms, hint=$hintSubdir, sender=$targetSender)")
 
                     // 1. FAST MEDIASTORE SCAN: Executes in 1-2ms and catches incoming photos/videos instantly!
-                    scanMediaStore(hintSubdir, targetSender)
+                    if (scanMediaStore(hintSubdir, targetSender)) {
+                        Log.i(TAG, "Fast scan captured media, cancelling subsequent bursts for '$targetSender'")
+                        cancelBurstScans(targetSender)
+                        return
+                    }
 
                     // 2. TARGETED SAF SCAN: Scan the specific folder matching hintSubdir
                     if (hintSubdir != null) {
@@ -319,7 +356,7 @@ class MediaWatcherService : Service() {
                         // Fast targeted scans for both common media folders when hint is not specific
                         scanSubdirByName(treeUri, "WhatsApp Video", targetSender)
                         scanSubdirByName(treeUri, "WhatsApp Images", targetSender)
-                        if (delay == 0L || delay >= 16000L) {
+                        if (delay == 0L || delay >= 6000L) {
                             scanAllSubdirs(treeUri, targetSender)
                         }
                     }
@@ -410,7 +447,7 @@ class MediaWatcherService : Service() {
                     "${MediaStore.MediaColumns.DATA} LIKE '%com.whatsapp%' OR " +
                     "${MediaStore.MediaColumns.DATA} LIKE '%WhatsApp%')"
             val selectionArgs = arrayOf(cutoffSec.toString())
-            val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC LIMIT 5"
+            val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC"
 
             for ((contentUri, mediaType) in queryTargets) {
                 contentResolver.query(contentUri, projection, selection, selectionArgs, sortOrder)?.use { cursor ->
@@ -420,7 +457,9 @@ class MediaWatcherService : Service() {
                     val sizeIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
                     val addedIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_ADDED)
 
-                    while (cursor.moveToNext()) {
+                    var checkedCount = 0
+                    while (cursor.moveToNext() && checkedCount < 5) {
+                        checkedCount++
                         val id = cursor.getLong(idIdx)
                         val dataPath = cursor.getString(dataIdx) ?: continue
                         val displayName = cursor.getString(nameIdx) ?: File(dataPath).name
@@ -666,15 +705,38 @@ class MediaWatcherService : Service() {
                 val currentDocId = queue.removeAt(0)
                 val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, currentDocId)
                 
+                val unstableClient = try {
+                    contentResolver.acquireUnstableContentProviderClient(childrenUri)
+                } catch (_: Exception) { null }
+
                 val cursor = try {
-                    contentResolver.query(childrenUri, arrayOf(
+                    val projection = arrayOf(
                         DocumentsContract.Document.COLUMN_DOCUMENT_ID,   // 0
                         DocumentsContract.Document.COLUMN_DISPLAY_NAME,  // 1
                         DocumentsContract.Document.COLUMN_MIME_TYPE,     // 2
                         DocumentsContract.Document.COLUMN_SIZE,          // 3
                         DocumentsContract.Document.COLUMN_LAST_MODIFIED  // 4
-                    ), null, null, null)
-                } catch (e: Exception) { Log.e(TAG, "query($subdirName): ${e.message}"); continue }
+                    )
+                    if (unstableClient != null) {
+                        unstableClient.query(childrenUri, projection, null, null, null)
+                    } else {
+                        contentResolver.query(childrenUri, projection, null, null, null)
+                    }
+                } catch (e: Exception) { 
+                    Log.e(TAG, "query($subdirName): ${e.message}")
+                    null 
+                } finally {
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                            unstableClient?.close()
+                        } else {
+                            @Suppress("DEPRECATION")
+                            unstableClient?.release()
+                        }
+                    } catch (_: Exception) {}
+                }
+
+                if (cursor == null) continue
 
                 val pendingDirs = mutableListOf<Pair<String, String>>() // (docId, name)
 
@@ -712,14 +774,27 @@ class MediaWatcherService : Service() {
                             // Unseen document id => new file => copy immediately, whatever its mtime.
                             val knownKey = "$subdirName|$docId"
                             if (knownFiles.contains(knownKey)) continue
+
+                            // Fast timestamp cutoff: Only examine files modified in the last 15 minutes.
+                            // This skips 99.9% of historical media files immediately without touching disk or DB.
+                            val modMs = when {
+                                rawModified > 1_000_000_000_000L -> rawModified
+                                rawModified in 1_000_000_000L..999_999_999_999L -> rawModified * 1000L
+                                else -> 0L
+                            }
+                            if (modMs > 0L && (scanStart - modMs) > 15 * 60 * 1000L) {
+                                markKnown(knownKey)
+                                continue
+                            }
+
                             if (!baselineDone) {
-                                val recentlyModified = rawModified > 1_000_000_000_000L &&
-                                    scanStart - rawModified in 0..(10 * 60 * 1000L)
+                                val recentlyModified = modMs > 0L && scanStart - modMs in 0..(10 * 60 * 1000L)
                                 if (!recentlyModified) { markKnown(knownKey); continue }
                             }
 
                             // Skip files that have already been copied and successfully linked
                             if (destFile.exists() && destFile.length() == size && (linkedPaths.contains(destFile.absolutePath) || nativeDb?.isMediaAlreadyLinked(destFile.absolutePath) == true)) {
+                                markKnown(knownKey)
                                 continue
                             }
 

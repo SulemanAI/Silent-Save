@@ -34,13 +34,10 @@ class DatabaseHelper {
       path,
       version: 9, // v9: added permanent saved-message state
       onConfigure: (db) async {
-        // WAL must be set first — if sqflite reconnects and tries to switch to
-        // TRUNCATE while the native side holds a WAL write lock, it will fail
-        // with "database is locked". Setting it here prevents sqflite from
-        // defaulting to TRUNCATE mode on reconnect.
+        // Set busy_timeout FIRST so that any concurrent native writes wait up to 15s instead of aborting
+        await db.rawQuery('PRAGMA busy_timeout = 15000;');
+        // WAL must be set next to ensure Write-Ahead Logging is maintained
         await db.rawQuery('PRAGMA journal_mode = WAL;');
-        // Increase timeout so concurrent native writes don't immediately abort.
-        await db.rawQuery('PRAGMA busy_timeout = 10000;');
         // NORMAL is safe with WAL: reduces fsync pressure during burst writes.
         await db.rawQuery('PRAGMA synchronous = NORMAL;');
         // Auto-checkpoint every 200 pages to keep WAL file from growing unbounded.

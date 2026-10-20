@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
@@ -40,6 +41,11 @@ class _HomeScreenState extends State<HomeScreen>
   String? _highlightedConversationKey;
   late TabController _tabController;
 
+  // Debounce and mutex for DB conversation reloads during notification bursts
+  Timer? _reloadDebounceTimer;
+  bool _isReloading = false;
+  bool _pendingReload = false;
+
   // Variables for custom swipe-to-switch tabs gesture detection
   double _horizontalDragTotal = 0;
   bool _isDraggingVertically = false;
@@ -69,6 +75,7 @@ class _HomeScreenState extends State<HomeScreen>
     NotificationService.instance.newMessageNotifier.removeListener(
       _onNewMessage,
     );
+    _reloadDebounceTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _searchController.dispose();
     _searchFocusNode.dispose();
@@ -120,9 +127,18 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   /// Called by the newMessageNotifier whenever a message is saved.
-  /// Reloads conversations directly from DB without re-triggering notification polling.
+  /// Debounces rapid notifications (e.g. 20 messages in 2 seconds) so only 1 DB reload runs.
   void _onNewMessage() {
-    _reloadConversationsFromDB();
+    _debounceReloadConversations();
+  }
+
+  void _debounceReloadConversations() {
+    _reloadDebounceTimer?.cancel();
+    _reloadDebounceTimer = Timer(const Duration(milliseconds: 600), () {
+      if (mounted) {
+        _reloadConversationsFromDB();
+      }
+    });
   }
 
   Future<void> _performSearch(String query) async {
@@ -180,14 +196,22 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   /// Reload conversations from DB only (no notification refresh), to avoid loops.
+  /// Protected by mutex against concurrent execution during message bursts.
   Future<void> _reloadConversationsFromDB() async {
+    if (_isReloading) {
+      _pendingReload = true;
+      return;
+    }
+    _isReloading = true;
+    _pendingReload = false;
     try {
       final conversations = await DatabaseHelper.instance
           .getConversations()
           .timeout(
             const Duration(seconds: 10),
             onTimeout: () {
-              return <Map<String, dynamic>>[];
+              debugPrint('[HomeScreen] getConversations timed out — retaining existing list');
+              return _conversations; // CRITICAL: Never wipe out UI with empty list on slow queries!
             },
           );
       if (mounted) {
@@ -199,6 +223,11 @@ class _HomeScreenState extends State<HomeScreen>
       }
     } catch (e) {
       debugPrint('[HomeScreen] Error reloading conversations: $e');
+    } finally {
+      _isReloading = false;
+      if (_pendingReload && mounted) {
+        _debounceReloadConversations();
+      }
     }
   }
 
@@ -295,30 +324,113 @@ class _HomeScreenState extends State<HomeScreen>
   Future<void> _checkPermission() async {
     final hasPermission = await NotificationService.instance
         .isNotificationPermissionGranted();
-    final isConnected = await NotificationService.instance.isNlsConnected();
+    var isConnected = await NotificationService.instance.isNlsConnected();
     debugPrint(
       '[HomeScreen] Notification permission status: $hasPermission, Connected: $isConnected',
     );
+
+    // If permission is granted but NLS is disconnected,
+    // request rebind and retry checking up to 3 times with 700ms delays
+    // (Android OS binder takes 500ms-1500ms to re-establish connection after toggling in Settings).
+    if (hasPermission && !isConnected) {
+      await NotificationService.instance.forceRebindNls();
+      for (int i = 0; i < 3 && !isConnected; i++) {
+        await Future.delayed(const Duration(milliseconds: 700));
+        if (!mounted) return;
+        isConnected = await NotificationService.instance.isNlsConnected();
+        debugPrint('[HomeScreen] NLS connection retry #${i + 1}: $isConnected');
+      }
+    }
+
     if (mounted) {
       setState(() {
         _hasPermission = hasPermission;
         _isNlsConnected = isConnected;
       });
     }
+  }
 
-    // Force-stop recovery: If permission is granted but NLS is disconnected,
-    // trigger component toggle rebind immediately to re-register with NotificationManagerService.
-    if (hasPermission && !isConnected) {
-      await NotificationService.instance.forceRebindNls();
-      await Future.delayed(const Duration(seconds: 1));
+  Future<void> _handleNlsStatusTap() async {
+    try {
       if (!mounted) return;
-      final isConnectedRetry = await NotificationService.instance
-          .isNlsConnected();
-      if (mounted) {
-        setState(() {
-          _isNlsConnected = isConnectedRetry;
-        });
+      final messenger = ScaffoldMessenger.of(context);
+      if (_isNlsConnected) {
+        messenger.hideCurrentSnackBar();
+        messenger.showSnackBar(
+          const SnackBar(
+            content: Text('✓ Message capture listener is connected and active.'),
+            backgroundColor: Colors.green,
+            duration: Duration(seconds: 2),
+          ),
+        );
+        return;
       }
+
+      messenger.hideCurrentSnackBar();
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text('Connecting notification listener...'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+
+      await NotificationService.instance.forceRebindNls();
+      
+      // Retry checking for up to 3 seconds (OS binder can take 1-2s)
+      var connected = false;
+      for (int i = 0; i < 4 && !connected; i++) {
+        await Future.delayed(const Duration(milliseconds: 750));
+        if (!mounted) return;
+        connected = await NotificationService.instance.isNlsConnected();
+      }
+
+      if (connected) {
+        setState(() => _isNlsConnected = true);
+        messenger.hideCurrentSnackBar();
+        messenger.showSnackBar(
+          const SnackBar(
+            content: Text('✓ Reconnected successfully!'),
+            backgroundColor: Colors.green,
+            duration: Duration(seconds: 2),
+          ),
+        );
+      } else {
+        if (!mounted) return;
+        showDialog<void>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.sync_problem, color: Colors.orange),
+                SizedBox(width: 8),
+                Flexible(child: Text('Reconnect Service')),
+              ],
+            ),
+            content: const Text(
+              'Your device battery manager put the notification listener on standby.\n\n'
+              'Tap "Fix in Settings", then toggle "SilentSave" OFF and back ON.\n\n'
+              'No phone restart required!',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Cancel'),
+              ),
+              FilledButton.icon(
+                icon: const Icon(Icons.settings),
+                label: const Text('Fix in Settings'),
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  NotificationService.instance.openNotificationSettings();
+                },
+              ),
+            ],
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('[HomeScreen] _handleNlsStatusTap error: $e');
     }
   }
 
@@ -632,11 +744,42 @@ class _HomeScreenState extends State<HomeScreen>
               style: TextStyle(fontWeight: FontWeight.bold),
             ),
             const SizedBox(width: 8),
-            Text(
-              _isNlsConnected ? '(C)' : '(K)',
-              style: TextStyle(
-                fontWeight: FontWeight.bold,
-                color: _isNlsConnected ? Colors.green : Colors.red,
+            GestureDetector(
+              onTap: () {
+                _handleNlsStatusTap();
+              },
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: _isNlsConnected ? Colors.green.withOpacity(0.15) : Colors.red.withOpacity(0.15),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: _isNlsConnected ? Colors.green.withOpacity(0.6) : Colors.red.withOpacity(0.6),
+                    width: 1,
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 7,
+                      height: 7,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: _isNlsConnected ? Colors.green : Colors.red,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      _isNlsConnected ? '(C)' : '(K)',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        color: _isNlsConnected ? Colors.green : Colors.red,
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ],

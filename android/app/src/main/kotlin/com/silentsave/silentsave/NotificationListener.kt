@@ -247,6 +247,7 @@ class NotificationListener : NotificationListenerService() {
     @Volatile private var lastJsonWriteTime = 0L
     private val JSON_QUEUE_WRITE_INTERVAL = 10 // Write JSON every 10th message
     private val JSON_QUEUE_TIME_THRESHOLD_MS = 30_000L // Or if >30s since last write
+    private val nlsScope = CoroutineScope(Dispatchers.IO)
 
     private var isUnlockReceiverRegistered = false
     private val unlockReceiver = object : BroadcastReceiver() {
@@ -528,12 +529,24 @@ class NotificationListener : NotificationListenerService() {
         // O(1) package check
         if (packageName !in TARGET_PACKAGES) return
         
-        // Targeted short WakeLock (3 seconds) strictly during message extraction & disk persistence
-        acquireShortWakeLock(3000L)
-        try {
-            onNotificationPostedInternal(sbn)
-        } finally {
-            releaseWakeLock()
+        val notification = sbn.notification ?: return
+        
+        // Fast skip on main looper for group summaries and ongoing events (<0.001ms)
+        if ((notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
+        if ((notification.flags and Notification.FLAG_ONGOING_EVENT) != 0) return
+
+        // Offload all bitmap decoding, SQLite DB inserts, disk file I/O, and SAF scans
+        // to Dispatchers.IO. Leaves Android main thread completely free (0.01ms execution),
+        // preventing MotionEvent / ANR timeouts even during 100+ notification bursts!
+        acquireShortWakeLock(5000L)
+        nlsScope.launch {
+            try {
+                onNotificationPostedInternal(sbn)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error processing notification asynchronously: ${e.message}")
+            } finally {
+                releaseWakeLock()
+            }
         }
     }
 
@@ -776,11 +789,29 @@ class NotificationListener : NotificationListenerService() {
         try {
             if (drawable is BitmapDrawable && drawable.bitmap != null) {
                 val bmp = drawable.bitmap
-                if (bmp.width > 1 && bmp.height > 1) return bmp
+                if (bmp.width > 1 && bmp.height > 1) {
+                    if (bmp.width <= 256 && bmp.height <= 256) return bmp
+                    val scale = 256f / Math.max(bmp.width, bmp.height)
+                    val targetW = (bmp.width * scale).toInt().coerceAtLeast(1)
+                    val targetH = (bmp.height * scale).toInt().coerceAtLeast(1)
+                    return Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
+                }
             }
-            val width = if (drawable.intrinsicWidth > 0) drawable.intrinsicWidth else 512
-            val height = if (drawable.intrinsicHeight > 0) drawable.intrinsicHeight else 512
+            var width = if (drawable.intrinsicWidth > 0) drawable.intrinsicWidth else 192
+            var height = if (drawable.intrinsicHeight > 0) drawable.intrinsicHeight else 192
             if (width <= 1 || height <= 1) return null
+
+            // Cap dimensions to 256x256 for notification icons/avatars to prevent multi-megabyte allocations
+            if (width > 256 || height > 256) {
+                val ratio = width.toFloat() / height.toFloat()
+                if (width > height) {
+                    width = 256
+                    height = (256 / ratio).toInt().coerceAtLeast(1)
+                } else {
+                    height = 256
+                    width = (256 * ratio).toInt().coerceAtLeast(1)
+                }
+            }
 
             val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(bitmap)
@@ -912,15 +943,20 @@ class NotificationListener : NotificationListenerService() {
             val mediaFile = File(mediaDir, fileName)
 
             // Return cached file if already saved for this exact timestamp
-            if (mediaFile.exists() && mediaFile.length() > 0) return mediaFile.absolutePath
+            if (mediaFile.exists() && mediaFile.length() > 0) {
+                try { if (!bitmap.isRecycled) bitmap.recycle() } catch (_: Exception) {}
+                return mediaFile.absolutePath
+            }
 
             FileOutputStream(mediaFile).use { fos ->
                 bitmap.compress(Bitmap.CompressFormat.JPEG, 85, fos)
                 fos.flush()
             }
+            try { if (!bitmap.isRecycled) bitmap.recycle() } catch (_: Exception) {}
             Log.d(TAG, "$prefix picture saved: $fileName (${bitmap.width}x${bitmap.height})")
             mediaFile.absolutePath
         } catch (e: Exception) {
+            try { if (!bitmap.isRecycled) bitmap.recycle() } catch (_: Exception) {}
             Log.e(TAG, "Error saving bitmap to file: ${e.message}")
             null
         }
@@ -1029,8 +1065,11 @@ class NotificationListener : NotificationListenerService() {
                     bitmap.compress(Bitmap.CompressFormat.PNG, 90, fos)
                     fos.flush()
                 }
+                try { if (!bitmap.isRecycled) bitmap.recycle() } catch (_: Exception) {}
                 Log.d(TAG, "Avatar saved: $fileName (group=$isGroupChat)")
                 return avatarFile.absolutePath
+            } else if (bitmap != null) {
+                try { if (!bitmap.isRecycled) bitmap.recycle() } catch (_: Exception) {}
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error extracting avatar: ${e.message}")
@@ -1072,6 +1111,7 @@ class NotificationListener : NotificationListenerService() {
             // Cache: skip if saved recently (< 24h)
             if (avatarFile.exists() && 
                 System.currentTimeMillis() - avatarFile.lastModified() < 24 * 60 * 60 * 1000) {
+                try { if (!bitmap.isRecycled) bitmap.recycle() } catch (_: Exception) {}
                 return avatarFile.absolutePath
             }
             
@@ -1079,6 +1119,7 @@ class NotificationListener : NotificationListenerService() {
                 bitmap.compress(Bitmap.CompressFormat.PNG, 90, fos)
                 fos.flush()
             }
+            try { if (!bitmap.isRecycled) bitmap.recycle() } catch (_: Exception) {}
             Log.d(TAG, "Sender avatar saved: $fileName")
             return avatarFile.absolutePath
         } catch (e: Exception) {
