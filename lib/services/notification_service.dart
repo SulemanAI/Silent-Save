@@ -51,6 +51,7 @@ class NotificationService with WidgetsBindingObserver {
   // Track whether we're currently processing the media queue, to prevent overlapping calls.
   // Media processing involves SQLite reads + file I/O which must never run concurrently.
   bool _isCheckingMedia = false;
+  bool _isRefreshing = false;
 
   // Periodic safety-net poll timer (only while app is in foreground)
   Timer? _pollTimer;
@@ -728,6 +729,11 @@ class NotificationService with WidgetsBindingObserver {
 
   /// Manual refresh — call from pull-to-refresh or app resume.
   Future<void> refreshNotifications() async {
+    if (_isRefreshing) {
+      debugPrint('[NotificationService] Refresh already in progress — skipping duplicate');
+      return;
+    }
+    _isRefreshing = true;
     debugPrint('[NotificationService] Manual refresh');
     try {
       await _checkForNewNotifications().timeout(
@@ -746,6 +752,8 @@ class NotificationService with WidgetsBindingObserver {
       );
     } catch (e) {
       debugPrint('[NotificationService] Refresh error: $e');
+    } finally {
+      _isRefreshing = false;
     }
   }
 
@@ -1009,4 +1017,3 @@ class NotificationService with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
   }
 }
-

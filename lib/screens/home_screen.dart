@@ -45,6 +45,7 @@ class _HomeScreenState extends State<HomeScreen>
   Timer? _reloadDebounceTimer;
   bool _isReloading = false;
   bool _pendingReload = false;
+  bool _isLoadingConversations = false;
 
   // Variables for custom swipe-to-switch tabs gesture detection
   double _horizontalDragTotal = 0;
@@ -436,6 +437,7 @@ class _HomeScreenState extends State<HomeScreen>
 
   Future<void> _checkSafPermission() async {
     final hasSaf = await NotificationService.instance.getSafPermissionStatus();
+    if (!mounted) return;
     setState(() {
       _hasSafPermission = hasSaf;
     });
@@ -443,14 +445,17 @@ class _HomeScreenState extends State<HomeScreen>
 
   Future<void> _checkEncryption() async {
     final enabled = await EncryptionService.instance.isEncryptionEnabled();
+    if (!mounted) return;
     setState(() {
       _encryptionEnabled = enabled;
     });
   }
 
   Future<void> _loadConversations() async {
+    if (_isLoadingConversations) return;
+    _isLoadingConversations = true;
     _searchFocusNode.unfocus();
-    if (_conversations.isEmpty) {
+    if (_conversations.isEmpty && mounted) {
       setState(() {
         _isLoading = true;
       });
@@ -476,6 +481,7 @@ class _HomeScreenState extends State<HomeScreen>
               return <Map<String, dynamic>>[];
             },
           );
+      if (!mounted) return;
       setState(() {
         _conversations = conversations.toList();
         _isLoading = false;
@@ -483,11 +489,13 @@ class _HomeScreenState extends State<HomeScreen>
       _applySortAndFilter();
     } catch (e) {
       debugPrint('[HomeScreen] Error loading conversations: $e');
-      setState(() {
-        _conversations = [];
-        _filteredConversations = [];
-        _isLoading = false;
-      });
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    } finally {
+      _isLoadingConversations = false;
     }
   }
 
