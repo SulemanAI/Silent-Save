@@ -1,6 +1,7 @@
 package com.silentsave.silentsave
 
 import android.app.Notification
+import com.silentsave.silentsave.callrecorder.CallAutoRecordCoordinator
 import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
@@ -531,6 +532,21 @@ class NotificationListener : NotificationListenerService() {
         
         val notification = sbn.notification ?: return
         
+        // Forward WhatsApp call lifecycle events to the Call Recorder auto-detector
+        // before ongoing events are skipped by the chat-message archiver below.
+        if (packageName == WHATSAPP_PACKAGE || packageName == WHATSAPP_BUSINESS_PACKAGE) {
+            try {
+                CallAutoRecordCoordinator.onWhatsAppNotificationPosted(
+                    applicationContext,
+                    sbn
+                ) {
+                    try { activeNotifications } catch (_: Exception) { null }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "CallAutoRecordCoordinator post hook warning: ${e.message}")
+            }
+        }
+
         // Fast skip on main looper for group summaries and ongoing events (<0.001ms)
         if ((notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
         if ((notification.flags and Notification.FLAG_ONGOING_EVENT) != 0) return
@@ -546,6 +562,23 @@ class NotificationListener : NotificationListenerService() {
                 Log.e(TAG, "Error processing notification asynchronously: ${e.message}")
             } finally {
                 releaseWakeLock()
+            }
+        }
+    }
+
+    private fun forwardCallRemovalToRecorder(sbn: StatusBarNotification?) {
+        if (sbn == null) return
+        val packageName = sbn.packageName ?: return
+        if (packageName == WHATSAPP_PACKAGE || packageName == WHATSAPP_BUSINESS_PACKAGE) {
+            try {
+                CallAutoRecordCoordinator.onWhatsAppNotificationRemoved(
+                    applicationContext,
+                    sbn
+                ) {
+                    try { activeNotifications } catch (_: Exception) { null }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "CallAutoRecordCoordinator remove hook warning: ${e.message}")
             }
         }
     }
@@ -1561,7 +1594,7 @@ class NotificationListener : NotificationListenerService() {
                         Log.d(TAG, "Skipping call notification text: '$rawMsgText'")
                         continue
                     }
-                    rawMsgText
+                    rawMsgText.trim()
                 }
 
                 if (isCountSummaryMessage(msgText) || isSummaryMessage(msgText)) continue
@@ -1597,7 +1630,7 @@ class NotificationListener : NotificationListenerService() {
                     }
                 }
                 
-                val hasMedia = perMessageMediaPath != null || mediaPicturePath != null
+                val hasMedia = perMessageMediaPath != null || (mediaPicturePath != null && msg === rawMessages.lastOrNull())
                 
                 // Only skip duplicates if they don't bring new media. 
                 // If they have media, let them through so the DB can update the existing row.
@@ -1884,6 +1917,8 @@ class NotificationListener : NotificationListenerService() {
         // no-op), so there is zero value in capturing them.
         // Read-state is managed exclusively by the Flutter UI when the user opens
         // a conversation, not by OS-level notification dismissals.
+        // (Call Recorder hook: forwards WhatsApp call-end events only; archiving stays a no-op.)
+        forwardCallRemovalToRecorder(sbn)
         if (sbn == null) return
         val packageName = sbn.packageName ?: return
         if (packageName !in TARGET_PACKAGES) return

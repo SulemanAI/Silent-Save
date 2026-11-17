@@ -24,8 +24,8 @@ android {
         applicationId = "com.silentsave.silentsave"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion  // Required for NotificationListenerService
-        targetSdk = flutter.targetSdkVersion
+        minSdk = 29 // Android 10+ required for Scoped Storage MediaStore & MediaProjection FGS
+        targetSdk = 34 // Android 14 target SDK
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }

@@ -2,4 +2,6 @@
 <resources>
     <string name="app_name">SilentSave</string>
     <string name="accessibility_service_description">SilentSave needs accessibility access to capture messages when WhatsApp or Instagram is open on screen. This helps capture messages that would otherwise be missed when notifications are suppressed.</string>
+    <string name="call_recorder_accessibility_label">SilentSave Auto Call Recorder</string>
+    <string name="call_recorder_accessibility_description">Allows SilentSave to automatically start microphone recording when a WhatsApp voice call connects and prompt screen capture when a WhatsApp video call connects, without reading screen text.</string>
 </resources>

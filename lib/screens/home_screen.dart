@@ -13,6 +13,7 @@ import '../widgets/full_screen_media_viewer.dart';
 import 'conversation_screen.dart';
 import 'capture_screen.dart';
 import 'settings_screen.dart';
+import '../call_recorder/screens/call_recorder_screen.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:local_auth/local_auth.dart';
 
@@ -59,7 +60,7 @@ class _HomeScreenState extends State<HomeScreen>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _tabController = TabController(length: 3, vsync: this);
+    _tabController = TabController(length: 4, vsync: this);
     _tabController.addListener(_handleTabSelection);
     _checkPermission();
     _checkSafPermission();
@@ -122,6 +123,7 @@ class _HomeScreenState extends State<HomeScreen>
       }
     } else {
       _previousTabIndex = _tabController.index;
+      if (mounted) setState(() {});
       // Optional: reset authentication when navigating away from Captures tab
       // _isCapturesAuthenticated = false;
     }
@@ -874,6 +876,14 @@ class _HomeScreenState extends State<HomeScreen>
               ),
               text: 'Captures',
             ),
+            Tab(
+              icon: Icon(
+                Icons.phone_in_talk,
+                size: 24,
+                color: Colors.tealAccent,
+              ),
+              text: 'Calls',
+            ),
           ],
         ),
       ),
@@ -882,11 +892,11 @@ class _HomeScreenState extends State<HomeScreen>
           if (!_hasPermission) _buildPermissionWarning(),
           if (_hasPermission && !_hasSafPermission && _tabController.index == 0)
             _buildSafPermissionWarning(),
-          _buildSearchBar(),
+          if (_tabController.index < 2) _buildSearchBar(),
           Expanded(
             child: _isLoading
                 ? const Center(child: CircularProgressIndicator())
-                : _searchController.text.isNotEmpty
+                : (_searchController.text.isNotEmpty && _tabController.index < 2)
                 ? _buildSearchResultsList()
                 : Listener(
                     onPointerDown: (_) {
@@ -922,6 +932,7 @@ class _HomeScreenState extends State<HomeScreen>
                         _buildConversationList('com.whatsapp'),
                         _buildConversationList('com.instagram.android'),
                         const CaptureScreen(),
+                        const CallRecorderScreen(),
                       ],
                     ),
                   ),

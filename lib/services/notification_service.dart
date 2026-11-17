@@ -2,6 +2,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'dart:io';
 import 'database_helper.dart';
+import 'encryption_service.dart';
 import '../models/message_model.dart';
 import '../utils/text_sanitizer.dart';
 import '../utils/timestamp_matcher.dart';
@@ -277,6 +278,24 @@ class NotificationService with WidgetsBindingObserver {
           }
           
           if (method == 'onNotificationReceived') {
+            final rawMsgId = result['messageId'];
+            final int? nativeMsgId = rawMsgId is int
+                ? rawMsgId
+                : (rawMsgId is num ? rawMsgId.toInt() : null);
+
+            // If Kotlin's NativeDatabaseHelper already inserted this exact message into SQLite
+            // (messageId > 0) and Flutter encryption is disabled, do NOT re-insert it from the JSON
+            // queue (which could duplicate the row if text sanitization differs). Just trigger UI refresh!
+            final isEncrypted = await EncryptionService.instance.isEncryptionEnabled();
+            if (nativeMsgId != null && nativeMsgId > 0 && !isEncrypted) {
+              _processedNotificationIds.add(notificationId);
+              while (_processedNotificationIds.length > _maxProcessedIds) {
+                _processedNotificationIds.remove(_processedNotificationIds.first);
+              }
+              _scheduleNotify();
+              continue;
+            }
+
             final messageTimestamp = DateTime.fromMillisecondsSinceEpoch(timestamp);
             
             messagesToInsert.add(MessageModel(

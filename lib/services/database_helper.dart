@@ -32,7 +32,7 @@ class DatabaseHelper {
 
     final db = await openDatabase(
       path,
-      version: 9, // v9: added permanent saved-message state
+      version: 10, // v10: added call_recordings table for Call Recorder module
       onConfigure: (db) async {
         // Set busy_timeout FIRST so that any concurrent native writes wait up to 15s instead of aborting
         await db.rawQuery('PRAGMA busy_timeout = 15000;');
@@ -50,6 +50,8 @@ class DatabaseHelper {
     // Safety net: ensure avatarPath column exists regardless of migration state.
     // This handles edge cases where the DB version was bumped but the ALTER failed.
     await _ensureColumns(db);
+    // Safety net: ensure call_recordings table exists even if NativeDatabaseHelper opened DB first at v9
+    await _createCallRecordingsTable(db);
     // Do NOT call cleanupCorruptedMediaLinks here — the native NativeDatabaseHelper
     // also runs it on every service start. Running it during DB init while the
     // native side is actively writing causes immediate DB lock errors.
@@ -138,6 +140,9 @@ class DatabaseHelper {
     if (oldVersion < 7) {
       // Add media_attachments table for SAF-captured WhatsApp media files
       await _createMediaAttachmentsTable(db);
+
+    // call_recordings table (v10)
+    await _createCallRecordingsTable(db);
     }
     if (oldVersion < 8) {
       await db.execute('''
@@ -148,6 +153,9 @@ class DatabaseHelper {
         CREATE INDEX IF NOT EXISTS idx_conversations_unread 
         ON messages(sender, app, isDeleted, isRead)
       ''');
+    }
+    if (oldVersion < 10) {
+      await _createCallRecordingsTable(db);
     }
     if (oldVersion < 9) {
       try {
@@ -206,6 +214,9 @@ class DatabaseHelper {
 
     // media_attachments table (v7)
     await _createMediaAttachmentsTable(db);
+
+    // call_recordings table (v10)
+    await _createCallRecordingsTable(db);
   }
 
   /// Creates the media_attachments table.
@@ -1547,5 +1558,84 @@ class DatabaseHelper {
   Future<void> close() async {
     final db = await database;
     await db.close();
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  // CALL RECORDINGS (v10 — Call Recorder Module, isolated from messages)
+  // ══════════════════════════════════════════════════════════════════════
+
+  /// Creates the call_recordings table and indexes if they do not yet exist.
+  Future<void> _createCallRecordingsTable(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS call_recordings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        media_store_id INTEGER,
+        media_uri TEXT NOT NULL,
+        file_path TEXT,
+        display_name TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        audio_source TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        size_bytes INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        is_partial INTEGER NOT NULL DEFAULT 0,
+        backup_synced INTEGER NOT NULL DEFAULT 0
+      )
+    ''');
+    await db.execute('''
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_call_recordings_uri
+      ON call_recordings(media_uri)
+    ''');
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS idx_call_recordings_created
+      ON call_recordings(created_at DESC)
+    ''');
+  }
+
+  /// Queries all call recordings from SQLite ordered newest-first.
+  Future<List<Map<String, dynamic>>> getCallRecordings({String? mode}) async {
+    final db = await database;
+    if (mode != null && mode.isNotEmpty) {
+      return db.query(
+        'call_recordings',
+        where: 'mode = ?',
+        whereArgs: [mode],
+        orderBy: 'created_at DESC',
+      );
+    }
+    return db.query('call_recordings', orderBy: 'created_at DESC');
+  }
+
+  /// Calculates total bytes used by call recordings tracked in SQLite.
+  Future<int> getCallRecordingsTotalBytes() async {
+    final db = await database;
+    final res = await db.rawQuery(
+      'SELECT COALESCE(SUM(size_bytes), 0) AS total_bytes FROM call_recordings',
+    );
+    if (res.isEmpty) return 0;
+    return (res.first['total_bytes'] as num? ?? 0).toInt();
+  }
+
+  /// Returns unsynced call recordings so a future Google Drive / SAF backup job
+  /// can upload new recordings and mark them synced via [markCallRecordingBackupSynced].
+  Future<List<Map<String, dynamic>>> getUnsyncedCallRecordings() async {
+    final db = await database;
+    return db.query(
+      'call_recordings',
+      where: 'backup_synced = 0',
+      orderBy: 'created_at ASC',
+    );
+  }
+
+  /// Marks a call recording as backed up to external/cloud storage.
+  Future<int> markCallRecordingBackupSynced(int id, {bool synced = true}) async {
+    final db = await database;
+    return db.update(
+      'call_recordings',
+      {'backup_synced': synced ? 1 : 0},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
   }
 }

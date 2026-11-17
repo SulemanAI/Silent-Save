@@ -70,6 +70,9 @@ class MainActivity : FlutterFragmentActivity() {
     // Set before launching ACTION_OPEN_DOCUMENT_TREE, resolved in onActivityResult.
     private var pendingSafResult: MethodChannel.Result? = null
 
+    // Platform channel bridge for the Call Recorder module (isolated from notification capture)
+    private var callRecorderChannelHandler: com.silentsave.silentsave.callrecorder.CallRecorderChannelHandler? = null
+
     fun forceRebindNls(context: Context) {
         try {
             val componentName = ComponentName(context, NotificationListener::class.java)
@@ -96,6 +99,12 @@ class MainActivity : FlutterFragmentActivity() {
 
         val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
         activeMethodChannel = channel
+
+        // Register Call Recorder MethodChannel + EventChannel
+        callRecorderChannelHandler?.dispose()
+        callRecorderChannelHandler = com.silentsave.silentsave.callrecorder.CallRecorderChannelHandler(this).also {
+            it.register(flutterEngine)
+        }
 
         Log.d(TAG, "Configuring Flutter engine")
 
@@ -681,6 +690,9 @@ class MainActivity : FlutterFragmentActivity() {
             pendingSafResult = null
             return
         }
+        if (callRecorderChannelHandler?.onActivityResult(requestCode, resultCode, data) == true) {
+            return
+        }
         super.onActivityResult(requestCode, resultCode, data)
     }
 
@@ -802,6 +814,8 @@ class MainActivity : FlutterFragmentActivity() {
     }
 
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        callRecorderChannelHandler?.dispose()
+        callRecorderChannelHandler = null
         activeMethodChannel = null
         super.cleanUpFlutterEngine(flutterEngine)
     }

@@ -31,7 +31,7 @@ class NativeDatabaseHelper private constructor(context: Context) {
     companion object {
         private const val TAG = "NativeDB"
         private const val DB_NAME = "silentsave.db"
-        private const val DB_VERSION = 9 // v9: isSaved column added
+        private const val DB_VERSION = 10 // v10: call_recordings table added
 
         @Volatile
         private var INSTANCE: NativeDatabaseHelper? = null
@@ -188,6 +188,34 @@ class NativeDatabaseHelper private constructor(context: Context) {
                 ON media_attachments(captured_at)
             """.trimIndent())
 
+            // call_recordings table (v10): isolated metadata for Call Recorder module,
+            // synchronized with MediaStore (Movies/CallRecordings & Music/CallRecordings).
+            db.execSQL("""
+                CREATE TABLE IF NOT EXISTS call_recordings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    media_store_id INTEGER,
+                    media_uri TEXT NOT NULL,
+                    file_path TEXT,
+                    display_name TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    audio_source TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    size_bytes INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    is_partial INTEGER NOT NULL DEFAULT 0,
+                    backup_synced INTEGER NOT NULL DEFAULT 0
+                )
+            """.trimIndent())
+            db.execSQL("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_call_recordings_uri
+                ON call_recordings(media_uri)
+            """.trimIndent())
+            db.execSQL("""
+                CREATE INDEX IF NOT EXISTS idx_call_recordings_created
+                ON call_recordings(created_at DESC)
+            """.trimIndent())
+
             // Ensure all columns exist (handles upgrades from older versions)
             ensureColumns()
 
@@ -295,16 +323,18 @@ class NativeDatabaseHelper private constructor(context: Context) {
         mediaPath: String? = null
     ): Long {
         try {
+            val cleanSender = sender.trim()
+            val cleanMessage = message.trim()
             val dedupWindowMs = 2000L // ±2 seconds, matches Flutter's window
             val database = safeDb() // Use resilient connection
 
-            // Dedup check: same sender + app + message within ±2s
+            // Dedup check: same sender + app + message within ±2s (trimmed to match Dart's sanitizeText(text.trim()))
             val isDuplicate = database.query(
                 "messages",
                 arrayOf("id"),
-                "sender = ? AND app = ? AND message = ? AND timestamp BETWEEN ? AND ?",
+                "TRIM(sender) = ? AND app = ? AND TRIM(message) = ? AND timestamp BETWEEN ? AND ?",
                 arrayOf(
-                    sender, app, message,
+                    cleanSender, app, cleanMessage,
                     (timestampMs - dedupWindowMs).toString(),
                     (timestampMs + dedupWindowMs).toString()
                 ),
@@ -315,19 +345,19 @@ class NativeDatabaseHelper private constructor(context: Context) {
                 // Not a new message — but if it has media and the existing row doesn't,
                 // update the existing row's mediaPath
                 if (mediaPath != null) {
-                    updateMediaPathIfMissing(sender, app, message, timestampMs, dedupWindowMs, mediaPath)
+                    updateMediaPathIfMissing(cleanSender, app, cleanMessage, timestampMs, dedupWindowMs, mediaPath)
                 }
                 return -1L
             }
 
             val values = ContentValues().apply {
-                put("sender", sender)
-                put("message", message)
+                put("sender", cleanSender)
+                put("message", cleanMessage)
                 put("app", app)
                 put("timestamp", timestampMs)
                 put("isDeleted", 0)
                 put("isRead", 0)
-                put("senderName", senderName)
+                put("senderName", senderName.trim())
                 put("isGroupChat", if (isGroupChat) 1 else 0)
                 if (avatarPath != null) put("avatarPath", avatarPath)
                 if (mediaPath != null) put("mediaPath", mediaPath)
@@ -1534,5 +1564,240 @@ class NativeDatabaseHelper private constructor(context: Context) {
             Log.w(TAG, "purgeAvatarMisusedMedia error: ${e.message}")
         }
         return count
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // CALL RECORDINGS (v10 — Call Recorder Module, isolated from messages)
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Insert or update a call recording row keyed by [entity.mediaUri].
+     * Preserves existing [audioSource], [isPartial], and [backupSynced] flags when
+     * reconciling externally discovered MediaStore entries.
+     */
+    @Synchronized
+    fun upsertCallRecording(
+        entity: com.silentsave.silentsave.callrecorder.CallRecordingEntity,
+        preserveExistingMetadata: Boolean = false
+    ): com.silentsave.silentsave.callrecorder.CallRecordingEntity {
+        return try {
+            val database = safeDb()
+            var existingId: Long? = null
+            var existingAudioSource: String? = null
+            var existingIsPartial = 0
+            var existingBackupSynced = 0
+
+            database.query(
+                "call_recordings",
+                arrayOf("id", "audio_source", "is_partial", "backup_synced"),
+                "media_uri = ?",
+                arrayOf(entity.mediaUri),
+                null, null, null, "1"
+            ).use { cur ->
+                if (cur.moveToFirst()) {
+                    existingId = cur.getLong(0)
+                    existingAudioSource = cur.getString(1)
+                    existingIsPartial = cur.getInt(2)
+                    existingBackupSynced = cur.getInt(3)
+                }
+            }
+
+            val finalAudioSource = if (preserveExistingMetadata && !existingAudioSource.isNullOrBlank()) {
+                existingAudioSource!!
+            } else {
+                entity.audioSource.wireValue
+            }
+            val finalIsPartial = if (preserveExistingMetadata && existingId != null) {
+                existingIsPartial
+            } else {
+                if (entity.isPartial) 1 else 0
+            }
+            val finalBackupSynced = if (preserveExistingMetadata && existingId != null) {
+                existingBackupSynced
+            } else {
+                if (entity.backupSynced) 1 else 0
+            }
+
+            val values = ContentValues().apply {
+                if (entity.mediaStoreId != null) put("media_store_id", entity.mediaStoreId)
+                put("media_uri", entity.mediaUri)
+                if (entity.filePath != null) put("file_path", entity.filePath)
+                put("display_name", entity.displayName)
+                put("mode", entity.mode.wireValue)
+                put("audio_source", finalAudioSource)
+                put("mime_type", entity.mimeType)
+                put("duration_ms", entity.durationMs)
+                put("size_bytes", entity.sizeBytes)
+                put("created_at", entity.createdAtMs)
+                put("is_partial", finalIsPartial)
+                put("backup_synced", finalBackupSynced)
+            }
+
+            val finalId = if (existingId != null) {
+                database.update(
+                    "call_recordings",
+                    values,
+                    "id = ?",
+                    arrayOf(existingId.toString())
+                )
+                existingId!!
+            } else {
+                database.insertWithOnConflict(
+                    "call_recordings",
+                    null,
+                    values,
+                    SQLiteDatabase.CONFLICT_REPLACE
+                )
+            }
+
+            entity.copy(
+                id = if (finalId > 0) finalId else entity.id,
+                audioSource = com.silentsave.silentsave.callrecorder.AudioSourceOption.fromWire(finalAudioSource),
+                isPartial = finalIsPartial == 1,
+                backupSynced = finalBackupSynced == 1
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "upsertCallRecording error: ${e.message}")
+            entity
+        }
+    }
+
+    /**
+     * Fetch all call recordings ordered newest-first.
+     */
+    fun getAllCallRecordings(): List<com.silentsave.silentsave.callrecorder.CallRecordingEntity> {
+        val result = mutableListOf<com.silentsave.silentsave.callrecorder.CallRecordingEntity>()
+        try {
+            val database = safeDb()
+            database.query(
+                "call_recordings",
+                null,
+                null,
+                null,
+                null,
+                null,
+                "created_at DESC"
+            ).use { cur ->
+                while (cur.moveToNext()) {
+                    result.add(readCallRecordingRow(cur))
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "getAllCallRecordings error: ${e.message}")
+        }
+        return result
+    }
+
+    /**
+     * Fetch a single call recording by its SQLite primary key [id].
+     */
+    fun getCallRecordingById(id: Long): com.silentsave.silentsave.callrecorder.CallRecordingEntity? {
+        return try {
+            val database = safeDb()
+            database.query(
+                "call_recordings",
+                null,
+                "id = ?",
+                arrayOf(id.toString()),
+                null,
+                null,
+                null,
+                "1"
+            ).use { cur ->
+                if (cur.moveToFirst()) readCallRecordingRow(cur) else null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "getCallRecordingById error: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Update display_name (and optional resolved file_path) after renaming in MediaStore.
+     */
+    @Synchronized
+    fun updateCallRecordingRename(id: Long, newDisplayName: String, newFilePath: String?): Boolean {
+        return try {
+            val database = safeDb()
+            val values = ContentValues().apply {
+                put("display_name", newDisplayName)
+                if (newFilePath != null) put("file_path", newFilePath)
+            }
+            database.update("call_recordings", values, "id = ?", arrayOf(id.toString())) > 0
+        } catch (e: Exception) {
+            Log.e(TAG, "updateCallRecordingRename error: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Delete a single call recording row by SQLite [id].
+     */
+    @Synchronized
+    fun deleteCallRecordingById(id: Long): Boolean {
+        return try {
+            val database = safeDb()
+            database.delete("call_recordings", "id = ?", arrayOf(id.toString())) > 0
+        } catch (e: Exception) {
+            Log.e(TAG, "deleteCallRecordingById error: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Remove SQLite rows whose MediaStore URI no longer exists in MediaStore
+     * (e.g. deleted externally by the user in a file manager or gallery app).
+     */
+    @Synchronized
+    fun pruneMissingCallRecordings(validMediaUris: Set<String>): Int {
+        var removed = 0
+        try {
+            val database = safeDb()
+            val existingRows = mutableListOf<Pair<Long, String>>()
+            database.query(
+                "call_recordings",
+                arrayOf("id", "media_uri"),
+                null, null, null, null, null
+            ).use { cur ->
+                while (cur.moveToNext()) {
+                    existingRows.add(Pair(cur.getLong(0), cur.getString(1) ?: ""))
+                }
+            }
+            for ((rowId, uri) in existingRows) {
+                if (uri !in validMediaUris) {
+                    database.delete("call_recordings", "id = ?", arrayOf(rowId.toString()))
+                    removed++
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "pruneMissingCallRecordings error: ${e.message}")
+        }
+        return removed
+    }
+
+    private fun readCallRecordingRow(
+        cur: android.database.Cursor
+    ): com.silentsave.silentsave.callrecorder.CallRecordingEntity {
+        val msIdIdx = cur.getColumnIndexOrThrow("media_store_id")
+        val pathIdx = cur.getColumnIndexOrThrow("file_path")
+        return com.silentsave.silentsave.callrecorder.CallRecordingEntity(
+            id = cur.getLong(cur.getColumnIndexOrThrow("id")),
+            mediaStoreId = if (cur.isNull(msIdIdx)) null else cur.getLong(msIdIdx),
+            mediaUri = cur.getString(cur.getColumnIndexOrThrow("media_uri")) ?: "",
+            filePath = if (cur.isNull(pathIdx)) null else cur.getString(pathIdx),
+            displayName = cur.getString(cur.getColumnIndexOrThrow("display_name")) ?: "",
+            mode = com.silentsave.silentsave.callrecorder.RecordingMode.fromWire(
+                cur.getString(cur.getColumnIndexOrThrow("mode"))
+            ),
+            audioSource = com.silentsave.silentsave.callrecorder.AudioSourceOption.fromWire(
+                cur.getString(cur.getColumnIndexOrThrow("audio_source"))
+            ),
+            mimeType = cur.getString(cur.getColumnIndexOrThrow("mime_type")) ?: "",
+            durationMs = cur.getLong(cur.getColumnIndexOrThrow("duration_ms")),
+            sizeBytes = cur.getLong(cur.getColumnIndexOrThrow("size_bytes")),
+            createdAtMs = cur.getLong(cur.getColumnIndexOrThrow("created_at")),
+            isPartial = cur.getInt(cur.getColumnIndexOrThrow("is_partial")) == 1,
+            backupSynced = cur.getInt(cur.getColumnIndexOrThrow("backup_synced")) == 1
+        )
     }
 }

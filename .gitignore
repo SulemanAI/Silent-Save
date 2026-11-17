@@ -46,4 +46,4 @@ app.*.map.json
 # Android local properties (machine-specific SDK paths)
 android/local.properties
 
-
+handson.md

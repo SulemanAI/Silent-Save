@@ -4,6 +4,9 @@ import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
+import '../call_recorder/models/call_recording.dart';
+import '../call_recorder/repositories/call_recording_repository.dart';
+import '../services/database_helper.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -12,11 +15,12 @@ class SettingsScreen extends StatefulWidget {
   State<SettingsScreen> createState() => _SettingsScreenState();
 }
 
-class _SettingsScreenState extends State<SettingsScreen> {
+class _SettingsScreenState extends State<SettingsScreen> with WidgetsBindingObserver {
   bool _isLoading = true;
   double _dbSizeMb = 0.0;
   double _avatarsSizeMb = 0.0;
   double _captureSizeMb = 0.0;
+  double _callRecordingsSizeMb = 0.0;
   double _totalSizeMb = 0.0;
 
   // Capture settings
@@ -25,20 +29,47 @@ class _SettingsScreenState extends State<SettingsScreen> {
   int _audioDurationSec = 0;
   String _videoQuality = '720p';
 
+  // Call Recorder settings
+  CallAudioSource _callAudioSource = CallAudioSource.mic;
+  bool _callAutoRecordEnabled = true;
+  bool _callA11yEnabled = false;
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadSettings();
     _calculateStorage();
   }
 
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _loadSettings();
+    }
+  }
+
   Future<void> _loadSettings() async {
     final prefs = await SharedPreferences.getInstance();
+    final a11y = await CallRecordingRepository.instance.isAccessibilityServiceEnabled();
+    if (!mounted) return;
     setState(() {
       _useFrontCamera = prefs.getBool('capture_use_front_camera') ?? false;
       _videoDurationSec = prefs.getInt('capture_video_duration') ?? 0;
       _audioDurationSec = prefs.getInt('capture_audio_duration') ?? 0;
       _videoQuality = prefs.getString('capture_video_quality') ?? '720p';
+      _callAudioSource = CallAudioSource.fromWire(
+        prefs.getString(CallRecordingRepository.prefKeyAudioSource),
+      );
+      _callAutoRecordEnabled =
+          prefs.getBool(CallRecordingRepository.prefKeyAutoRecordEnabled) ?? true;
+      _callA11yEnabled = a11y;
     });
   }
 
@@ -48,12 +79,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await prefs.setInt('capture_video_duration', _videoDurationSec);
     await prefs.setInt('capture_audio_duration', _audioDurationSec);
     await prefs.setString('capture_video_quality', _videoQuality);
+    await prefs.setString(
+      CallRecordingRepository.prefKeyAudioSource,
+      _callAudioSource.wireValue,
+    );
+    await prefs.setBool(
+      CallRecordingRepository.prefKeyAutoRecordEnabled,
+      _callAutoRecordEnabled,
+    );
   }
 
   Future<void> _calculateStorage() async {
     double dbSize = 0;
     double avatarsSize = 0;
     double captureSize = 0;
+    double callRecSize = 0;
 
     try {
       // DB Size
@@ -102,11 +142,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
       debugPrint("Error calculating capture size: $e");
     }
 
+    try {
+      final totalCallBytes =
+          await DatabaseHelper.instance.getCallRecordingsTotalBytes();
+      callRecSize = totalCallBytes / (1024 * 1024);
+    } catch (e) {
+      debugPrint("Error calculating call recordings size: $e");
+    }
+
     setState(() {
       _dbSizeMb = dbSize;
       _avatarsSizeMb = avatarsSize;
       _captureSizeMb = captureSize;
-      _totalSizeMb = dbSize + avatarsSize + captureSize;
+      _callRecordingsSizeMb = callRecSize;
+      _totalSizeMb = dbSize + avatarsSize + captureSize + callRecSize;
       _isLoading = false;
     });
   }
@@ -230,6 +279,73 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   
                   const SizedBox(height: 32),
+
+                  // ── Call Recorder Settings ───────────────────────────
+                  const Text(
+                    'Call Recorder Settings',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+                  ),
+                  const SizedBox(height: 16),
+                  _buildSettingsTile(
+                    icon: Icons.autorenew,
+                    title: 'Auto-Record WhatsApp Calls',
+                    subtitle: '0-tap voice auto-start + 1-tap video prompt & auto-stop',
+                    trailing: Switch(
+                      value: _callAutoRecordEnabled,
+                      activeThumbColor: Colors.tealAccent,
+                      onChanged: (value) {
+                        setState(() => _callAutoRecordEnabled = value);
+                        _saveSettings();
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  _buildSettingsTile(
+                    icon: Icons.accessibility_new,
+                    title: 'Accessibility Auto-Start Service',
+                    subtitle: _callA11yEnabled
+                        ? 'Enabled — 0-tap background voice recording active'
+                        : 'Disabled — tap to enable "SilentSave Auto Call Recorder"',
+                    trailing: TextButton(
+                      onPressed: () {
+                        CallRecordingRepository.instance.openAccessibilitySettings();
+                      },
+                      child: Text(
+                        _callA11yEnabled ? 'Settings' : 'Enable',
+                        style: TextStyle(
+                          color: _callA11yEnabled ? Colors.greenAccent : Colors.amberAccent,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  _buildSettingsTile(
+                    icon: Icons.settings_voice,
+                    title: 'Call Audio Source',
+                    subtitle: _callAudioSource.description,
+                    trailing: DropdownButton<CallAudioSource>(
+                      value: _callAudioSource,
+                      dropdownColor: Colors.grey.shade800,
+                      underline: const SizedBox(),
+                      items: CallAudioSource.values.map((src) {
+                        return DropdownMenuItem(
+                          value: src,
+                          child: Text(
+                            src.wireValue,
+                            style: const TextStyle(color: Colors.white, fontSize: 13),
+                          ),
+                        );
+                      }).toList(),
+                      onChanged: (value) {
+                        if (value != null) {
+                          setState(() => _callAudioSource = value);
+                          _saveSettings();
+                        }
+                      },
+                    ),
+                  ),
+
+                  const SizedBox(height: 32),
                   
                   // ── Storage Usage ─────────────────────────────────────
                   const Text(
@@ -242,6 +358,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   _buildStorageItem(Icons.image, 'Avatars & Media', _avatarsSizeMb),
                   const SizedBox(height: 12),
                   _buildStorageItem(Icons.camera_alt, 'Captures', _captureSizeMb),
+                  const SizedBox(height: 12),
+                  _buildStorageItem(Icons.phone_in_talk, 'Call Recordings', _callRecordingsSizeMb),
                   const Divider(color: Colors.grey, height: 32),
                   _buildStorageItem(Icons.data_usage, 'Total Usage', _totalSizeMb, isTotal: true),
                 ],
